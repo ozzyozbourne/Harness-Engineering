@@ -1,12 +1,79 @@
 #!/usr/bin/env bash
 # Orb setup for harness-engineering.
 #
-# The repository currently has no lockfiles, toolchain pins, or backing
-# services; the orb base template already ships everything needed (git, gh,
-# Node.js, npm, pnpm, Bun, Python 3, uv, rg, jq, ffmpeg, ImageMagick, browser
-# tooling). This script is a fast, idempotent placeholder: extend it here as
-# manifests land in the repository (pnpm install, mise install, apt-get
-# packages, database seeding, .env templates, etc.).
+# Installs the toolchains this repo uses: Rust (rustup, latest stable),
+# Common Lisp (SBCL, latest release), Python (latest CPython via uv),
+# and TypeScript (latest tsc via npm). Node.js ships with the orb base
+# template and is kept up to date opportunistically.
+#
+# Idempotent: each step checks before installing. Fast on a warm filesystem.
 set -euo pipefail
 
-echo "[setup] No repository-defined toolchain or dependencies yet; nothing to install."
+step() { echo "[setup] $1"; }
+
+# --- Rust (latest stable via rustup) -----------------------------------------
+if ! command -v rustup >/dev/null 2>&1; then
+  step "Installing rustup + latest stable Rust"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+else
+  source "$HOME/.cargo/env" 2>/dev/null || true
+  step "rustup present; updating stable toolchain"
+  rustup update stable >/dev/null
+fi
+
+# --- SBCL (latest release runnable on Debian 12) -------------------------------
+# apt's sbcl is far behind; install the official Linux x86-64 binary release.
+sbcl_target="/usr/local/bin/sbcl"
+sbcl_core="/usr/local/lib/sbcl"
+sbcl_version="2.4.11"
+if ! command -v sbcl >/dev/null 2>&1 || [[ "$(sbcl --version 2>/dev/null | awk '{print $1}')" != "SBCL $sbcl_version" ]]; then
+  step "Installing SBCL $sbcl_version"
+  # Newest official binary that runs on Debian 12: releases from 2.5.x on
+  # require GLIBC 2.38, the orb ships 2.36.
+  tmp="$(mktemp -d)"
+  curl -sSL "https://downloads.sourceforge.net/project/sbcl/sbcl/$sbcl_version/sbcl-$sbcl_version-x86-64-linux-binary.tar.bz2" -o "$tmp/sbcl.tar.bz2"
+  tar -xjf "$tmp/sbcl.tar.bz2" -C "$tmp"
+  ( cd "$tmp/sbcl-$sbcl_version-x86-64-linux" && sh install.sh --prefix=/usr/local >/dev/null )
+  rm -rf "$tmp"
+fi
+
+# --- Clojure (latest CLI tools) -------------------------------------------------
+clojure_version="1.12.6.1673"
+if ! command -v clj >/dev/null 2>&1 || ! grep -q "$clojure_version" <(clojure --version 2>/dev/null); then
+  step "Installing Clojure $clojure_version"
+  curl -sSL "https://download.clojure.org/install/linux-install-$clojure_version.sh" -o /tmp/clojure-install.sh
+  bash /tmp/clojure-install.sh --prefix /usr/local >/dev/null
+  rm -f /tmp/clojure-install.sh
+fi
+
+# --- Python (latest CPython via uv) -------------------------------------------
+if ! command -v uv >/dev/null 2>&1; then
+  step "Installing uv"
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+python_version="3.14"
+step "Installing Python $python_version via uv"
+uv python install "$python_version" --default >/dev/null 2>&1 || uv python install "$python_version" >/dev/null
+# Make `python3`/`python` on PATH resolve to the uv-managed latest Python.
+uv_python_bin="$(uv python find "$python_version" 2>/dev/null || true)"
+if [[ -n "$uv_python_bin" ]]; then
+  uv_python_dir="$(dirname "$uv_python_bin")"
+  for name in python3 python; do
+    ln -sfn "$uv_python_bin" "/usr/local/bin/$name"
+  done
+fi
+
+# --- TypeScript (latest via npm) ----------------------------------------------
+step "Installing latest TypeScript globally"
+npm install -g typescript tsx >/dev/null 2>&1 || npm install -g typescript tsx
+
+echo "[setup] Done:"
+echo "  $(rustc --version 2>/dev/null || echo rustc MISSING)"
+echo "  $(sbcl --version 2>/dev/null || echo sbcl MISSING)"
+echo "  $(clojure --version 2>/dev/null || echo clojure MISSING)"
+echo "  $(python3 --version 2>/dev/null || echo python3 MISSING)"
+echo "  $(tsc --version 2>/dev/null || echo tsc MISSING)"
+echo "  $(node --version 2>/dev/null || echo node MISSING)"
