@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Orb resume for harness-engineering.
+#
+# Runs on every orb wake. Keep it fast (under Amp's 10-second window) and
+# idempotent. Add only quick reconnection or repair steps here — for example
+# refreshing credentials or checking that a service from .amp/services.yaml is
+# reachable. Never install dependencies or run slow work in this script.
+set -euo pipefail
+
+echo "[resume] Nothing to reconnect yet."

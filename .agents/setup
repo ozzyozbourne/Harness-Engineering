@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Orb setup for harness-engineering.
+#
+# The repository currently has no lockfiles, toolchain pins, or backing
+# services; the orb base template already ships everything needed (git, gh,
+# Node.js, npm, pnpm, Bun, Python 3, uv, rg, jq, ffmpeg, ImageMagick, browser
+# tooling). This script is a fast, idempotent placeholder: extend it here as
+# manifests land in the repository (pnpm install, mise install, apt-get
+# packages, database seeding, .env templates, etc.).
+set -euo pipefail
+
+echo "[setup] No repository-defined toolchain or dependencies yet; nothing to install."
