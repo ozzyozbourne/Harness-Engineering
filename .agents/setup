@@ -12,6 +12,7 @@ set -euo pipefail
 step() { echo "[setup] $1"; }
 
 # --- Rust (latest stable via rustup) -----------------------------------------
+export PATH="$HOME/.cargo/bin:$PATH"
 if ! command -v rustup >/dev/null 2>&1; then
   step "Installing rustup + latest stable Rust"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
@@ -28,7 +29,7 @@ fi
 sbcl_target="/usr/local/bin/sbcl"
 sbcl_core="/usr/local/lib/sbcl"
 sbcl_version="2.4.11"
-if ! command -v sbcl >/dev/null 2>&1 || [[ "$(sbcl --version 2>/dev/null | awk '{print $1}')" != "SBCL $sbcl_version" ]]; then
+if [[ "$(sbcl --version 2>/dev/null)" != "SBCL $sbcl_version" ]]; then
   step "Installing SBCL $sbcl_version"
   # Newest official binary that runs on Debian 12: releases from 2.5.x on
   # require GLIBC 2.38, the orb ships 2.36.
@@ -46,6 +47,38 @@ if ! command -v clj >/dev/null 2>&1 || ! grep -q "$clojure_version" <(clojure --
   curl -sSL "https://download.clojure.org/install/linux-install-$clojure_version.sh" -o /tmp/clojure-install.sh
   bash /tmp/clojure-install.sh --prefix /usr/local >/dev/null
   rm -f /tmp/clojure-install.sh
+fi
+
+# --- Elixir + Erlang/OTP (latest releases) --------------------------------------
+# Debian 12's apt Erlang is OTP 25, too old for current Elixir. hex.pm publishes
+# precompiled OTP builds for Ubuntu 22.04 (GLIBC 2.35, runs on Debian 12), and
+# Elixir ships precompiled zips per OTP major.
+otp_version="29.1.1"
+elixir_version="1.20.4"
+# Erlang reports the major ("29") at runtime; check the full version file instead.
+erlang_version_file="/usr/local/lib/erlang/releases/${otp_version%%.*}/OTP_VERSION"
+if ! grep -qx "$otp_version" "$erlang_version_file" 2>/dev/null; then
+  step "Installing Erlang/OTP $otp_version"
+  tmp="$(mktemp -d)"
+  curl -sSL "https://builds.hex.pm/builds/otp/ubuntu-22.04/OTP-$otp_version.tar.gz" -o "$tmp/otp.tar.gz"
+  tar -xzf "$tmp/otp.tar.gz" -C "$tmp"
+  mkdir -p /usr/local/lib/erlang
+  rm -rf /usr/local/lib/erlang/*
+  cp -r "$tmp/OTP-$otp_version"/* /usr/local/lib/erlang/
+  rm -rf "$tmp"
+  ( cd /usr/local/lib/erlang && ./Install -minimal /usr/local/lib/erlang >/dev/null )
+  ln -sf /usr/local/lib/erlang/bin/erl /usr/local/bin/erl
+  ln -sf /usr/local/lib/erlang/bin/erlc /usr/local/bin/erlc
+fi
+if ! command -v elixir >/dev/null 2>&1 || ! grep -q "$elixir_version" <(elixir --version 2>/dev/null); then
+  step "Installing Elixir $elixir_version"
+  tmp="$(mktemp -d)"
+  curl -sSL "https://github.com/elixir-lang/elixir/releases/download/v$elixir_version/elixir-otp-29.zip" -o "$tmp/elixir.zip"
+  mkdir -p /usr/local/lib/elixir
+  rm -rf /usr/local/lib/elixir/*
+  unzip -q "$tmp/elixir.zip" -d /usr/local/lib/elixir
+  rm -rf "$tmp"
+  for b in elixir elixirc mix iex; do ln -sf /usr/local/lib/elixir/bin/$b /usr/local/bin/$b; done
 fi
 
 # --- Python (latest CPython via uv) -------------------------------------------
@@ -74,6 +107,7 @@ echo "[setup] Done:"
 echo "  $(rustc --version 2>/dev/null || echo rustc MISSING)"
 echo "  $(sbcl --version 2>/dev/null || echo sbcl MISSING)"
 echo "  $(clojure --version 2>/dev/null || echo clojure MISSING)"
+echo "  $(elixir --version 2>/dev/null | tail -1 || echo elixir MISSING)"
 echo "  $(python3 --version 2>/dev/null || echo python3 MISSING)"
 echo "  $(tsc --version 2>/dev/null || echo tsc MISSING)"
 echo "  $(node --version 2>/dev/null || echo node MISSING)"
