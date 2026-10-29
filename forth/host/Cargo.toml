@@ -1,0 +1,22 @@
+[package]
+name = "cmh-forth"
+version = "0.1.0"
+edition = "2024"
+description = "cmh: a continual, self-modifying coding-agent harness (Forth-in-WebAssembly flavor)"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "cmh"
+path = "src/main.rs"
+
+[lib]
+name = "cmh"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }

@@ -1,0 +1,23 @@
+[package]
+name = "cmh-forth-vm"
+version = "0.1.0"
+edition = "2024"
+description = "cmh Forth: a small late-bound Forth compiled to WebAssembly"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+
+# Standalone workspace: built only for wasm32-unknown-unknown by host/build.rs.
+[workspace]
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+debug = false
+strip = true

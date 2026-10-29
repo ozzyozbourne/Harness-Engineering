@@ -1,0 +1,5 @@
+[workspace]
+resolver = "3"
+members = ["host"]
+# The VM is built for wasm32-unknown-unknown by host/build.rs.
+exclude = ["vm"]
