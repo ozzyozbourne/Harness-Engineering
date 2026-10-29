@@ -281,6 +281,9 @@ def main():
 
     started = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = pathlib.Path(a.out or ROOT / "results" / started)
+    if (out / "summary.md").exists():
+        # A supervised service reruns its command when it exits; never append a second run.
+        sys.exit(f"{out} already holds a finished run")
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     all_h = load_harnesses()
