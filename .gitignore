@@ -10,3 +10,6 @@ racket/**/compiled/
 
 # eval run output (logs, per-episode results)
 evals/results/
+
+# Python bytecode
+__pycache__/
