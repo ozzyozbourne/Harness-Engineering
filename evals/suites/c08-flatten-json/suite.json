@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "Flatten config.json into flat.json: a single JSON object whose keys are dotted paths and whose values are the leaf values. Object keys are joined with '.', list elements use their index (e.g. servers.0.host). Empty objects and empty lists are leaves and keep their value ({} or []). Keys in the input that themselves contain a '.' must be wrapped in square brackets in the path, e.g. {\"a\": {\"b.c\": 1}} becomes {\"a.[b.c]\": 1}.",
+  "fixture": "fixture", "check": "check.py"}]}

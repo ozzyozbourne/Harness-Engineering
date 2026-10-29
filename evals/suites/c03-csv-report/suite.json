@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "sales.csv has one row per sale (date, region, product, units, unit_price). Region names are inconsistent in case and surrounding whitespace; treat them case-insensitively and trimmed, and report them in lowercase. Write report.json with exactly these keys: \"total_revenue\" (sum of units*unit_price over all rows), \"by_region\" (object mapping each region to its revenue), and \"top_product\" (the product with the highest total revenue). Round every money amount to 2 decimals.",
+  "setup": "setup.py", "check": "check.py"}]}

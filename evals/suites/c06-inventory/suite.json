@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "Some tests in test_inventory.py fail (`python3 -m unittest test_inventory`). Find and fix the bugs in inventory.py. Do not change the tests.",
+  "fixture": "fixture", "check": "check.py"}]}

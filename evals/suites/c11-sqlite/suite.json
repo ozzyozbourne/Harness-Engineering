@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "shop.db is a SQLite database. Write out.csv with the header line `name,total` listing every customer whose total order amount over orders placed in calendar year 2025 is greater than 500, sorted by total descending and then name ascending. Format totals with exactly 2 decimals. Refunded orders (status = 'refunded') do not count.",
+  "setup": "setup.py", "check": "check.py"}]}

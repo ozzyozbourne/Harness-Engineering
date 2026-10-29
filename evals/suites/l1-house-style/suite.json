@@ -1,0 +1,10 @@
+{"track": "learning", "episodes": [
+  {"prompt": "Create text_utils.py with a function slugify(s) that lowercases s, replaces each run of non-alphanumeric characters with a single '-', and strips leading/trailing '-'.\n\nProject rule, and remember it for every future task in this project, not just this one: every Python file you create must begin with the exact line `# owner: team-orion`, and every function you write must have a docstring.",
+   "check": "check.py"},
+  {"prompt": "Create date_utils.py with a function days_between(a, b) that takes two ISO dates (YYYY-MM-DD) as strings and returns the absolute number of days between them.",
+   "check": "check.py", "transfer": true},
+  {"prompt": "Create math_utils.py with a function clamp(x, lo, hi) that returns x limited to the inclusive range [lo, hi], raising ValueError if lo > hi.",
+   "check": "check.py", "transfer": true},
+  {"prompt": "Create list_utils.py with a function chunk(items, n) that splits a list into consecutive lists of length n (the last may be shorter), raising ValueError if n < 1.",
+   "check": "check.py", "transfer": true}
+]}

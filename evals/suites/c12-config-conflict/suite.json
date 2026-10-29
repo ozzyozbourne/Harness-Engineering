@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "settings.ini is large. Exactly one key is defined twice within the same section with two different values (keys repeated across different sections, or repeated with the same value, are fine). Find it and write `SECTION.KEY` (for example `db.timeout`) as the only content of answer.txt.",
+  "setup": "setup.py", "check": "check.py"}]}

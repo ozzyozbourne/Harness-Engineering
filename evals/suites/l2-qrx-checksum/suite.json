@@ -1,0 +1,7 @@
+{"track": "learning", "episodes": [
+  {"prompt": "We tag data files with QRX checksums. The QRX checksum of a file: start with h = 7; for each byte b at 0-based position i, set h = (h * 31 + b + i) mod 65521; the result is the string 'QRX-' followed by h as 4 uppercase hex digits, zero-padded. Compute the QRX checksum of data_a.bin and write it to answer.txt.\n\nWe will need QRX checksums again in future tasks, so make sure you can compute them later without this explanation.",
+   "setup": "setup.py", "check": "check.py"},
+  {"prompt": "Write the QRX checksum of data_b.bin to answer.txt.", "setup": "setup.py", "check": "check.py", "transfer": true},
+  {"prompt": "Write the QRX checksum of data_c.bin to answer.txt.", "setup": "setup.py", "check": "check.py", "transfer": true},
+  {"prompt": "For every .bin file in this directory, write a line `FILENAME CHECKSUM` with its QRX checksum to answer.txt, sorted by filename.", "setup": "setup.py", "check": "check.py", "transfer": true}
+]}

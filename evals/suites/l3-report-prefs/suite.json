@@ -1,0 +1,7 @@
+{"track": "learning", "episodes": [
+  {"prompt": "events.csv lists this week's project events. Write report.md: a short markdown status report with one bullet per event giving its date and what happened.\n\nMy standing preferences for every report you write for me, in this task and all future tasks, so remember them: write all dates as ISO 8601 (YYYY-MM-DD); end the report with the exact line `Prepared by: cmh-eval`; never use the word \"very\".",
+   "fixture": "ep1", "check": "check.py"},
+  {"prompt": "tickets.csv lists open support tickets. Write report.md: a short markdown summary with one bullet per ticket giving its opened date, id and title.", "fixture": "ep2", "check": "check.py", "transfer": true},
+  {"prompt": "releases.csv lists upcoming releases. Write report.md summarizing them, one bullet per release with its date, version and highlights.", "fixture": "ep3", "check": "check.py", "transfer": true},
+  {"prompt": "incidents.csv lists last month's incidents. Write report.md with one bullet per incident giving its date, id and a one-sentence impact summary.", "fixture": "ep4", "check": "check.py", "transfer": true}
+]}

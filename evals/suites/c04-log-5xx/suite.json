@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "access.log is a web server log in combined log format. Find the 3 client IPs with the most responses whose status code is 5xx. Write them to answer.txt, one per line as `IP COUNT`, ordered by count descending and, for equal counts, by IP string ascending.",
+  "setup": "setup.py", "check": "check.py"}]}

@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "contacts.txt is a messy export. Extract every valid email address from it and write them to emails.txt, lowercased, de-duplicated, sorted, one per line. An address is valid when it is LOCAL@DOMAIN where LOCAL is 1+ characters from letters, digits and . _ + - that neither starts nor ends with '.' and has no '..'; DOMAIN is two or more dot-separated labels, each label 1+ letters/digits/hyphens not starting or ending with '-', and the last label (the TLD) is 2+ letters only. An address is a maximal run of non-whitespace characters after stripping surrounding <>, (), quotes, commas and semicolons; if that run is not entirely a valid address, it does not count.",
+  "fixture": "fixture", "check": "check.py"}]}

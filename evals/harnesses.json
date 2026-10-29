@@ -1,0 +1,79 @@
+{
+  "prime": {
+    "cmd": [
+      "~/.local/bin/prime-agent",
+      "-p",
+      "--provider",
+      "anthropic",
+      "--model",
+      "{model}",
+      "{prompt}"
+    ],
+    "env": {
+      "PRIME_AGENT_CODING_AGENT_DIR": "{state}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy",
+      "DO_NOT_TRACK": "1"
+    },
+    "models_json": true
+  },
+  "clojure": {
+    "cmd": [
+      "{repo}/clojure/bin/cmh",
+      "--state",
+      "{state}",
+      "--model",
+      "{model}",
+      "run",
+      "{prompt}"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "{base_url}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy"
+    }
+  },
+  "rust": {
+    "cmd": [
+      "{repo}/rust/target/release/cmh",
+      "--state",
+      "{state}",
+      "--model",
+      "{model}",
+      "run",
+      "{prompt}"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "{base_url}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy"
+    }
+  },
+  "racket": {
+    "cmd": [
+      "{repo}/racket/bin/cmh",
+      "--state",
+      "{state}",
+      "--model",
+      "{model}",
+      "run",
+      "{prompt}"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "{base_url}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy"
+    }
+  },
+  "lean": {
+    "cmd": [
+      "{repo}/lean/.lake/build/bin/cmh",
+      "--state",
+      "{state}",
+      "--model",
+      "{model}",
+      "run",
+      "{prompt}"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "{base_url}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy"
+    }
+  }
+}

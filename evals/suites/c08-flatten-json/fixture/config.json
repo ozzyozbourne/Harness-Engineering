@@ -1,0 +1,13 @@
+{
+  "name": "svc",
+  "version": 3,
+  "debug": false,
+  "owner": null,
+  "servers": [
+    {"host": "a.example", "ports": [80, 443], "tags": []},
+    {"host": "b.example", "ports": [], "meta": {}}
+  ],
+  "limits": {"cpu": 1.5, "mem": "512Mi", "per.user": {"max": 10, "burst.factor": 2}},
+  "matrix": [[1, 2], [], [[3]]],
+  "empty": {}
+}

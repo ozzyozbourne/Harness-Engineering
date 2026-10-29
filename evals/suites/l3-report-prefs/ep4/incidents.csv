@@ -1,0 +1,5 @@
+date,id,description
+02/03/2026,INC-7,API latency spike for 20 minutes
+02/11/2026,INC-8,Very slow dashboard after cache eviction
+02/19/2026,INC-9,Payment webhook retries delayed by 2 hours
+02/25/2026,INC-10,Search index rebuild failed overnight

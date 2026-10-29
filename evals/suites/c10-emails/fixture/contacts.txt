@@ -1,0 +1,21 @@
+Name, Email, Notes
+Ann Lee, <Ann.Lee@Example.com>, primary
+Bob, bob@example.com; BOB@EXAMPLE.COM, dup in caps
+"Cara" (cara+news@mail.co.uk), ok
+dan@localhost, no tld
+eve@@example.com, double at
+.frank@example.com, leading dot
+grace.@example.com, trailing dot
+hank..h@example.com, double dot
+ivy@-bad.com, label starts with hyphen
+jo@good-domain.io
+kim@example.c, tld too short
+li@ex4mple.com2, digit in tld
+mo_m-ax@sub.domain.org;
+nina@example.com.
+oscar@example.com,pat@example.net
+quinn@exa_mple.com underscore domain
+"rae@example.com"
+sam@example..com
+ted@example.museum
+uma@123.example.travel

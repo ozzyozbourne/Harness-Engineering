@@ -1,0 +1,3 @@
+{"track": "coding", "episodes": [{
+  "prompt": "Rename the function calc_total to compute_total everywhere in this project: its definition, every call site and import, and the tests. Behaviour must stay identical and `python3 -m unittest discover -s tests` must still pass.",
+  "fixture": "fixture", "check": "check.py"}]}
