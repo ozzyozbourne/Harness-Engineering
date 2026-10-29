@@ -1,0 +1,30 @@
+;; Seed userspace, installed as kept version 1 when the journal is empty.
+[{:name "compose_system"
+  :kind "hook"
+  :file "compose_system.clj"
+  :description "Builds the supplemental system prompt: notes under a Notes heading, lessons under Lessons."
+  :tests [{:input {:notes ["Prefer small diffs."] :lessons ["Run the tests first."]}
+           :expect "## Notes\n- Prefer small diffs."}
+          {:input {:notes [] :lessons ["Run the tests first."]}
+           :expect "## Lessons\n- Run the tests first."}]}
+ {:name "select_lessons"
+  :kind "hook"
+  :file "select_lessons.clj"
+  :description "Top 8 lessons by score sharing a 4+ letter word with the task, else the top 3 by score."
+  :tests [{:input {:task "fix the parser"
+                   :lessons [{:id "L1" :text "the parser needs care" :score 1}
+                             {:id "L2" :text "unrelated advice" :score 5}]}
+           :expect "[\"L1\"]"}
+          {:input {:task "zzz"
+                   :lessons [{:id "L1" :text "a" :score 1}
+                             {:id "L2" :text "b" :score 5}]}
+           :expect "[\"L2\",\"L1\"]"}]}
+ {:name "word_count"
+  :kind "tool"
+  :file "word_count.clj"
+  :description "Counts whitespace-separated words in text."
+  :input_schema {:type "object"
+                 :properties {:text {:type "string" :description "Text to count words in"}}
+                 :required ["text"]}
+  :tests [{:input {:text "one two  three"} :expect "3"}
+          {:input {:text ""} :expect "0"}]}]

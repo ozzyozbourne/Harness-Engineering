@@ -1,2 +1,12 @@
 # Amp orb runtime artifacts
 .amp/portals/*
+
+# cmh harness state and build output
+.cmh/
+rust/target/
+lean/.lake/
+clojure/.cpcache/
+racket/**/compiled/
+
+# eval run output (logs, per-episode results)
+evals/results/

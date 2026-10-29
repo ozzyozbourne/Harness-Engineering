@@ -1,0 +1,21 @@
+[package]
+name = "cmh"
+version = "0.1.0"
+edition = "2024"
+description = "cmh: a continual, self-modifying coding-agent harness (Rust flavor)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "cmh"
+path = "src/main.rs"
+
+[lib]
+name = "cmh"
+path = "src/lib.rs"
+
+[dependencies]
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }

@@ -1,0 +1,32 @@
+[
+  {
+    "name": "compose_system",
+    "kind": "hook",
+    "file": "compose_system.rktl",
+    "description": "Joins notes under a Notes heading and lessons under a Lessons heading",
+    "tests": [
+      {"input": {"notes": ["Prefer rg."], "lessons": ["Run tests first."]}, "expect": "## Notes\nPrefer rg."},
+      {"input": {"notes": [], "lessons": ["Run tests first."]}, "expect": "## Lessons\n- Run tests first."}
+    ]
+  },
+  {
+    "name": "select_lessons",
+    "kind": "hook",
+    "file": "select_lessons.rktl",
+    "description": "Top 8 scored lessons sharing a 4+ letter word with the task, else top 3 by score",
+    "tests": [
+      {"input": {"task": "fix the parser", "lessons": [{"id": 1, "text": "the parser is fragile", "score": 0}, {"id": 2, "text": "unrelated", "score": 5}]}, "expect": "[1]"},
+      {"input": {"task": "zzz", "lessons": [{"id": 1, "text": "a", "score": 0}, {"id": 2, "text": "b", "score": 5}]}, "expect": "[2,1]"}
+    ]
+  },
+  {
+    "name": "word_count",
+    "kind": "tool",
+    "file": "word_count.rktl",
+    "description": "Counts whitespace-separated words in text",
+    "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    "tests": [
+      {"input": {"text": "one two  three"}, "expect": "3"}
+    ]
+  }
+]

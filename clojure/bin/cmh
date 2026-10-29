@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# cmh (Clojure flavor). Runs in the caller's working directory.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CP="$(cd "$DIR" && clojure -Spath)"
+ABS=""
+IFS=: read -ra parts <<< "$CP"
+for p in "${parts[@]}"; do
+  case "$p" in /*) ;; *) p="$DIR/$p" ;; esac
+  ABS="${ABS:+$ABS:}$p"
+done
+exec java -Dcmh.home="$DIR" -cp "$ABS" clojure.main -m cmh.kernel.main "$@"

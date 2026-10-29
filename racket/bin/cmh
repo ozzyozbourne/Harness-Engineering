@@ -1,0 +1,4 @@
+#!/bin/sh
+# cmh, Racket flavor. Compile once with: raco make racket/main.rkt
+dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec racket "$dir/main.rkt" "$@"

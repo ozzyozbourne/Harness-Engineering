@@ -1,0 +1,19 @@
+[
+  {"name": "compose_system", "kind": "hook", "file": "compose_system.lean",
+   "description": "Builds the supplemental system prompt: notes under a Notes heading, lessons under Lessons.",
+   "tests": [{"input": {"notes": ["Prefer small diffs."], "lessons": ["Run tests first."]},
+              "expect": "## Notes\n- Prefer small diffs.\n\n## Lessons\n- Run tests first."}]},
+  {"name": "select_lessons", "kind": "hook", "file": "select_lessons.lean",
+   "description": "Picks the 8 best-scored lessons sharing a 4+ letter word with the task, else the top 3.",
+   "tests": [{"input": {"task": "fix the parser bug",
+                        "lessons": [{"id": 1, "text": "parser errors hide in lexer", "score": 0},
+                                    {"id": 2, "text": "unrelated", "score": 5}]},
+              "expect": "[1]"},
+             {"input": {"task": "zzz", "lessons": [{"id": 1, "text": "a", "score": 0},
+                                                   {"id": 2, "text": "b", "score": 5}]},
+              "expect": "[2,1]"}]},
+  {"name": "word_count", "kind": "tool", "file": "word_count.lean",
+   "description": "Counts whitespace-separated words in text.",
+   "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+   "tests": [{"input": {"text": "hello big  world"}, "expect": "3"}, {"input": {"text": ""}, "expect": "0"}]}
+]
