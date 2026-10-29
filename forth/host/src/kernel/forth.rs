@@ -10,21 +10,24 @@
 //! in linear memory, so `snapshot` is a copy of linear memory and `restore`
 //! is a fresh instance with that copy written back.
 
+use super::state::{i64_field, str_field};
 use super::tools;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Memory, Module, ResourceLimiter, Store, Trap, WasmParams, WasmResults};
+use wasmtime::{Caller, Config, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store, Trap, TypedFunc};
+
+/// Status codes and host word op codes shared with the VM (the same file is
+/// compiled into the VM as `mod abi`).
+#[path = "../../../vm/src/abi.rs"]
+mod abi;
+use abi::*;
 
 pub const VM_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmh_forth_vm.wasm"));
 
-const ST_OK: i32 = 0;
-const ST_ERR: i32 = 1;
-const ST_NEED: i32 = 2;
 const TICK: Duration = Duration::from_millis(10);
-const HOST_ERR: i64 = i64::MIN;
 const FILE_MAX: usize = 1 << 20;
 
 /// Resource limits for one entry into the VM (a call, a definition).
@@ -44,8 +47,9 @@ impl Default for Limits {
     }
 }
 
-/// Live userspace code the VM may compile lazily: name -> (version, source).
-pub type Live = BTreeMap<String, (u32, String)>;
+/// Live userspace code the VM may compile lazily: name -> (version, source),
+/// borrowed from the registry.
+pub type Live<'a> = BTreeMap<&'a str, (u32, &'a str)>;
 
 pub struct CallOutcome {
     pub result: Result<String, String>,
@@ -57,24 +61,31 @@ pub struct CallOutcome {
     pub lessons: Vec<String>,
 }
 
+/// A copy of the VM's linear memory: the whole Forth image.
 pub struct Snapshot(Vec<u8>);
 
+// A snapshot is never empty, so `len` (bytes, for traces) has no `is_empty`.
+#[allow(clippy::len_without_is_empty)]
 impl Snapshot {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
+/// Per-instance host state (the Wasmtime store data).
 struct Host {
     memory_cap: usize,
+    /// Linear memory growth was refused by the cap during this entry.
     memory_hit: bool,
+    /// A host word's result or error message, until the VM takes it.
     pending: Vec<u8>,
+    /// Live userspace names the VM may bind lazily (`host_known`).
     known: HashSet<String>,
+    /// The VM's panic message, if it panicked.
     panic: Option<String>,
+    /// Lessons from the `remember` host word during this entry.
     lessons: Vec<String>,
+    /// Canonical working directory: file host words stay inside it.
     work_dir: PathBuf,
     protected: Vec<PathBuf>,
 }
@@ -92,13 +103,24 @@ impl ResourceLimiter for Host {
     }
 }
 
-fn engine_module() -> Result<&'static (Engine, Module), String> {
-    static EM: OnceLock<Result<(Engine, Module), String>> = OnceLock::new();
-    EM.get_or_init(|| {
+/// Shared by every VM instance: the engine (with its epoch ticker thread)
+/// and the module, already linked against the host functions.
+struct Runtime {
+    engine: Engine,
+    pre: InstancePre<Host>,
+}
+
+fn runtime() -> Result<&'static Runtime, String> {
+    static RT: OnceLock<Result<Runtime, String>> = OnceLock::new();
+    RT.get_or_init(|| {
         let mut c = Config::new();
         c.consume_fuel(true).epoch_interruption(true);
         let engine = Engine::new(&c).map_err(|e| format!("wasmtime engine: {e:?}"))?;
         let module = Module::new(&engine, VM_WASM).map_err(|e| format!("compile Forth VM module: {e:?}"))?;
+        let pre = host_functions(&engine)
+            .and_then(|linker| linker.instantiate_pre(&module))
+            .map_err(|e| format!("link Forth VM: {e:?}"))?;
+        // The epoch ticker drives every store's wall-clock deadline.
         let ticker = engine.clone();
         std::thread::spawn(move || {
             loop {
@@ -106,35 +128,93 @@ fn engine_module() -> Result<&'static (Engine, Module), String> {
                 ticker.increment_epoch();
             }
         });
-        Ok((engine, module))
+        Ok(Runtime { engine, pre })
     })
     .as_ref()
     .map_err(Clone::clone)
 }
 
+/// The functions the VM imports from module "cmh".
+fn host_functions(engine: &Engine) -> wasmtime::Result<Linker<Host>> {
+    let mut linker: Linker<Host> = Linker::new(engine);
+    linker.func_wrap("cmh", "host_word", |mut c: Caller<'_, Host>, op: i32, a: i32, al: i32, b: i32, bl: i32| -> i64 {
+        host_word(&mut c, op, a, al, b, bl)
+    })?;
+    linker.func_wrap("cmh", "host_take", |mut c: Caller<'_, Host>, dst: i32| {
+        let data = std::mem::take(&mut c.data_mut().pending);
+        if let Some(Extern::Memory(m)) = c.get_export("memory") {
+            let _ = m.write(&mut c, dst as u32 as usize, &data);
+        }
+    })?;
+    linker.func_wrap("cmh", "host_pending_len", |c: Caller<'_, Host>| -> i32 { c.data().pending.len() as i32 })?;
+    linker.func_wrap("cmh", "host_known", |mut c: Caller<'_, Host>, p: i32, l: i32| -> i32 {
+        let name = read(&mut c, p, l).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        i32::from(c.data().known.contains(&name))
+    })?;
+    linker.func_wrap("cmh", "host_panic", |mut c: Caller<'_, Host>, p: i32, l: i32| {
+        let msg = read(&mut c, p, l).map(|b| String::from_utf8_lossy(&b).into_owned());
+        c.data_mut().panic = msg;
+    })?;
+    Ok(linker)
+}
+
+/// The VM's exports (`cmh_*` in `forth/vm/src/lib.rs`), resolved once per instance.
+struct Exports {
+    init: TypedFunc<(), ()>,
+    mailbox: TypedFunc<i32, i32>,
+    out_ptr: TypedFunc<(), i32>,
+    out_len: TypedFunc<(), i32>,
+    define: TypedFunc<(i32, i32, i32), i32>,
+    call: TypedFunc<(i32, i32), i32>,
+    resume: TypedFunc<i32, i32>,
+    bind: TypedFunc<(i32, i32), i32>,
+    unbind: TypedFunc<i32, ()>,
+    bound: TypedFunc<i32, i32>,
+    /// `cmh_where`: a report for wherever execution was when a trap hit.
+    locate: TypedFunc<(i32, i32), i32>,
+    stats: TypedFunc<(), i64>,
+}
+
+impl Exports {
+    fn resolve(inst: &wasmtime::Instance, store: &mut Store<Host>) -> WResult<Exports> {
+        Ok(Exports {
+            init: inst.get_typed_func(&mut *store, "cmh_init")?,
+            mailbox: inst.get_typed_func(&mut *store, "cmh_mailbox")?,
+            out_ptr: inst.get_typed_func(&mut *store, "cmh_out_ptr")?,
+            out_len: inst.get_typed_func(&mut *store, "cmh_out_len")?,
+            define: inst.get_typed_func(&mut *store, "cmh_define")?,
+            call: inst.get_typed_func(&mut *store, "cmh_call")?,
+            resume: inst.get_typed_func(&mut *store, "cmh_resume")?,
+            bind: inst.get_typed_func(&mut *store, "cmh_bind")?,
+            unbind: inst.get_typed_func(&mut *store, "cmh_unbind")?,
+            bound: inst.get_typed_func(&mut *store, "cmh_bound")?,
+            locate: inst.get_typed_func(&mut *store, "cmh_where")?,
+            stats: inst.get_typed_func(&mut *store, "cmh_stats")?,
+        })
+    }
+}
+
 pub struct ForthVm {
     store: Store<Host>,
-    inst: Instance,
     mem: Memory,
+    ex: Exports,
     limits: Limits,
 }
 
 type WResult<T> = wasmtime::Result<T>;
 
 impl ForthVm {
-    /// A brand-new VM with only the core words.
+    /// A brand-new VM with only the core words. `work_dir` must be canonical:
+    /// file host words compare canonical paths against it.
     pub fn new(limits: Limits, work_dir: PathBuf, protected: Vec<PathBuf>) -> Result<ForthVm, String> {
         let mut vm = Self::instantiate(limits, work_dir, protected)?;
         vm.budget();
-        vm.func::<(), ()>("cmh_init")
-            .and_then(|f| f.call(&mut vm.store, ()))
-            .map_err(|e| format!("Forth VM init failed: {e:?}"))?;
+        vm.ex.init.call(&mut vm.store, ()).map_err(|e| format!("Forth VM init failed: {e:?}"))?;
         Ok(vm)
     }
 
     fn instantiate(limits: Limits, work_dir: PathBuf, protected: Vec<PathBuf>) -> Result<ForthVm, String> {
-        let (engine, module) = engine_module()?;
-        let work_dir = work_dir.canonicalize().unwrap_or(work_dir);
+        let rt = runtime()?;
         let host = Host {
             memory_cap: limits.memory,
             memory_hit: false,
@@ -145,46 +225,13 @@ impl ForthVm {
             work_dir,
             protected,
         };
-        let mut store = Store::new(engine, host);
+        let mut store = Store::new(&rt.engine, host);
         store.limiter(|h| h);
         store.epoch_deadline_trap();
-        let mut linker: Linker<Host> = Linker::new(engine);
-        let e = |e: wasmtime::Error| format!("link Forth VM: {e:?}");
-        linker
-            .func_wrap("cmh", "host_word", |mut c: Caller<'_, Host>, op: i32, a: i32, al: i32, b: i32, bl: i32| -> i64 {
-                host_word(&mut c, op, a, al, b, bl)
-            })
-            .map_err(e)?;
-        linker
-            .func_wrap("cmh", "host_take", |mut c: Caller<'_, Host>, dst: i32| {
-                let data = std::mem::take(&mut c.data_mut().pending);
-                if let Some(Extern::Memory(m)) = c.get_export("memory") {
-                    let _ = m.write(&mut c, dst as u32 as usize, &data);
-                }
-            })
-            .map_err(e)?;
-        linker
-            .func_wrap("cmh", "host_pending_len", |c: Caller<'_, Host>| -> i32 { c.data().pending.len() as i32 })
-            .map_err(e)?;
-        linker
-            .func_wrap("cmh", "host_known", |mut c: Caller<'_, Host>, p: i32, l: i32| -> i32 {
-                let name = read(&mut c, p, l).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-                i32::from(c.data().known.contains(&name))
-            })
-            .map_err(e)?;
-        linker
-            .func_wrap("cmh", "host_panic", |mut c: Caller<'_, Host>, p: i32, l: i32| {
-                let msg = read(&mut c, p, l).map(|b| String::from_utf8_lossy(&b).into_owned());
-                c.data_mut().panic = msg;
-            })
-            .map_err(e)?;
-        let inst = linker.instantiate(&mut store, module).map_err(|e| format!("instantiate Forth VM: {e:?}"))?;
+        let inst = rt.pre.instantiate(&mut store).map_err(|e| format!("instantiate Forth VM: {e:?}"))?;
         let mem = inst.get_memory(&mut store, "memory").ok_or("Forth VM exports no memory")?;
-        Ok(ForthVm { store, inst, mem, limits })
-    }
-
-    fn func<P: WasmParams, R: WasmResults>(&mut self, name: &str) -> WResult<wasmtime::TypedFunc<P, R>> {
-        self.inst.get_typed_func::<P, R>(&mut self.store, name)
+        let ex = Exports::resolve(&inst, &mut store).map_err(|e| format!("instantiate Forth VM: {e:?}"))?;
+        Ok(ForthVm { store, mem, ex, limits })
     }
 
     /// Fresh fuel and wall-clock deadline for one entry into the VM.
@@ -194,16 +241,22 @@ impl ForthVm {
         self.store.set_epoch_deadline(ticks);
     }
 
+    /// Writes `parts` back to back into the VM's mailbox: the arguments of
+    /// the next export call, which gets their lengths.
     fn put_mail(&mut self, parts: &[&[u8]]) -> WResult<()> {
-        let all: Vec<u8> = parts.concat();
-        let ptr = self.func::<i32, i32>("cmh_mailbox")?.call(&mut self.store, all.len() as i32)?;
-        self.mem.write(&mut self.store, ptr as u32 as usize, &all)?;
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut at = self.ex.mailbox.call(&mut self.store, total as i32)? as u32 as usize;
+        for part in parts {
+            self.mem.write(&mut self.store, at, part)?;
+            at += part.len();
+        }
         Ok(())
     }
 
+    /// The VM's output buffer: a result, a report or a name, by status.
     fn out(&mut self) -> WResult<Vec<u8>> {
-        let p = self.func::<(), i32>("cmh_out_ptr")?.call(&mut self.store, ())? as u32 as usize;
-        let l = self.func::<(), i32>("cmh_out_len")?.call(&mut self.store, ())? as u32 as usize;
+        let p = self.ex.out_ptr.call(&mut self.store, ())? as u32 as usize;
+        let l = self.ex.out_len.call(&mut self.store, ())? as u32 as usize;
         let mut buf = vec![0u8; l];
         self.mem.read(&self.store, p, &mut buf)?;
         Ok(buf)
@@ -211,7 +264,7 @@ impl ForthVm {
 
     fn reset_host(&mut self, live: &Live) {
         let h = self.store.data_mut();
-        h.known = live.keys().cloned().collect();
+        h.known = live.keys().map(|k| k.to_string()).collect();
         h.panic = None;
         h.memory_hit = false;
         h.pending.clear();
@@ -231,11 +284,10 @@ impl ForthVm {
         }
     }
 
+    /// `Some(report)` if the source did not compile.
     fn define_inner(&mut self, name: &str, version: u32, source: &str) -> WResult<Option<Vec<u8>>> {
         self.put_mail(&[name.as_bytes(), source.as_bytes()])?;
-        let st = self
-            .func::<(i32, i32, i32), i32>("cmh_define")?
-            .call(&mut self.store, (name.len() as i32, source.len() as i32, version as i32))?;
+        let st = self.ex.define.call(&mut self.store, (name.len() as i32, source.len() as i32, version as i32))?;
         Ok(if st == ST_OK { None } else { Some(self.out()?) })
     }
 
@@ -255,15 +307,17 @@ impl ForthVm {
 
     fn call_inner(&mut self, name: &str, input: &[u8], live: &Live, loads: &mut Vec<(String, u32)>) -> WResult<Result<String, String>> {
         self.put_mail(&[name.as_bytes(), input])?;
-        let mut st = self.func::<(i32, i32), i32>("cmh_call")?.call(&mut self.store, (name.len() as i32, input.len() as i32))?;
+        let mut st = self.ex.call.call(&mut self.store, (name.len() as i32, input.len() as i32))?;
         loop {
             let out = self.out()?;
             match st {
                 ST_OK => return Ok(Ok(String::from_utf8_lossy(&out).into_owned())),
                 ST_ERR => return Ok(Err(format_report(&out, input))),
+                // The VM hit an unbound public slot: compile that definition
+                // (if it is live) and let the VM continue or fail.
                 ST_NEED => {
                     let need = String::from_utf8_lossy(&out).into_owned();
-                    let ok = match live.get(&need) {
+                    let ok = match live.get(need.as_str()) {
                         Some((v, src)) => {
                             if let Some(rep) = self.define_inner(&need, *v, src)? {
                                 return Ok(Err(format!(
@@ -276,46 +330,45 @@ impl ForthVm {
                         }
                         None => 0,
                     };
-                    st = self.func::<i32, i32>("cmh_resume")?.call(&mut self.store, ok)?;
+                    st = self.ex.resume.call(&mut self.store, ok)?;
                 }
                 other => return Ok(Err(format!("Forth VM returned unknown status {other}"))),
             }
         }
     }
 
+    /// Fresh budget, `name` in the mailbox, then the export `f` with
+    /// `params`: for the exports that take a definition name.
+    fn call_named<P: wasmtime::WasmParams, R: wasmtime::WasmResults>(
+        &mut self,
+        name: &str,
+        f: fn(&Exports) -> &TypedFunc<P, R>,
+        params: P,
+    ) -> WResult<R> {
+        self.budget();
+        self.put_mail(&[name.as_bytes()])?;
+        f(&self.ex).call(&mut self.store, params)
+    }
+
     /// Version bound to the public slot `name` (0 if not compiled/bound).
     pub fn bound(&mut self, name: &str) -> u32 {
-        self.budget();
-        let r: WResult<i32> = (|| {
-            self.put_mail(&[name.as_bytes()])?;
-            self.func::<i32, i32>("cmh_bound")?.call(&mut self.store, name.len() as i32)
-        })();
-        r.map_or(0, |v| v.max(0) as u32)
+        self.call_named(name, |ex| &ex.bound, name.len() as i32).map_or(0, |v| v.max(0) as u32)
     }
 
     /// Points `name` at an already compiled version. False if not compiled.
     pub fn bind(&mut self, name: &str, version: u32) -> bool {
-        self.budget();
-        let r: WResult<i32> = (|| {
-            self.put_mail(&[name.as_bytes()])?;
-            self.func::<(i32, i32), i32>("cmh_bind")?.call(&mut self.store, (name.len() as i32, version as i32))
-        })();
-        r.is_ok_and(|v| v == 1)
+        self.call_named(name, |ex| &ex.bind, (name.len() as i32, version as i32)).is_ok_and(|v| v == 1)
     }
 
     /// Unbinds `name`; its next call compiles the live version lazily.
     pub fn unbind(&mut self, name: &str) {
-        self.budget();
-        let _: WResult<()> = (|| {
-            self.put_mail(&[name.as_bytes()])?;
-            self.func::<i32, ()>("cmh_unbind")?.call(&mut self.store, name.len() as i32)
-        })();
+        let _ = self.call_named(name, |ex| &ex.unbind, name.len() as i32);
     }
 
     /// Bytes of Forth data space used and number of compiled words.
     pub fn stats(&mut self) -> (u64, u64) {
         self.budget();
-        let v = self.func::<(), i64>("cmh_stats").and_then(|f| f.call(&mut self.store, ())).unwrap_or(0);
+        let v = self.ex.stats.call(&mut self.store, ()).unwrap_or(0);
         ((v >> 32) as u64, (v & 0xffff_ffff) as u64)
     }
 
@@ -375,7 +428,7 @@ impl ForthVm {
         self.store.set_epoch_deadline(100);
         let loc: WResult<Vec<u8>> = (|| {
             self.put_mail(&[kind.as_bytes(), msg.as_bytes()])?;
-            self.func::<(i32, i32), i32>("cmh_where")?.call(&mut self.store, (kind.len() as i32, msg.len() as i32))?;
+            self.ex.locate.call(&mut self.store, (kind.len() as i32, msg.len() as i32))?;
             self.out()
         })();
         match loc {
@@ -388,10 +441,15 @@ impl ForthVm {
     }
 }
 
+/// The guest bytes at (p, l), if they are inside linear memory.
+fn guest_slice(data: &[u8], p: i32, l: i32) -> Option<&[u8]> {
+    let (p, l) = (p as u32 as usize, l as u32 as usize);
+    data.get(p..p.checked_add(l)?)
+}
+
 fn read(c: &mut Caller<'_, Host>, p: i32, l: i32) -> Option<Vec<u8>> {
     let Some(Extern::Memory(m)) = c.get_export("memory") else { return None };
-    let (p, l) = (p as u32 as usize, l as u32 as usize);
-    m.data(&*c).get(p..p.checked_add(l)?).map(<[u8]>::to_vec)
+    guest_slice(m.data(&*c), p, l).map(<[u8]>::to_vec)
 }
 
 enum HostOut {
@@ -400,9 +458,18 @@ enum HostOut {
 }
 
 fn host_word(c: &mut Caller<'_, Host>, op: i32, a: i32, al: i32, b: i32, bl: i32) -> i64 {
-    let r = match (read(c, a, al), read(c, b, bl)) {
-        (Some(x), Some(y)) => host_op(c.data_mut(), op, &x, &y),
-        _ => Err("string arguments are outside linear memory".into()),
+    const OUTSIDE: &str = "string arguments are outside linear memory";
+    // The arguments are read in place: guest memory and host state are
+    // borrowed side by side, without copying the strings.
+    let r = match c.get_export("memory") {
+        Some(Extern::Memory(m)) => {
+            let (data, host) = m.data_and_store_mut(&mut *c);
+            match (guest_slice(data, a, al), guest_slice(data, b, bl)) {
+                (Some(x), Some(y)) => host_op(host, op, x, y),
+                _ => Err(OUTSIDE.into()),
+            }
+        }
+        _ => Err(OUTSIDE.into()),
     };
     match r {
         Ok(HostOut::Str(s)) => {
@@ -469,7 +536,7 @@ fn checked_path(h: &Host, p: &[u8]) -> Result<PathBuf, String> {
     if !path.starts_with(&h.work_dir) {
         return Err(format!("refused `{raw}`: outside the working directory {}", h.work_dir.display()));
     }
-    if let Some(p) = h.protected.iter().find(|p| path.starts_with(p)) {
+    if let Some(p) = tools::protected_by(&path, &h.protected) {
         return Err(format!("refused `{raw}`: inside protected path {}", p.display()));
     }
     Ok(path)
@@ -478,7 +545,7 @@ fn checked_path(h: &Host, p: &[u8]) -> Result<PathBuf, String> {
 fn host_op(h: &mut Host, op: i32, x: &[u8], y: &[u8]) -> Result<HostOut, String> {
     match op {
         // json-get ( json path -- str )
-        1 => {
+        OP_JSON_GET => {
             let v = parse_json(x)?;
             let path = String::from_utf8_lossy(y);
             Ok(HostOut::Str(match lookup(&v, &path)? {
@@ -487,7 +554,7 @@ fn host_op(h: &mut Host, op: i32, x: &[u8], y: &[u8]) -> Result<HostOut, String>
             }))
         }
         // json-len ( json path -- n ): -1 if missing
-        2 => {
+        OP_JSON_LEN => {
             let v = parse_json(x)?;
             let path = String::from_utf8_lossy(y);
             Ok(HostOut::Num(match lookup(&v, &path) {
@@ -499,27 +566,32 @@ fn host_op(h: &mut Host, op: i32, x: &[u8], y: &[u8]) -> Result<HostOut, String>
             }))
         }
         // json-str ( str -- "json string" )
-        3 => Ok(HostOut::Str(Value::String(String::from_utf8_lossy(x).into_owned()).to_string().into_bytes())),
+        OP_JSON_STR => Ok(HostOut::Str(Value::String(String::from_utf8_lossy(x).into_owned()).to_string().into_bytes())),
         // file-read ( path -- contents )
-        4 => {
+        OP_FILE_READ => {
             let path = checked_path(h, x)?;
+            // Refuse a big file before reading it. A failed stat is left to
+            // the read, so its error message is the read's.
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.len() > FILE_MAX as u64
+            {
+                return Err(too_big(&path, meta.len()));
+            }
             let data = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+            // Files whose size stat does not report (e.g. under /proc).
             if data.len() > FILE_MAX {
-                return Err(format!("{} is {} bytes; file-read is limited to {FILE_MAX}", path.display(), data.len()));
+                return Err(too_big(&path, data.len() as u64));
             }
             Ok(HostOut::Str(data))
         }
         // file-write ( contents path -- )
-        5 => {
+        OP_FILE_WRITE => {
             let path = checked_path(h, y)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(&path, x).map_err(|e| format!("write {}: {e}", path.display()))?;
+            tools::write_creating_dirs(&path, x)?;
             Ok(HostOut::Num(0))
         }
         // remember ( text -- )
-        6 => {
+        OP_REMEMBER => {
             let t = String::from_utf8_lossy(x).trim().to_string();
             if t.is_empty() {
                 return Err("empty lesson text".into());
@@ -531,6 +603,10 @@ fn host_op(h: &mut Host, op: i32, x: &[u8], y: &[u8]) -> Result<HostOut, String>
         }
         other => Err(format!("unknown host word {other}")),
     }
+}
+
+fn too_big(path: &Path, len: u64) -> String {
+    format!("{} is {len} bytes; file-read is limited to {FILE_MAX}", path.display())
 }
 
 fn hint(kind: &str) -> Option<&'static str> {
@@ -551,35 +627,30 @@ fn hint(kind: &str) -> Option<&'static str> {
     })
 }
 
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { format!("{}...", s.chars().take(max).collect::<String>()) }
-}
-
 /// Formats a VM error report (JSON) as the text the model sees.
 pub fn format_report(json: &[u8], input: &[u8]) -> String {
     let Ok(v) = serde_json::from_slice::<Value>(json) else {
         return format!("forth error: {}", String::from_utf8_lossy(json));
     };
-    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let n = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
-    let kind = s("kind");
+    let (kind, word, def, token) = (str_field(&v, "kind"), str_field(&v, "word"), str_field(&v, "def"), str_field(&v, "token"));
+    let line = i64_field(&v, "line");
     let mut out = format!("forth error [{kind}]");
-    if !s("word").is_empty() {
-        out.push_str(&format!(" in word `{}`", s("word")));
+    if !word.is_empty() {
+        out.push_str(&format!(" in word `{word}`"));
     }
-    if !s("def").is_empty() {
-        out.push_str(&format!(" of {} v{}", s("def"), n("version")));
+    if !def.is_empty() {
+        out.push_str(&format!(" of {def} v{}", i64_field(&v, "version")));
     }
-    if n("line") > 0 {
-        out.push_str(&format!(", line {}", n("line")));
+    if line > 0 {
+        out.push_str(&format!(", line {line}"));
     }
-    if !s("token").is_empty() && s("token") != "<entry>" {
-        out.push_str(&format!(", at `{}`", s("token")));
+    if !token.is_empty() {
+        out.push_str(&format!(", at `{token}`"));
     }
-    out.push_str(&format!(":\n  {}", s("message")));
+    out.push_str(&format!(":\n  {}", str_field(&v, "message")));
     if kind != "compile-error" && v.get("stack").is_some() {
         let items: Vec<String> = v["stack"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
-        let depth = n("depth");
+        let depth = i64_field(&v, "depth");
         let more = if depth as usize > items.len() { "... " } else { "" };
         out.push_str(&format!("\n  data stack (depth {depth}, top last): [{more}{}]", items.join(" ")));
     }
@@ -590,11 +661,12 @@ pub fn format_report(json: &[u8], input: &[u8]) -> String {
     if let Some(t) = v.get("top_string").and_then(Value::as_str) {
         out.push_str(&format!("\n  top two items as a string: {t:?}"));
     }
-    if !s("output").is_empty() {
-        out.push_str(&format!("\n  output before the error: {:?}", clip(&s("output"), 300)));
+    let output = str_field(&v, "output");
+    if !output.is_empty() {
+        out.push_str(&format!("\n  output before the error: {:?}", tools::clip(&output, 300)));
     }
     if !input.is_empty() {
-        out.push_str(&format!("\n  input: {}", clip(&String::from_utf8_lossy(input), 300)));
+        out.push_str(&format!("\n  input: {}", tools::clip(&String::from_utf8_lossy(input), 300)));
     }
     if let Some(h) = hint(&kind) {
         out.push_str(&format!("\n  hint: {h}"));

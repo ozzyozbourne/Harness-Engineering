@@ -79,25 +79,31 @@ pub struct State {
     pub tasks: Vec<TaskRecord>,
 }
 
-fn s(ev: &Value, k: &str) -> String {
-    ev.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
+/// String field `k` of a JSON object ("" if missing or not a string).
+pub(crate) fn str_field(v: &Value, k: &str) -> String {
+    v.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
 }
-fn u(ev: &Value, k: &str) -> u32 {
-    ev.get(k).and_then(Value::as_u64).unwrap_or(0) as u32
+/// Unsigned field `k` (0 if missing).
+pub(crate) fn u32_field(v: &Value, k: &str) -> u32 {
+    v.get(k).and_then(Value::as_u64).unwrap_or(0) as u32
+}
+/// Signed field `k` (0 if missing).
+pub(crate) fn i64_field(v: &Value, k: &str) -> i64 {
+    v.get(k).and_then(Value::as_i64).unwrap_or(0)
 }
 
 impl State {
     pub fn apply(&mut self, ev: &Value) {
-        let name = s(ev, "name");
+        let name = str_field(ev, "name");
         match ev.get("type").and_then(Value::as_str).unwrap_or("") {
             "def_trial" => {
                 let def = self.defs.entry(name.clone()).or_insert_with(|| Def { name, ..Def::default() });
-                let version = u(ev, "version");
+                let version = u32_field(ev, "version");
                 def.versions.push(DefVersion {
                     version,
-                    kind: s(ev, "kind"),
-                    source: s(ev, "source"),
-                    description: s(ev, "description"),
+                    kind: str_field(ev, "kind"),
+                    source: str_field(ev, "source"),
+                    description: str_field(ev, "description"),
                     tests: ev.get("tests").cloned().unwrap_or(json!([])),
                     input_schema: ev.get("input_schema").cloned().unwrap_or(Value::Null),
                     status: "trial".into(),
@@ -109,54 +115,36 @@ impl State {
                 if let Some(def) = self.defs.get_mut(&name) {
                     let ok = ev.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     let trial = def.live_version().is_some_and(|v| v.status == "trial");
-                    if ok && trial && def.live == Some(u(ev, "version")) {
+                    if ok && trial && def.live == Some(u32_field(ev, "version")) {
                         def.soak_uses += 1;
                     }
                 }
             }
-            "def_kept" => {
-                let version = u(ev, "version");
-                if let Some(def) = self.defs.get_mut(&name) {
-                    if let Some(v) = def.get_mut(version) {
-                        v.status = "kept".into();
-                    }
-                    def.soak_uses = 0;
-                }
-                self.push_verdict(ev, "kept");
-            }
-            "def_reverted" => {
-                let version = u(ev, "version");
-                if let Some(def) = self.defs.get_mut(&name) {
-                    if let Some(v) = def.get_mut(version) {
-                        v.status = "reverted".into();
-                    }
-                    def.live = ev.get("restored").and_then(Value::as_u64).map(|r| r as u32);
-                    def.soak_uses = 0;
-                }
-                self.push_verdict(ev, "reverted");
-            }
+            "def_kept" => self.settle(&name, ev, "kept"),
+            "def_reverted" => self.settle(&name, ev, "reverted"),
             "lesson_added" => self.lessons.push(Lesson {
-                id: ev.get("id").and_then(Value::as_i64).unwrap_or(0),
-                text: s(ev, "text"),
+                id: i64_field(ev, "id"),
+                text: str_field(ev, "text"),
                 score: 0,
                 retired: false,
-                origin: s(ev, "origin"),
+                origin: str_field(ev, "origin"),
             }),
             "lesson_scored" => {
-                let id = ev.get("id").and_then(Value::as_i64).unwrap_or(0);
+                let id = i64_field(ev, "id");
                 if let Some(l) = self.lessons.iter_mut().find(|l| l.id == id) {
+                    // A missing score keeps the old one (not 0).
                     l.score = ev.get("score").and_then(Value::as_i64).unwrap_or(l.score);
                 }
             }
             "lesson_retired" => {
-                let id = ev.get("id").and_then(Value::as_i64).unwrap_or(0);
+                let id = i64_field(ev, "id");
                 if let Some(l) = self.lessons.iter_mut().find(|l| l.id == id) {
                     l.retired = true;
                 }
             }
             "task_started" => self.tasks.push(TaskRecord {
                 id: ev.get("task_id").and_then(Value::as_u64).unwrap_or(0),
-                task: s(ev, "task"),
+                task: str_field(ev, "task"),
                 success: None,
                 summary: String::new(),
             }),
@@ -164,7 +152,7 @@ impl State {
                 let id = ev.get("task_id").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     t.success = ev.get("success").and_then(Value::as_bool);
-                    t.summary = s(ev, "summary");
+                    t.summary = str_field(ev, "summary");
                 }
             }
             // def_proposed / def_rejected are history only.
@@ -172,20 +160,40 @@ impl State {
         }
     }
 
+    /// Ends a soak (`def_kept` / `def_reverted`): the version gets `status`,
+    /// a revert makes `restored` live (none if missing), and the verdict is kept.
+    fn settle(&mut self, name: &str, ev: &Value, status: &str) {
+        if let Some(def) = self.defs.get_mut(name) {
+            if let Some(v) = def.get_mut(u32_field(ev, "version")) {
+                v.status = status.into();
+            }
+            if status == "reverted" {
+                def.live = ev.get("restored").and_then(Value::as_u64).map(|r| r as u32);
+            }
+            def.soak_uses = 0;
+        }
+        self.push_verdict(ev, status);
+    }
+
     fn push_verdict(&mut self, ev: &Value, outcome: &str) {
         if ev.get("seed").and_then(Value::as_bool) == Some(true) {
             return;
         }
         self.verdicts.push(Verdict {
-            name: s(ev, "name"),
-            version: u(ev, "version"),
+            name: str_field(ev, "name"),
+            version: u32_field(ev, "version"),
             outcome: outcome.into(),
-            text: s(ev, "verdict"),
+            text: str_field(ev, "verdict"),
         });
     }
 
     pub fn live(&self, name: &str) -> Option<&DefVersion> {
         self.defs.get(name).and_then(Def::live_version)
+    }
+
+    /// Every definition that has a live version, with that version, by name.
+    pub fn live_defs(&self) -> impl Iterator<Item = (&Def, &DefVersion)> {
+        self.defs.values().filter_map(|d| d.live_version().map(|v| (d, v)))
     }
 
     pub fn active_lessons(&self) -> impl Iterator<Item = &Lesson> {

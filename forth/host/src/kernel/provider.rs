@@ -7,11 +7,11 @@ use std::time::Duration;
 
 pub const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-pub struct ModelRequest {
+pub struct ModelRequest<'a> {
     /// System blocks chosen by the kernel: base prompt, then supplemental.
     pub system: Vec<String>,
-    pub tools: Vec<Value>,
-    pub messages: Vec<Value>,
+    pub tools: &'a [Value],
+    pub messages: &'a [Value],
 }
 
 pub struct ModelResponse {
@@ -41,7 +41,7 @@ pub fn request_body(model: &str, req: &ModelRequest, oauth: bool) -> Value {
         "messages": req.messages,
     });
     if !req.tools.is_empty() {
-        body["tools"] = Value::Array(req.tools.clone());
+        body["tools"] = Value::Array(req.tools.to_vec());
     }
     body
 }

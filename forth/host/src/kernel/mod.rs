@@ -14,9 +14,9 @@ mod provider_tests;
 use journal::Journal;
 use provider::{ModelRequest, Provider};
 use serde_json::{Value, json};
-use state::{DefVersion, State, words};
-use std::path::{Path, PathBuf};
-use forth::{ForthVm, Limits, Live};
+use forth::{ForthVm, Limits, Live, Snapshot};
+use state::{DefVersion, State, str_field, words};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const BASE_PROMPT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../base-prompt.md");
@@ -25,15 +25,15 @@ const BASE_PROMPT_EMBEDDED: &str = include_str!("../../../../base-prompt.md");
 const KERNEL_SRC: &str = env!("CARGO_MANIFEST_DIR");
 /// Kernel-owned system block after the base prompt: the Forth dialect.
 pub const FORTH_REFERENCE: &str = include_str!("forth_reference.md");
-/// Definitions compiled eagerly at startup; everything else loads lazily.
-const SEED_NAMES: [&str; 3] = ["compose_system", "select_lessons", "word_count"];
 
 pub const REFINE_PROMPT: &str = "Refine yourself. Review the recent task outcomes below, the verdicts in your system prompt, \
 and your current userspace (use list_defs, show_def and recall). Then improve userspace through propose_def or knowledge \
 through remember. Make at most 3 changes, prefer small ones, and give every tool or hook real tests. \
 Finish with a short summary of what you changed and why.";
 
-/// Seed userspace, installed as kept v1 when the journal is empty.
+/// Seed userspace, installed as kept v1 when the journal is empty. The live
+/// versions of these names are compiled eagerly at startup; everything else
+/// loads lazily.
 struct Seed {
     name: &'static str,
     kind: &'static str,
@@ -109,6 +109,10 @@ pub struct Kernel {
     journal: Journal,
     /// The live Forth image. Validation never touches it.
     vm: ForthVm,
+    /// Canonical working directory for every Forth VM's file host words.
+    vm_work_dir: PathBuf,
+    /// Paths no kernel tool or host word may write (`protected_paths`).
+    protected: Vec<PathBuf>,
     /// Definitions compiled lazily so far in this process (name, version).
     pub lazy_loads: Vec<(String, u32)>,
     provider: Box<dyn Provider>,
@@ -119,9 +123,9 @@ pub fn trace(line: &str) {
     eprintln!("{line}");
 }
 
+/// The first non-blank line of `s`, trimmed and clipped to `max` characters.
 fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    if line.chars().count() > max { format!("{}...", line.chars().take(max).collect::<String>()) } else { line.to_string() }
+    tools::clip(s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim(), max)
 }
 
 fn compact(v: &Value, max: usize) -> String {
@@ -140,9 +144,14 @@ impl Kernel {
         let journal = Journal::open(&state_dir)?;
         let mut cfg = cfg;
         cfg.state_dir = state_dir.clone();
-        let vm = ForthVm::new(cfg.limits.clone(), cfg.work_dir.clone(), protected_paths(&cfg))?;
+        // After Journal::open, so the state dir exists and resolves canonically.
+        let protected = protected_paths(&cfg);
+        let vm_work_dir = cfg.work_dir.canonicalize().unwrap_or_else(|_| cfg.work_dir.clone());
+        let vm = ForthVm::new(cfg.limits.clone(), vm_work_dir.clone(), protected.clone())?;
         let mut k = Kernel {
             vm,
+            vm_work_dir,
+            protected,
             lazy_loads: Vec::new(),
             cfg,
             state: State::default(),
@@ -172,8 +181,8 @@ impl Kernel {
     /// Compiles the live versions of the seed-named definitions into the
     /// live VM. Every other definition is compiled on its first call.
     fn load_seeds(&mut self) {
-        let code = self.live_code();
-        for name in SEED_NAMES {
+        let code = live_code(&self.state);
+        for name in SEEDS.map(|s| s.name) {
             if let Some((v, src)) = code.get(name)
                 && let Err(e) = self.vm.define(name, *v, src, &code)
             {
@@ -182,20 +191,17 @@ impl Kernel {
         }
     }
 
-    /// name -> (live version, source) for every compiled kind.
-    fn live_code(&self) -> Live {
-        self.state
-            .defs
-            .values()
-            .filter_map(|d| d.live_version().filter(|v| v.kind != "note").map(|v| (d.name.clone(), (v.version, v.source.clone()))))
-            .collect()
+    /// A fresh VM with only the core words (scratch VMs, and the fallback
+    /// when a snapshot cannot be restored).
+    fn new_vm(&self) -> Result<ForthVm, String> {
+        ForthVm::new(self.cfg.limits.clone(), self.vm_work_dir.clone(), self.protected.clone())
     }
 
     /// Makes the VM's public slot for `name` match the registry: bound to
     /// `version` if that version is compiled, otherwise unbound (lazy).
+    /// Binding is idempotent and fails only if the version is not compiled.
     fn sync_slot(&mut self, name: &str, version: Option<u32>) {
         match version {
-            Some(v) if self.vm.bound(name) == v => {}
             Some(v) if self.vm.bind(name, v) => {}
             _ => self.vm.unbind(name),
         }
@@ -217,7 +223,9 @@ impl Kernel {
         Ok(ev)
     }
 
-    fn rec(&mut self, kind: &str, fields: Value) {
+    /// `record` for events whose loss must not stop the agent: a failed
+    /// journal write is only traced.
+    fn record_or_trace(&mut self, kind: &str, fields: Value) {
         if let Err(e) = self.record(kind, fields) {
             trace(&format!("[journal] write failed: {e}"));
         }
@@ -225,7 +233,8 @@ impl Kernel {
 
     // ----------------------------------------------------------------- gate
 
-    fn validate(&mut self, name: &str, kind: &str, version: u32, source: &str, tests: &Value, schema: &Value) -> Result<usize, String> {
+    /// Shape checks, then compiles `source` in a scratch VM and runs its tests there.
+    fn validate(&self, name: &str, kind: &str, version: u32, source: &str, tests: &Value, schema: &Value) -> Result<(), String> {
         let valid_name = name.len() <= 48
             && name.starts_with(|c: char| c.is_ascii_lowercase())
             && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
@@ -247,7 +256,7 @@ impl Kernel {
             return Err("source is empty".into());
         }
         if kind == "note" {
-            return Ok(0);
+            return Ok(());
         }
         if kind == "hook" && !["compose_system", "select_lessons"].contains(&name) {
             return Err(format!("unknown hook `{name}`: hooks must be named compose_system or select_lessons"));
@@ -264,17 +273,15 @@ impl Kernel {
         // Scratch: a brand-new wasm instance with its own store and fuel. The
         // live VM is not touched.
         let t0 = Instant::now();
-        let code = self.live_code();
-        let mut scratch = ForthVm::new(self.cfg.limits.clone(), self.cfg.work_dir.clone(), protected_paths(&self.cfg))?;
+        let code = live_code(&self.state);
+        let mut scratch = self.new_vm()?;
         scratch.define(name, version, source, &code).map_err(|e| format!("compile failed:\n{e}"))?;
-        let compiled = scratch.snapshot();
+        // No snapshot/restore between tests: a trapped call always fails its
+        // test, which ends validation, so a trapped instance is never reused.
         for (i, t) in tests.iter().enumerate() {
             let expect = t["expect"].as_str().unwrap_or_default();
             let input = t["input"].to_string();
             let out = scratch.call(name, input.as_bytes(), &code);
-            if out.trapped {
-                scratch.restore(&compiled)?;
-            }
             let result = out.result.and_then(|o| check_output(name, &o).map(|()| o));
             match result {
                 Ok(out) if out.contains(expect) => {}
@@ -288,52 +295,50 @@ impl Kernel {
             }
         }
         trace(&format!("[gate] scratch vm: {name} v{version} compiled, {} test(s) passed in {} ms", tests.len(), t0.elapsed().as_millis()));
-        Ok(tests.len())
+        Ok(())
     }
 
     /// Scratchpad: compiles and runs a snippet in a throwaway VM. Nothing is
     /// journaled, so experiments do not count as proposals.
-    fn forth_eval(&mut self, input: &Value) -> Result<String, String> {
-        let source = input.get("source").and_then(Value::as_str).unwrap_or("");
+    fn forth_eval(&self, input: &Value) -> Result<String, String> {
+        let source = str_field(input, "source");
         if source.trim().is_empty() {
             return Err("source is empty".into());
         }
         let arg = input.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
-        let code = self.live_code();
-        let mut vm = ForthVm::new(self.cfg.limits.clone(), self.cfg.work_dir.clone(), protected_paths(&self.cfg))?;
-        vm.define("scratchpad", 1, source, &code).map_err(|e| format!("compile failed:\n{e}"))?;
+        let code = live_code(&self.state);
+        let mut vm = self.new_vm()?;
+        vm.define("scratchpad", 1, &source, &code).map_err(|e| format!("compile failed:\n{e}"))?;
         let out = vm.call("scratchpad", arg.to_string().as_bytes(), &code);
         out.result.map(|o| format!("output: {}", tools::truncate(&o, 20 * 1024)))
     }
 
     /// The gate. Returns the verdict text for the model, `Err` if rejected.
     pub fn propose_def(&mut self, input: &Value) -> Result<String, String> {
-        let name = input.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let kind = input.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
-        let source = input.get("source").and_then(Value::as_str).unwrap_or("").to_string();
-        let description = input.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+        let (name, kind) = (str_field(input, "name"), str_field(input, "kind"));
+        let (source, description) = (str_field(input, "source"), str_field(input, "description"));
         let tests = input.get("tests").cloned().unwrap_or(json!([]));
         let schema = if kind == "tool" { input.get("input_schema").cloned().unwrap_or(Value::Null) } else { Value::Null };
-        self.rec("def_proposed", json!({"name": name, "kind": kind, "source": source,
+        self.record_or_trace("def_proposed", json!({"name": name, "kind": kind, "source": source,
             "description": description, "tests": tests, "input_schema": schema}));
         let version = self.state.defs.get(&name).map_or(1, |d| d.next_version());
-        let rec = DefVersion { version, kind, source, description, tests, input_schema: schema, status: "trial".into() };
-        self.install_trial(&name, rec, "propose")
+        let candidate = DefVersion { version, kind, source, description, tests, input_schema: schema, status: "trial".into() };
+        self.install_trial(&name, candidate, "propose")
     }
 
     pub fn rollback_def(&mut self, name: &str, version: u32) -> Result<String, String> {
         let def = self.state.defs.get(name).ok_or(format!("no definition named `{name}`"))?;
         let old = def.get(version).ok_or(format!("`{name}` has no version {version}"))?.clone();
-        let rec = DefVersion { version: def.next_version(), status: "trial".into(), ..old };
-        self.install_trial(name, rec, &format!("rollback to v{version}"))
+        let candidate = DefVersion { version: def.next_version(), status: "trial".into(), ..old };
+        self.install_trial(name, candidate, &format!("rollback to v{version}"))
     }
 
-    fn install_trial(&mut self, name: &str, rec: DefVersion, origin: &str) -> Result<String, String> {
-        let v = rec.version;
-        if let Err(e) = self.validate(name, &rec.kind, v, &rec.source, &rec.tests, &rec.input_schema) {
-            self.rec("def_rejected", json!({"name": name, "version": v, "error": e}));
-            trace(&format!("[gate] {name} v{v} rejected: {}", first_line(&e, 120)));
-            return Err(format!("rejected: {e}\nThe live version is unchanged."));
+    /// Validates `candidate` in a scratch VM, then makes it the live trial
+    /// version (compiled into the live VM unless it is a note).
+    fn install_trial(&mut self, name: &str, candidate: DefVersion, origin: &str) -> Result<String, String> {
+        let v = candidate.version;
+        if let Err(e) = self.validate(name, &candidate.kind, v, &candidate.source, &candidate.tests, &candidate.input_schema) {
+            return self.reject(name, v, &e, &e);
         }
         // A trial that is still soaking is superseded (reverted) first.
         if let Some(def) = self.state.defs.get(name)
@@ -342,38 +347,43 @@ impl Kernel {
         {
             let (lv, desc, restored) = (live.version, live.description.clone(), def.last_kept());
             let verdict = format!("def {name} v{lv} ({desc:?}) reverted: superseded by v{v} before its soak finished");
-            self.rec("def_reverted", json!({"name": name, "version": lv, "restored": restored, "error": "superseded", "verdict": verdict}));
+            self.record_or_trace("def_reverted", json!({"name": name, "version": lv, "restored": restored, "error": "superseded", "verdict": verdict}));
         }
-        if rec.kind != "note" {
-            let code = self.live_code();
-            if let Err(e) = self.vm.define(name, v, &rec.source, &code) {
-                self.rec("def_rejected", json!({"name": name, "version": v, "error": e}));
-                trace(&format!("[gate] {name} v{v} rejected: {}", first_line(&e, 120)));
-                return Err(format!("rejected: compile in the live VM failed:\n{e}\nThe live version is unchanged."));
+        if candidate.kind != "note" {
+            let code = live_code(&self.state);
+            if let Err(e) = self.vm.define(name, v, &candidate.source, &code) {
+                return self.reject(name, v, &e, &format!("compile in the live VM failed:\n{e}"));
             }
         }
-        self.rec("def_trial", json!({"name": name, "version": v, "kind": rec.kind, "source": rec.source,
-            "description": rec.description, "tests": rec.tests, "input_schema": rec.input_schema, "origin": origin}));
+        self.record_or_trace("def_trial", json!({"name": name, "version": v, "kind": candidate.kind, "source": candidate.source,
+            "description": candidate.description, "tests": candidate.tests, "input_schema": candidate.input_schema, "origin": origin}));
         let soak = self.cfg.soak;
-        Ok(match rec.kind.as_str() {
+        Ok(match candidate.kind.as_str() {
             "note" => format!("trial v{v}: note `{name}` is live; kept after {soak} tasks that do not fail."),
             _ => format!("trial v{v}: compiled in a scratch VM and passed {} test(s); `{name}` is live now and is kept after {soak} clean uses (any error reverts it).",
-                rec.tests.as_array().map_or(0, Vec::len)),
+                candidate.tests.as_array().map_or(0, Vec::len)),
         })
+    }
+
+    /// Journals a rejected proposal; the model sees "rejected: {shown}".
+    fn reject(&mut self, name: &str, version: u32, error: &str, shown: &str) -> Result<String, String> {
+        self.record_or_trace("def_rejected", json!({"name": name, "version": version, "error": error}));
+        trace(&format!("[gate] {name} v{version} rejected: {}", first_line(error, 120)));
+        Err(format!("rejected: {shown}\nThe live version is unchanged."))
     }
 
     /// Records one use of a live definition and applies the soak rules.
     /// Returns a note for the model when the use reverted the trial.
     fn record_use(&mut self, name: &str, version: u32, result: &Result<String, String>, input: &Value) -> Option<String> {
         let error = result.as_ref().err().cloned();
-        self.rec("def_use", json!({"name": name, "version": version, "ok": error.is_none(), "error": error}));
+        self.record_or_trace("def_use", json!({"name": name, "version": version, "ok": error.is_none(), "error": error}));
         let def = self.state.defs.get(name)?;
         let live = def.live_version().filter(|l| l.version == version && l.status == "trial")?;
         let (desc, is_code) = (live.description.clone(), live.kind != "note");
         if let Some(err) = error {
             let restored = def.last_kept();
             let verdict = format!("def {name} v{version} ({desc:?}) reverted: {} on input {}", first_line(&err, 200), compact(input, 200));
-            self.rec("def_reverted", json!({"name": name, "version": version, "restored": restored, "error": err, "verdict": verdict}));
+            self.record_or_trace("def_reverted", json!({"name": name, "version": version, "restored": restored, "error": err, "verdict": verdict}));
             let now = restored.map_or("definition removed".into(), |r| format!("live: v{r}"));
             trace(&format!("[gate] {name} v{version} reverted: {} ({now})", first_line(&err, 100)));
             if is_code {
@@ -382,7 +392,7 @@ impl Kernel {
             return Some(format!("trial v{version} of `{name}` was reverted by this error ({now}); the verdict is recorded."));
         } else if def.soak_uses >= self.cfg.soak {
             let verdict = format!("def {name} v{version} ({desc:?}) kept after {} clean uses", def.soak_uses);
-            self.rec("def_kept", json!({"name": name, "version": version, "verdict": verdict}));
+            self.record_or_trace("def_kept", json!({"name": name, "version": version, "verdict": verdict}));
             trace(&format!("[gate] {name} v{version} kept"));
         }
         None
@@ -390,15 +400,16 @@ impl Kernel {
 
     /// Late binding: resolves `name` in the registry on every call; inside
     /// the VM every call goes through the slot named `name`.
-    pub fn call_def(&mut self, name: &str, input: &Value, check: fn(&str) -> Result<(), String>) -> Result<String, String> {
-        let Some(live) = self.state.live(name).cloned() else {
+    pub fn call_def(&mut self, name: &str, input: &Value) -> Result<String, String> {
+        let Some((version, is_note, is_trial)) = self.state.live(name).map(|v| (v.version, v.kind == "note", v.status == "trial"))
+        else {
             return Err(format!("no live definition `{name}`"));
         };
-        if live.kind == "note" {
+        if is_note {
             return Err(format!("`{name}` is a note, not code"));
         }
-        self.sync_slot(name, Some(live.version));
-        let code = self.live_code();
+        self.sync_slot(name, Some(version));
+        let code = live_code(&self.state);
         // Snapshot the whole Forth image (linear memory) before the call.
         let snap = self.vm.snapshot();
         let input_text = input.to_string();
@@ -407,32 +418,39 @@ impl Kernel {
             trace(&format!("[forth] lazy-load {n} v{v}"));
             self.lazy_loads.push((n.clone(), *v));
         }
-        let result = out.result.and_then(|s| check(&s).map(|()| s));
+        let result = out.result.and_then(|s| check_output(name, &s).map(|()| s));
+        // A trap may leave the image inconsistent, and a failing trial must
+        // not keep anything it changed (it is reverted below).
         if let Err(e) = &result
-            && (out.trapped || live.status == "trial")
+            && (out.trapped || is_trial)
         {
-            let why = first_line(e, 60);
-            match self.vm.restore(&snap) {
-                Ok(()) => trace(&format!("[forth] snapshot restored ({} KB) after: {why}", snap.len() >> 10)),
-                Err(re) => {
-                    trace(&format!("[forth] snapshot restore failed ({re}); starting a fresh VM"));
-                    match ForthVm::new(self.cfg.limits.clone(), self.cfg.work_dir.clone(), protected_paths(&self.cfg)) {
-                        Ok(vm) => {
-                            self.vm = vm;
-                            self.load_seeds();
-                        }
-                        Err(e2) => trace(&format!("[forth] fresh VM failed: {e2}")),
-                    }
-                }
-            }
+            self.restore_vm(&snap, &first_line(e, 60));
         }
         for l in out.lessons {
             let _ = self.remember(&l, "forth");
         }
-        let note = self.record_use(name, live.version, &result, input);
+        let note = self.record_use(name, version, &result, input);
         match (result, note) {
             (Err(e), Some(n)) => Err(format!("{e}\n{n}")),
             (r, _) => r,
+        }
+    }
+
+    /// Puts the live VM back to `snap`; if that fails, starts a fresh VM
+    /// with the seeds compiled.
+    fn restore_vm(&mut self, snap: &Snapshot, why: &str) {
+        match self.vm.restore(snap) {
+            Ok(()) => trace(&format!("[forth] snapshot restored ({} KB) after: {why}", snap.len() >> 10)),
+            Err(re) => {
+                trace(&format!("[forth] snapshot restore failed ({re}); starting a fresh VM"));
+                match self.new_vm() {
+                    Ok(vm) => {
+                        self.vm = vm;
+                        self.load_seeds();
+                    }
+                    Err(e2) => trace(&format!("[forth] fresh VM failed: {e2}")),
+                }
+            }
         }
     }
 
@@ -441,8 +459,7 @@ impl Kernel {
     fn select_lessons(&mut self, task: &str) -> Vec<i64> {
         let lessons: Vec<Value> =
             self.state.active_lessons().map(|l| json!({"id": l.id, "text": l.text, "score": l.score})).collect();
-        let check: fn(&str) -> Result<(), String> = |out| check_output("select_lessons", out);
-        let ids = match self.call_def("select_lessons", &json!({"task": task, "lessons": lessons}), check) {
+        let ids = match self.call_def("select_lessons", &json!({"task": task, "lessons": lessons})) {
             Ok(out) => serde_json::from_str::<Vec<i64>>(&out).unwrap_or_default(),
             Err(e) => {
                 trace(&format!("[hook] select_lessons failed, using default: {}", first_line(&e, 100)));
@@ -459,20 +476,14 @@ impl Kernel {
     /// built by the `compose_system` hook plus the verdicts (which bypass
     /// `select_lessons` and cannot be dropped by a hook).
     pub fn system_prompt(&mut self, selected: &[i64]) -> Vec<String> {
-        let notes: Vec<String> = self
-            .state
-            .defs
-            .values()
-            .filter_map(|d| d.live_version())
-            .filter(|v| v.kind == "note")
-            .map(|v| v.source.clone())
-            .collect();
+        let notes: Vec<String> =
+            self.state.live_defs().filter(|(_, v)| v.kind == "note").map(|(_, v)| v.source.clone()).collect();
         let lessons: Vec<String> = selected
             .iter()
             .filter_map(|id| self.state.lessons.iter().find(|l| l.id == *id))
             .map(|l| l.text.clone())
             .collect();
-        let mut supplemental = match self.call_def("compose_system", &json!({"notes": notes, "lessons": lessons}), |_| Ok(())) {
+        let mut supplemental = match self.call_def("compose_system", &json!({"notes": notes, "lessons": lessons})) {
             Ok(s) => s,
             Err(e) => {
                 trace(&format!("[hook] compose_system failed, using default: {}", first_line(&e, 100)));
@@ -491,10 +502,8 @@ impl Kernel {
 
     pub fn tool_list(&self) -> Vec<Value> {
         let mut list = tools::schemas();
-        for def in self.state.defs.values() {
-            if let Some(v) = def.live_version().filter(|v| v.kind == "tool") {
-                list.push(json!({"name": def.name, "description": v.description, "input_schema": v.input_schema}));
-            }
+        for (def, v) in self.state.live_defs().filter(|(_, v)| v.kind == "tool") {
+            list.push(json!({"name": def.name, "description": v.description, "input_schema": v.input_schema}));
         }
         list
     }
@@ -504,13 +513,11 @@ impl Kernel {
     fn exec_tool(&mut self, name: &str, input: &Value) -> Result<String, String> {
         let wd = self.cfg.work_dir.clone();
         let int = |k: &str| input.get(k).and_then(Value::as_u64).map(|v| v as u32);
-        let text = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let text = |k: &str| str_field(input, k);
         match name {
             "bash" => tools::bash(&wd, input),
             "read_file" => tools::read_file(&wd, input),
-            "write_file" => {
-                tools::write_file(&wd, input, &protected_paths(&self.cfg))
-            }
+            "write_file" => tools::write_file(&wd, input, &self.protected),
             "list_defs" => Ok(self.defs_table()),
             "show_def" => self.show_def(&text("name"), int("version")),
             "forth_eval" => self.forth_eval(input),
@@ -522,7 +529,7 @@ impl Kernel {
             "remember" => self.remember(&text("text"), "remember"),
             "recall" => Ok(self.recall(&text("query"))),
             _ if self.state.live(name).is_some_and(|v| v.kind == "tool") => {
-                self.call_def(name, input, |_| Ok(())).map(|s| tools::truncate(&s, 20 * 1024))
+                self.call_def(name, input).map(|s| tools::truncate(&s, 20 * 1024))
             }
             _ => Err(format!("unknown tool `{name}`")),
         }
@@ -598,24 +605,44 @@ impl Kernel {
 
     pub fn run_task(&mut self, task: &str) -> TaskOutcome {
         let task_id = self.state.tasks.len() as u64 + 1;
-        self.rec("task_started", json!({"task_id": task_id, "task": task}));
+        self.record_or_trace("task_started", json!({"task_id": task_id, "task": task}));
         let selected = self.select_lessons(task);
-        let mut messages = vec![json!({"role": "user", "content": task})];
-        let mut tool_errors: Vec<bool> = Vec::new();
         let mut transcript = vec![format!("TASK: {task}")];
-        let (mut kernel_error, mut stop, mut answer) = (None::<String>, String::new(), String::new());
+        let turns = self.run_turns(task, &selected, &mut transcript);
+        // Success: a clean end_turn, and neither of the last two tool calls failed.
+        let tail_ok = turns.tool_errors.iter().rev().take(2).all(|e| !e);
+        let success = turns.kernel_error.is_none() && turns.stop == "end_turn" && tail_ok;
+        self.soak_trial_notes(task, task_id, success);
+        self.score_lessons(&selected, task_id, success);
+        let summary = first_line(&turns.answer, 200);
+        self.record_or_trace("task_finished", json!({"task_id": task_id, "success": success, "error": turns.kernel_error, "summary": summary}));
+        trace(&format!("[task] {task_id} {}", if success { "succeeded" } else { "failed" }));
+        transcript.push(format!("OUTCOME: {}", if success { "success" } else { "failure" }));
+        if self.cfg.reflect {
+            self.reflect(&transcript.join("\n"));
+        }
+        TaskOutcome { success, answer: turns.answer, error: turns.kernel_error }
+    }
+
+    /// The model/tool loop: one model request per turn, then the tool calls
+    /// it asked for, until the model stops or something fails.
+    fn run_turns(&mut self, task: &str, selected: &[i64], transcript: &mut Vec<String>) -> Turns {
+        let mut messages = vec![json!({"role": "user", "content": task})];
+        let mut turns = Turns { answer: String::new(), stop: String::new(), kernel_error: None, tool_errors: Vec::new() };
         for turn in 0..self.cfg.max_turns {
-            let req = ModelRequest { system: self.system_prompt(&selected), tools: self.tool_list(), messages: messages.clone() };
-            let resp = match self.provider.complete(&req) {
+            // Recomposed every turn: each turn's compose_system call is a use
+            // of that hook (def_use, soak).
+            let system = self.system_prompt(selected);
+            let tools = self.tool_list();
+            let resp = match self.provider.complete(&ModelRequest { system, tools: &tools, messages: &messages }) {
                 Ok(r) => r,
                 Err(e) => {
                     trace(&format!("[kernel] model request failed: {}", first_line(&e, 200)));
-                    kernel_error = Some(e);
+                    turns.kernel_error = Some(e);
                     break;
                 }
             };
-            let text: Vec<&str> = resp.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-            let text = text.join("\n").trim().to_string();
+            let text = response_text(&resp.content);
             if !text.is_empty() {
                 if self.cfg.echo_text {
                     println!("{text}");
@@ -623,70 +650,72 @@ impl Kernel {
                     trace(&format!("[assistant] {}", first_line(&text, 160)));
                 }
                 transcript.push(format!("ASSISTANT: {}", tools::truncate(&text, 400)));
-                answer = text;
+                turns.answer = text;
             }
-            stop = resp.stop_reason.clone();
+            turns.stop = resp.stop_reason.clone();
             messages.push(json!({"role": "assistant", "content": resp.content}));
-            if stop != "tool_use" {
+            if turns.stop != "tool_use" {
                 break;
             }
-            let mut results = Vec::new();
-            for b in resp.content.iter().filter(|b| b["type"] == "tool_use") {
-                let name = b["name"].as_str().unwrap_or("");
-                let input = b.get("input").cloned().unwrap_or(json!({}));
-                let result = self.exec_tool(name, &input);
-                let (out, is_err) = match &result {
-                    Ok(s) => (s.clone(), false),
-                    Err(e) => (format!("error: {e}"), true),
-                };
-                trace(&tool_trace(name, &input, &result));
-                transcript.push(format!("TOOL {name} {} -> {}{}", compact(&input, 150), if is_err { "ERROR " } else { "" }, first_line(&out, 150)));
-                tool_errors.push(is_err);
-                results.push(json!({"type": "tool_result", "tool_use_id": b["id"], "content": out, "is_error": is_err}));
-            }
+            let results = self.run_tool_calls(&resp.content, transcript, &mut turns.tool_errors);
             if results.is_empty() {
-                kernel_error = Some("stop_reason tool_use without tool_use blocks".into());
+                turns.kernel_error = Some("stop_reason tool_use without tool_use blocks".into());
                 break;
             }
             messages.push(json!({"role": "user", "content": results}));
             if turn + 1 == self.cfg.max_turns {
-                kernel_error = Some(format!("turn limit ({}) reached", self.cfg.max_turns));
+                turns.kernel_error = Some(format!("turn limit ({}) reached", self.cfg.max_turns));
             }
         }
-        let tail_ok = tool_errors.iter().rev().take(2).all(|e| !e);
-        let success = kernel_error.is_none() && stop == "end_turn" && tail_ok;
+        turns
+    }
 
-        // Notes soak over tasks: a task that does not succeed counts as an error.
+    /// Runs every tool_use block of one response and returns the tool_result blocks.
+    fn run_tool_calls(&mut self, content: &[Value], transcript: &mut Vec<String>, tool_errors: &mut Vec<bool>) -> Vec<Value> {
+        let mut results = Vec::new();
+        for b in content.iter().filter(|b| b["type"] == "tool_use") {
+            let name = b["name"].as_str().unwrap_or("");
+            let input = b.get("input").cloned().unwrap_or(json!({}));
+            let result = self.exec_tool(name, &input);
+            let (out, is_err) = match &result {
+                Ok(s) => (s.clone(), false),
+                Err(e) => (format!("error: {e}"), true),
+            };
+            trace(&tool_trace(name, &input, &result));
+            transcript.push(format!("TOOL {name} {} -> {}{}", compact(&input, 150), if is_err { "ERROR " } else { "" }, first_line(&out, 150)));
+            tool_errors.push(is_err);
+            results.push(json!({"type": "tool_result", "tool_use_id": b["id"], "content": out, "is_error": is_err}));
+        }
+        results
+    }
+
+    /// Notes soak over tasks: a task that does not succeed counts as an error.
+    fn soak_trial_notes(&mut self, task: &str, task_id: u64, success: bool) {
         let trial_notes: Vec<(String, u32)> = self
             .state
-            .defs
-            .values()
-            .filter_map(|d| d.live_version().filter(|v| v.kind == "note" && v.status == "trial").map(|v| (d.name.clone(), v.version)))
+            .live_defs()
+            .filter(|(_, v)| v.kind == "note" && v.status == "trial")
+            .map(|(d, v)| (d.name.clone(), v.version))
             .collect();
         for (name, v) in trial_notes {
             let r = if success { Ok(String::new()) } else { Err(format!("task {task_id} failed")) };
             self.record_use(&name, v, &r, &json!({"task": task}));
         }
+    }
 
-        // Score the lessons that were in the prompt.
+    /// Scores the lessons that were in the prompt by the task outcome;
+    /// a lesson that reaches -3 is retired.
+    fn score_lessons(&mut self, selected: &[i64], task_id: u64, success: bool) {
         let delta = if success { 1 } else { -1 };
-        for id in &selected {
+        for id in selected {
             let Some(l) = self.state.lessons.iter().find(|l| l.id == *id) else { continue };
             let score = l.score + delta;
-            self.rec("lesson_scored", json!({"id": id, "delta": delta, "score": score, "task_id": task_id}));
+            self.record_or_trace("lesson_scored", json!({"id": id, "delta": delta, "score": score, "task_id": task_id}));
             if score <= -3 {
-                self.rec("lesson_retired", json!({"id": id}));
+                self.record_or_trace("lesson_retired", json!({"id": id}));
                 trace(&format!("[learn] lesson #{id} retired (score {score})"));
             }
         }
-        let summary = first_line(&answer, 200);
-        self.rec("task_finished", json!({"task_id": task_id, "success": success, "error": kernel_error, "summary": summary}));
-        trace(&format!("[task] {task_id} {}", if success { "succeeded" } else { "failed" }));
-        transcript.push(format!("OUTCOME: {}", if success { "success" } else { "failure" }));
-        if self.cfg.reflect {
-            self.reflect(&transcript.join("\n"));
-        }
-        TaskOutcome { success, answer, error: kernel_error }
     }
 
     fn reflect(&mut self, transcript: &str) {
@@ -695,7 +724,8 @@ impl Kernel {
              (strings) that would help with future tasks. Skip task-specific trivia; reply [] if there is nothing durable.",
             tools::truncate(transcript, 12_000)
         );
-        let req = ModelRequest { system: vec![self.base_prompt.clone()], tools: vec![], messages: vec![json!({"role": "user", "content": prompt})] };
+        let messages = [json!({"role": "user", "content": prompt})];
+        let req = ModelRequest { system: vec![self.base_prompt.clone()], tools: &[], messages: &messages };
         let resp = match self.provider.complete(&req) {
             Ok(r) => r,
             Err(e) => {
@@ -703,6 +733,7 @@ impl Kernel {
                 return;
             }
         };
+        // Unlike `response_text`: every block's text, concatenated as is.
         let text: String = resp.content.iter().filter_map(|b| b["text"].as_str()).collect();
         let parsed = text
             .find('[')
@@ -737,9 +768,34 @@ impl Kernel {
         self.run_task(&format!("{REFINE_PROMPT}\n\nRecent task outcomes:\n{recent}"))
     }
 
-    pub fn state_dir(&self) -> &Path {
-        &self.cfg.state_dir
-    }
+}
+
+/// name -> (live version, source) for every compiled kind. Takes the
+/// registry rather than the kernel so the VM can be borrowed mutably beside it.
+fn live_code(state: &State) -> Live<'_> {
+    state
+        .live_defs()
+        .filter(|(_, v)| v.kind != "note")
+        .map(|(d, v)| (d.name.as_str(), (v.version, v.source.as_str())))
+        .collect()
+}
+
+/// How the turn loop of one task ended.
+struct Turns {
+    /// The last non-empty assistant text.
+    answer: String,
+    /// The last stop_reason.
+    stop: String,
+    /// The model request failed, the reply was malformed, or the turn limit was reached.
+    kernel_error: Option<String>,
+    /// One entry per tool call: did it fail?
+    tool_errors: Vec<bool>,
+}
+
+/// The text blocks of a model response, joined by newlines and trimmed.
+fn response_text(content: &[Value]) -> String {
+    let text: Vec<&str> = content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+    text.join("\n").trim().to_string()
 }
 
 /// Paths no kernel tool or host word may write: the state dir, the kernel

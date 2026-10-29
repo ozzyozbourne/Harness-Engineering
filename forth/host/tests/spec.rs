@@ -9,10 +9,28 @@ use std::sync::{Arc, Mutex};
 
 type Requests = Arc<Mutex<Vec<Value>>>;
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cmh-forth-test-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh temporary directory, removed when the test ends (pass or fail).
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> TestDir {
+        let dir = std::env::temp_dir().join(format!("cmh-forth-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        TestDir(dir)
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn open(dir: &Path, script: Vec<Value>, soak: u32) -> (Kernel, Requests) {
@@ -66,8 +84,13 @@ const REVERSE: &str = r#"
 : run ( json-a json-u -- a u ) s" text" json-get rev ;
 "#;
 
+/// Calls live definition `name` the way the agent loop does.
+fn call(k: &mut Kernel, name: &str, input: Value) -> Result<String, String> {
+    k.call_def(name, &input)
+}
+
 fn wc(k: &mut Kernel, t: &str) -> Result<String, String> {
-    k.call_def("word_count", &json!({"text": t}), |_| Ok(()))
+    call(k, "word_count", json!({"text": t}))
 }
 
 /// Last tool_result content in a recorded request.
@@ -83,33 +106,31 @@ fn last_tool_result(req: &Value) -> String {
 
 #[test]
 fn seeds_pass_their_own_tests() {
-    let dir = fresh_dir("seeds");
+    let dir = TestDir::new("seeds");
     let (mut k, _) = open(&dir, vec![], 3);
     for name in ["word_count", "compose_system", "select_lessons"] {
         let v = k.state.live(name).unwrap().clone();
         assert_eq!(v.status, "kept");
         for t in v.tests.as_array().unwrap() {
-            let out = k.call_def(name, &t["input"], |_| Ok(())).unwrap();
+            let out = call(&mut k, name, t["input"].clone()).unwrap();
             assert!(out.contains(t["expect"].as_str().unwrap()), "{name}: {out:?}");
         }
     }
-    let out = k
-        .call_def(
-            "select_lessons",
-            &json!({"task": "zzz", "lessons": [
-                {"id": 1, "text": "a", "score": 1}, {"id": 2, "text": "b", "score": 7},
-                {"id": 3, "text": "c", "score": 7}, {"id": 4, "text": "d", "score": -1}]}),
-            |_| Ok(()),
-        )
-        .unwrap();
+    let out = call(
+        &mut k,
+        "select_lessons",
+        json!({"task": "zzz", "lessons": [
+            {"id": 1, "text": "a", "score": 1}, {"id": 2, "text": "b", "score": 7},
+            {"id": 3, "text": "c", "score": 7}, {"id": 4, "text": "d", "score": -1}]}),
+    )
+    .unwrap();
     assert_eq!(out, "[2,3,1]", "fallback: top 3 by score, ties by id");
     assert_eq!(wc(&mut k, "  one two\tthree\n").unwrap(), "3");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t1_late_binding() {
-    let dir = fresh_dir("late");
+    let dir = TestDir::new("late");
     let script = vec![
         tool_use("a", "word_count", json!({"text": "x y z"})),
         tool_use("b", "propose_def", word_count_v2(V2_TAGGED, "v2:2")),
@@ -124,12 +145,11 @@ fn t1_late_binding() {
     assert!(last_tool_result(&reqs[2]).starts_with("trial v2"), "{}", last_tool_result(&reqs[2]));
     assert_eq!(last_tool_result(&reqs[3]), "v2:3");
     assert_eq!(status(&k, "word_count"), (Some(2), "trial".into()));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t2_gate_rejection() {
-    let dir = fresh_dir("reject");
+    let dir = TestDir::new("reject");
     let (mut k, _) = open(&dir, vec![], 3);
     let err = k.propose_def(&word_count_v2(": run ( a u -- a u ) s\" x\" ", "2")).unwrap_err();
     assert!(err.contains("compile-error") && err.contains("missing `;`"), "{err}");
@@ -145,12 +165,11 @@ fn t2_gate_rejection() {
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
     assert_eq!(k.vm_bound("word_count"), 1, "the live VM still runs v1");
     assert_eq!(wc(&mut k, "a b c").unwrap(), "3");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t3_soak_revert() {
-    let dir = fresh_dir("revert");
+    let dir = TestDir::new("revert");
     let (mut k, _) = open(&dir, vec![], 3);
     // Divides by the text length: fine on tests, fails on empty text.
     let src = r#": run ( a u -- a u ) s" text" json-get nip 100 swap / n>s ;"#;
@@ -165,12 +184,11 @@ fn t3_soak_revert() {
     let v = k.state.verdicts.iter().find(|v| v.name == "word_count" && v.version == 2).expect("verdict");
     assert_eq!(v.outcome, "reverted");
     assert!(v.text.contains("division-by-zero"), "{}", v.text);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t4_soak_keep() {
-    let dir = fresh_dir("keep");
+    let dir = TestDir::new("keep");
     let (mut k, _) = open(&dir, vec![], 3);
     k.propose_def(&word_count_v2(V2_TAGGED, "v2:2")).unwrap();
     for i in 0..3 {
@@ -180,15 +198,14 @@ fn t4_soak_keep() {
     assert_eq!(status(&k, "word_count"), (Some(2), "kept".into()));
     assert!(k.state.verdicts.iter().any(|v| v.version == 2 && v.outcome == "kept"));
     // Runtime errors from a kept version do not revert it.
-    assert!(k.call_def("word_count", &json!({}), |_| Ok(())).is_err());
+    assert!(call(&mut k, "word_count", json!({})).is_err());
     assert_eq!(status(&k, "word_count"), (Some(2), "kept".into()));
     assert_eq!(wc(&mut k, "a b").unwrap(), "v2:2");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t5_persistence() {
-    let dir = fresh_dir("persist");
+    let dir = TestDir::new("persist");
     let (mut k, _) = open(&dir, vec![], 3);
     k.propose_def(&word_count_v2(V2_TAGGED, "v2:2")).unwrap();
     wc(&mut k, "a b").unwrap();
@@ -203,12 +220,11 @@ fn t5_persistence() {
     assert_eq!(k2.state, before);
     assert_eq!(wc(&mut k2, "a b c").unwrap(), "v2:3");
     assert_eq!(k2.state.defs["word_count"].soak_uses, 2);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t6_hook_redefinition() {
-    let dir = fresh_dir("hook");
+    let dir = TestDir::new("hook");
     let (mut k, reqs) = open(&dir, vec![text("first"), text("second")], 3);
     k.run_task("before");
     let src = r#"
@@ -228,12 +244,11 @@ fn t6_hook_redefinition() {
     assert!(after[0].starts_with("You are cmh"), "base prompt must stay first");
     assert!(after[1].contains("cmh Forth reference"), "the kernel's Forth reference follows it");
     assert!(after[2].contains("CUSTOM-SUPPLEMENT notes=0 lessons=0"), "{after:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn t7_lesson_scoring() {
-    let dir = fresh_dir("score");
+    let dir = TestDir::new("score");
     // One successful reply; later tasks exhaust the script and fail.
     let (mut k, reqs) = open(&dir, vec![text("ok")], 3);
     k.remember("Parser changes need regression tests.", "remember").unwrap();
@@ -250,7 +265,6 @@ fn t7_lesson_scoring() {
     assert_eq!(score(&k), (-3, true));
     k.run_task("fix the parser");
     assert_eq!(score(&k), (-3, true));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn run_bin(state: &Path, script: &Value, task: &str) -> (i32, String, String) {
@@ -267,8 +281,8 @@ fn run_bin(state: &Path, script: &Value, task: &str) -> (i32, String, String) {
 
 #[test]
 fn t8_end_to_end_run() {
-    let dir = fresh_dir("e2e");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("e2e");
+    std::fs::create_dir_all(&*dir).unwrap();
     let script = json!([
         tool_use("p", "propose_def", tool_def("reverse", REVERSE, json!({"text": "abc"}), "cba")),
         tool_use("r", "reverse", json!({"text": "hello"})),
@@ -294,35 +308,33 @@ fn t8_end_to_end_run() {
     let (code, stdout, _) = run_bin(&state, &json!([]), "anything");
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------------ Forth-specific
 
 #[test]
 fn forth_late_binding_existing_caller() {
-    let dir = fresh_dir("caller");
+    let dir = TestDir::new("caller");
     let (mut k, _) = open(&dir, vec![], 3);
     // `tagged` calls word_count through its slot; it is never recompiled.
     let caller = r#": run ( json-a json-u -- a u ) word_count s"  words" concat ;"#;
     k.propose_def(&tool_def("tagged", caller, json!({"text": "a b"}), "2 words")).unwrap();
-    let call = |k: &mut Kernel| k.call_def("tagged", &json!({"text": "x y z"}), |_| Ok(())).unwrap();
-    assert_eq!(call(&mut k), "3 words");
+    let tagged = |k: &mut Kernel| call(k, "tagged", json!({"text": "x y z"})).unwrap();
+    assert_eq!(tagged(&mut k), "3 words");
     k.propose_def(&word_count_v2(V2_TAGGED, "v2:2")).unwrap();
-    assert_eq!(call(&mut k), "v2:3 words", "the existing caller uses the new word_count");
+    assert_eq!(tagged(&mut k), "v2:3 words", "the existing caller uses the new word_count");
     // Revert word_count v2 (bad input), and the caller follows the slot back to v1.
     assert!(wc(&mut k, "").is_ok());
     let src = r#": run ( a u -- a u ) s" text" json-get nip 0= if 1 0 / then s" v3" ;"#;
     k.propose_def(&word_count_v2(src, "v3")).unwrap();
     assert!(wc(&mut k, "").is_err());
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
-    assert_eq!(call(&mut k), "3 words");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(tagged(&mut k), "3 words");
 }
 
 #[test]
 fn forth_infinite_loop_stopped_by_fuel() {
-    let dir = fresh_dir("fuel");
+    let dir = TestDir::new("fuel");
     let (mut k, _) = open(&dir, vec![], 3);
     // Loops forever when the text is "spin".
     let src = r#"
@@ -339,16 +351,15 @@ fn forth_infinite_loop_stopped_by_fuel() {
     assert!(k.state.verdicts.iter().any(|v| v.version == 2 && v.text.contains("fuel-exhausted")));
     // The host and the VM keep working.
     assert_eq!(wc(&mut k, "a b").unwrap(), "2");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn forth_out_of_bounds_trap_restores_snapshot() {
-    let dir = fresh_dir("oob");
+    let dir = TestDir::new("oob");
     let (mut k, _) = open(&dir, vec![], 3);
     k.propose_def(&tool_def("reverse", REVERSE, json!({"text": "abc"}), "cba")).unwrap();
     for _ in 0..3 {
-        k.call_def("reverse", &json!({"text": "abc"}), |_| Ok(())).unwrap();
+        call(&mut k, "reverse", json!({"text": "abc"})).unwrap();
     }
     assert_eq!(status(&k, "reverse"), (Some(1), "kept".into()));
     // Scribbles over data space, then stores far past the end of linear memory.
@@ -365,15 +376,14 @@ fn forth_out_of_bounds_trap_restores_snapshot() {
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
     // The dictionary still works: the seed, the kept tool, and new definitions.
     assert_eq!(wc(&mut k, "a b c").unwrap(), "3");
-    assert_eq!(k.call_def("reverse", &json!({"text": "xyz"}), |_| Ok(())).unwrap(), "zyx");
+    assert_eq!(call(&mut k, "reverse", json!({"text": "xyz"})).unwrap(), "zyx");
     k.propose_def(&tool_def("tagged", r#": run word_count s" !" concat ;"#, json!({"text": "a"}), "1!")).unwrap();
-    assert_eq!(k.call_def("tagged", &json!({"text": "p q"}), |_| Ok(())).unwrap(), "2!");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(call(&mut k, "tagged", json!({"text": "p q"})).unwrap(), "2!");
 }
 
 #[test]
 fn forth_stack_underflow_is_structured() {
-    let dir = fresh_dir("underflow");
+    let dir = TestDir::new("underflow");
     let (mut k, _) = open(&dir, vec![], 3);
     let src = r#"
 : combine ( a b -- a+b ) + ;
@@ -385,13 +395,12 @@ fn forth_stack_underflow_is_structured() {
     assert!(err.contains("called from: `run` (word_count v2) line 3 at `combine`"), "{err}");
     assert!(err.contains("input: {\"text\":\"abcdef\"}"), "{err}");
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn forth_lazy_load_in_fresh_process() {
-    let dir = fresh_dir("lazy");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("lazy");
+    std::fs::create_dir_all(&*dir).unwrap();
     let state = dir.join("state");
     let script = json!([
         tool_use("p", "propose_def", tool_def("reverse", REVERSE, json!({"text": "abc"}), "cba")),
@@ -413,15 +422,14 @@ fn forth_lazy_load_in_fresh_process() {
     let (mut k, _) = open(&state, vec![], 3);
     assert_eq!(k.vm_bound("reverse"), 0);
     assert_eq!(k.vm_bound("word_count"), 1);
-    assert_eq!(k.call_def("reverse", &json!({"text": "ab"}), |_| Ok(())).unwrap(), "ba");
+    assert_eq!(call(&mut k, "reverse", json!({"text": "ab"})).unwrap(), "ba");
     assert_eq!(k.lazy_loads, vec![("reverse".to_string(), 1)]);
     assert_eq!(k.vm_bound("reverse"), 1);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn forth_eval_scratchpad_runs_code_without_proposing() {
-    let dir = fresh_dir("eval");
+    let dir = TestDir::new("eval");
     let script = vec![
         tool_use("e1", "forth_eval", json!({"source": ": run ( a u -- a u ) 2drop + s\" x\" ;"})),
         tool_use("e2", "forth_eval", json!({"source": REVERSE, "input": {"text": "abc"}})),
@@ -440,5 +448,4 @@ fn forth_eval_scratchpad_runs_code_without_proposing() {
     assert!(!k.state.defs.contains_key("scratchpad"));
     let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
     assert!(!journal.contains("def_proposed") && !journal.contains("def_rejected"));
-    let _ = std::fs::remove_dir_all(&dir);
 }

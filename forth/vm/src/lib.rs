@@ -15,22 +15,25 @@
 //! Errors never panic: they come back to the host as JSON (kind, word, def,
 //! version, line, token, data stack, call trace, console output).
 
+mod abi;
+
+use abi::*;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 const PERM_SIZE: usize = 1 << 20;
 const SCRATCH_SIZE: usize = 2 << 20;
+/// Data stack depth.
 const DS_MAX: usize = 1024;
+/// Call depth (`Exec::frames`).
 const RS_MAX: usize = 512;
+/// Items pushed with `>r` (`Exec::rstack`).
 const US_MAX: usize = 256;
+/// Nested DO loops (`Exec::loops`).
 const LS_MAX: usize = 64;
 const CONSOLE_MAX: usize = 4096;
 const BUILDER_MAX: usize = 1 << 20;
 const NO_WORD: u32 = u32::MAX;
-
-const ST_OK: i32 = 0;
-const ST_ERR: i32 = 1;
-const ST_NEED: i32 = 2;
 
 static mut PERM: [u8; PERM_SIZE] = [0; PERM_SIZE];
 static mut SCRATCH: [u8; SCRATCH_SIZE] = [0; SCRATCH_SIZE];
@@ -43,9 +46,9 @@ static mut CUR: *mut Exec = std::ptr::null_mut();
 
 #[link(wasm_import_module = "cmh")]
 unsafe extern "C" {
-    /// Host word `op` on strings (a, al) and (b, bl). Returns a result length
-    /// (string ops) or value (json-len); `i64::MIN` means error, with the
-    /// message pending.
+    /// Host word `op` (`abi::OP_*`) on strings (a, al) and (b, bl). Returns a
+    /// result length (string ops) or value (json-len); `HOST_ERR` means
+    /// error, with the message pending.
     fn host_word(op: i32, a: i32, al: i32, b: i32, bl: i32) -> i64;
     /// Copies the pending host result (or error message) to `dst`.
     fn host_take(dst: i32);
@@ -206,18 +209,27 @@ struct Slot {
     version: u32,
 }
 
+/// One call in progress: where to return to.
 #[derive(Clone, Copy)]
 struct Frame {
+    /// Instruction after the call.
     ret: u32,
+    /// The calling word (`NO_WORD` for the entry trampoline).
     word: u32,
-    lsd: u32,
+    /// `Exec::loops` depth at the call; restored on return so an EXIT from
+    /// inside a DO loop drops that loop.
+    loops_depth: u32,
 }
 
 struct Exec {
+    /// Data stack.
     ds: Vec<i64>,
-    rs: Vec<Frame>,
-    us: Vec<i64>,
-    ls: Vec<(i64, i64)>,
+    /// Call frames (the hidden return stack).
+    frames: Vec<Frame>,
+    /// The user return stack of `>r`, `r>` and `r@`.
+    rstack: Vec<i64>,
+    /// Active DO loops: (index, limit), innermost last.
+    loops: Vec<(i64, i64)>,
     ip: u32,
     /// The instruction being executed (for error reports).
     at: u32,
@@ -226,7 +238,7 @@ struct Exec {
 
 impl Exec {
     const fn new() -> Exec {
-        Exec { ds: Vec::new(), rs: Vec::new(), us: Vec::new(), ls: Vec::new(), ip: 0, at: 0, word: NO_WORD }
+        Exec { ds: Vec::new(), frames: Vec::new(), rstack: Vec::new(), loops: Vec::new(), ip: 0, at: 0, word: NO_WORD }
     }
     // Volatile so that after a trap (e.g. out of fuel in a tight loop) the
     // host can still see where execution was.
@@ -245,8 +257,29 @@ impl Exec {
 }
 
 enum Fail {
+    /// A JSON error report.
     Err(String),
+    /// Suspended on this unbound public slot.
     Need(u32),
+}
+
+/// Fields of one error report (see `Vm::report_json`).
+struct Report<'a> {
+    kind: &'a str,
+    msg: &'a str,
+    word: &'a str,
+    def: &'a str,
+    version: u32,
+    line: u32,
+    token: &'a str,
+    /// Data stack depth.
+    depth: usize,
+    /// The top 8 data stack items, comma-separated.
+    stack: String,
+    /// Call trace entries as JSON strings, comma-separated.
+    trace: String,
+    /// The top two stack items read as an ( addr len ) string, if they are one.
+    top_string: Option<String>,
 }
 
 struct Vm {
@@ -367,19 +400,54 @@ impl Src<'_> {
     }
 }
 
+/// An open control structure; the u32s are code positions to branch to or patch.
 enum Ctrl {
     If(u32),
     Else(u32),
     Begin(u32),
+    /// (BEGIN position, WHILE branch to patch)
     While(u32, u32),
+    /// (loop body start, LEAVE and ?DO branches to patch with the exit)
     Do(u32, Vec<u32>),
 }
 
+/// The `: name ... ;` definition being compiled.
 struct Open {
     name: String,
     slot: u32,
     start: u32,
     ctrl: Vec<Ctrl>,
+}
+
+/// A use of a not-yet-defined word inside a definition; it must be defined
+/// by the end of the source.
+struct Forward {
+    slot: u32,
+    line: u32,
+    token: String,
+}
+
+/// One definition version being compiled (`Vm::define`).
+struct Unit {
+    /// Private namespace, "def/version".
+    ns: String,
+    /// Executor for top-level code, which runs at load time.
+    tmp: Exec,
+    open: Option<Open>,
+    forwards: Vec<Forward>,
+}
+
+/// One source token: `raw` as written (for reports), `t` lowercased (for lookup).
+struct Token {
+    raw: String,
+    t: String,
+    line: u32,
+}
+
+impl Token {
+    fn err(&self, msg: impl Into<String>) -> CompileFail {
+        CompileFail::At(cerr(self.line, &self.raw, msg))
+    }
 }
 
 struct CErr {
@@ -390,6 +458,13 @@ struct CErr {
 
 fn cerr(line: u32, token: &str, msg: impl Into<String>) -> CErr {
     CErr { line, token: token.to_string(), msg: msg.into() }
+}
+
+enum CompileFail {
+    /// A compile error at a source position, reported as `compile-error`.
+    At(CErr),
+    /// Top-level code failed while running at load time: its runtime report (JSON).
+    Report(String),
 }
 
 impl Vm {
@@ -410,9 +485,10 @@ impl Vm {
             ctx_version: 0,
             pending: None,
         };
-        // Trampoline: code[0] is patched with the slot being called.
-        vm.emit(Op::Call(0), 0, "<entry>");
-        vm.emit(Op::Halt, 0, "<entry>");
+        // Trampoline: code[0] is patched with the slot being called. Its empty
+        // token and line 0 keep "at" and "line" out of reports that point here.
+        vm.emit(Op::Call(0), 0, "");
+        vm.emit(Op::Halt, 0, "");
         vm
     }
 
@@ -433,6 +509,52 @@ impl Vm {
         let s = self.new_slot(name);
         self.public.insert(name.to_string(), s);
         s
+    }
+
+    /// The slot of word `name` in private namespace `ns` ("def/version"),
+    /// created unbound if it does not exist yet.
+    fn private_slot(&mut self, ns: &str, name: &str) -> u32 {
+        if let Some(s) = self.privs[ns].get(name) {
+            return *s;
+        }
+        let s = self.new_slot(&format!("{ns}:{name}"));
+        self.privs.get_mut(ns).expect("ns").insert(name.to_string(), s);
+        s
+    }
+
+    /// Points public slot `name` at word `run` of definition version `version`.
+    fn bind_public(&mut self, name: &str, version: u32, run: u32) {
+        let slot = self.public_slot(name);
+        self.slots[slot as usize].target = Some(run);
+        self.slots[slot as usize].version = version;
+    }
+
+    /// Unbinds public slot `name` (if it exists): its next call suspends with NEED.
+    fn unbind_public(&mut self, name: &str) {
+        if let Some(s) = self.public.get(name).copied() {
+            self.slots[s as usize].target = None;
+            self.slots[s as usize].version = 0;
+        }
+    }
+
+    /// What `tok` (lowercased) means in namespace `ns`: a private word first,
+    /// then a primitive, then a public (userspace) slot that already exists.
+    fn resolve(&self, ns: &str, tok: &str) -> Option<Op> {
+        if let Some(slot) = self.privs[ns].get(tok) {
+            return Some(Op::Call(*slot));
+        }
+        if let Some((p, _, _)) = prim(tok) {
+            return Some(Op::Prim(p));
+        }
+        self.public.get(tok).map(|slot| Op::Call(*slot))
+    }
+
+    fn undefined_word_msg(&self, ns: &str, tok: &str) -> String {
+        let mut msg = format!("undefined word `{tok}`");
+        if let Some(s) = self.suggest(ns, tok) {
+            let _ = write!(msg, "; did you mean `{s}`?");
+        }
+        msg
     }
 
     // ------------------------------------------------------------ reports
@@ -460,13 +582,35 @@ impl Vm {
         Some(if u > 80 { format!("{s}...") } else { s })
     }
 
+    /// The JSON error report the host turns into text (`format_report`),
+    /// with the console output so far.
+    fn report_json(&self, r: &Report) -> String {
+        format!(
+            "{{\"kind\":{},\"message\":{},\"word\":{},\"def\":{},\"version\":{},\"line\":{},\"token\":{},\"depth\":{},\"stack\":[{}],\"trace\":[{}],\"top_string\":{},\"output\":{}}}",
+            js(r.kind),
+            js(r.msg),
+            js(r.word),
+            js(r.def),
+            r.version,
+            r.line,
+            js(r.token),
+            r.depth,
+            r.stack,
+            r.trace,
+            r.top_string.as_deref().map_or("null".into(), js),
+            js(&String::from_utf8_lossy(&self.console)),
+        )
+    }
+
+    /// A runtime report for wherever `ex` is: the word, line and token being
+    /// executed, the top of the data stack, and the call trace.
     fn report(&self, ex: &Exec, kind: &str, msg: &str) -> String {
         let (word, def, version) = self.word_info(ex.word);
-        let (line, tok) = self.loc.get(ex.at as usize).cloned().unwrap_or((0, String::new()));
+        let (line, token) = self.loc.get(ex.at as usize).cloned().unwrap_or((0, String::new()));
         let n = ex.ds.len();
         let top: Vec<String> = ex.ds[n.saturating_sub(8)..].iter().map(|v| v.to_string()).collect();
         let mut trace = Vec::new();
-        for f in ex.rs.iter().rev() {
+        for f in ex.frames.iter().rev() {
             if f.word == NO_WORD {
                 continue;
             }
@@ -474,39 +618,40 @@ impl Vm {
             let (l, t) = self.loc.get((f.ret as usize).saturating_sub(1)).cloned().unwrap_or((0, String::new()));
             trace.push(js(&format!("`{w}` ({d} v{v}) line {l} at `{t}`")));
         }
-        let hint = if n >= 2 { self.preview(ex.ds[n - 2], ex.ds[n - 1]) } else { None };
-        format!(
-            "{{\"kind\":{},\"message\":{},\"word\":{},\"def\":{},\"version\":{},\"line\":{},\"token\":{},\"depth\":{},\"stack\":[{}],\"trace\":[{}],\"top_string\":{},\"output\":{}}}",
-            js(kind),
-            js(msg),
-            js(&word),
-            js(&def),
+        self.report_json(&Report {
+            kind,
+            msg,
+            word: &word,
+            def: &def,
             version,
             line,
-            js(&tok),
-            n,
-            top.join(","),
-            trace.join(","),
-            hint.map_or("null".into(), |h| js(&h)),
-            js(&String::from_utf8_lossy(&self.console)),
-        )
+            token: &token,
+            depth: n,
+            stack: top.join(","),
+            trace: trace.join(","),
+            top_string: if n >= 2 { self.preview(ex.ds[n - 2], ex.ds[n - 1]) } else { None },
+        })
     }
 
     fn fail(&self, ex: &Exec, kind: &str, msg: impl AsRef<str>) -> Fail {
         Fail::Err(self.report(ex, kind, msg.as_ref()))
     }
 
+    /// A compile error has no runtime state: empty stack and trace.
     fn compile_report(&self, def: &str, version: u32, word: &str, e: &CErr) -> String {
-        format!(
-            "{{\"kind\":\"compile-error\",\"message\":{},\"word\":{},\"def\":{},\"version\":{},\"line\":{},\"token\":{},\"depth\":0,\"stack\":[],\"trace\":[],\"top_string\":null,\"output\":{}}}",
-            js(&e.msg),
-            js(word),
-            js(def),
+        self.report_json(&Report {
+            kind: "compile-error",
+            msg: &e.msg,
+            word,
+            def,
             version,
-            e.line,
-            js(&e.token),
-            js(&String::from_utf8_lossy(&self.console)),
-        )
+            line: e.line,
+            token: &e.token,
+            depth: 0,
+            stack: String::new(),
+            trace: String::new(),
+            top_string: None,
+        })
     }
 
     // ------------------------------------------------------------- memory
@@ -614,7 +759,7 @@ impl Vm {
                 Op::Prim(p) => self.prim(ex, p)?,
                 Op::Call(s) => match self.slots[s as usize].target {
                     Some(w) => {
-                        if ex.rs.len() >= RS_MAX {
+                        if ex.frames.len() >= RS_MAX {
                             let name = self.slots[s as usize].name.clone();
                             return Err(self.fail(
                                 ex,
@@ -622,7 +767,7 @@ impl Vm {
                                 format!("call depth exceeded {RS_MAX} calling `{name}` (unbounded recursion?)"),
                             ));
                         }
-                        ex.rs.push(Frame { ret: ip as u32 + 1, word: ex.word, lsd: ex.ls.len() as u32 });
+                        ex.frames.push(Frame { ret: ip as u32 + 1, word: ex.word, loops_depth: ex.loops.len() as u32 });
                         ex.set_word(w);
                         ex.set_ip(self.words[w as usize].start);
                     }
@@ -631,9 +776,9 @@ impl Vm {
                         return Err(Fail::Need(s));
                     }
                 },
-                Op::Exit => match ex.rs.pop() {
+                Op::Exit => match ex.frames.pop() {
                     Some(f) => {
-                        ex.ls.truncate(f.lsd as usize);
+                        ex.loops.truncate(f.loops_depth as usize);
                         ex.set_word(f.word);
                         ex.set_ip(f.ret);
                     }
@@ -665,10 +810,10 @@ impl Vm {
                         ex.set_ip(t);
                         continue;
                     }
-                    if ex.ls.len() >= LS_MAX {
+                    if ex.loops.len() >= LS_MAX {
                         return Err(self.fail(ex, "stack-overflow", format!("more than {LS_MAX} nested DO loops")));
                     }
-                    ex.ls.push((start, limit));
+                    ex.loops.push((start, limit));
                 }
                 Op::Loop(t) | Op::PLoop(t) => {
                     let step = if let Op::PLoop(_) = op {
@@ -679,7 +824,7 @@ impl Vm {
                     } else {
                         1
                     };
-                    let Some(l) = ex.ls.last_mut() else {
+                    let Some(l) = ex.loops.last_mut() else {
                         return Err(self.fail(ex, "vm-error", "LOOP without an active DO"));
                     };
                     l.0 = l.0.wrapping_add(step);
@@ -687,11 +832,11 @@ impl Vm {
                     if again {
                         ex.set_ip(t);
                     } else {
-                        ex.ls.pop();
+                        ex.loops.pop();
                     }
                 }
                 Op::Leave(t) => {
-                    ex.ls.pop();
+                    ex.loops.pop();
                     ex.set_ip(t);
                 }
             }
@@ -771,18 +916,18 @@ impl Vm {
             }
             P::Depth => self.push(ex, n as i64)?,
             P::ToR => {
-                if ex.us.len() >= US_MAX {
+                if ex.rstack.len() >= US_MAX {
                     return Err(self.fail(ex, "stack-overflow", format!("`>r` return stack full ({US_MAX})")));
                 }
                 let v = ex.pop();
-                ex.us.push(v);
+                ex.rstack.push(v);
             }
             P::RFrom | P::RFetch => {
-                let Some(&v) = ex.us.last() else {
+                let Some(&v) = ex.rstack.last() else {
                     return Err(self.fail(ex, "stack-underflow", format!("`{name}` but nothing was pushed with `>r`")));
                 };
                 if p == P::RFrom {
-                    ex.us.pop();
+                    ex.rstack.pop();
                 }
                 self.push(ex, v)?;
             }
@@ -887,10 +1032,10 @@ impl Vm {
             P::Cells => ex.ds[n - 1] = ex.ds[n - 1].wrapping_mul(8),
             P::I | P::J => {
                 let depth = if p == P::I { 1 } else { 2 };
-                if ex.ls.len() < depth {
+                if ex.loops.len() < depth {
                     return Err(self.fail(ex, "stack-underflow", format!("`{name}` used outside a DO loop (or J outside a nested loop)")));
                 }
-                let v = ex.ls[ex.ls.len() - depth].0;
+                let v = ex.loops[ex.loops.len() - depth].0;
                 self.push(ex, v)?;
             }
             P::Type => {
@@ -1017,15 +1162,18 @@ impl Vm {
         Ok(())
     }
 
+    /// Runs a host word: checks its string arguments, calls the host, and
+    /// pushes the result (a string, a number, or nothing).
     fn host(&mut self, ex: &mut Exec, p: P, name: &str) -> Result<(), Fail> {
         let op = match p {
-            P::JsonGet => 1,
-            P::JsonLen => 2,
-            P::JsonStr => 3,
-            P::FileRead => 4,
-            P::FileWrite => 5,
-            _ => 6,
+            P::JsonGet => OP_JSON_GET,
+            P::JsonLen => OP_JSON_LEN,
+            P::JsonStr => OP_JSON_STR,
+            P::FileRead => OP_FILE_READ,
+            P::FileWrite => OP_FILE_WRITE,
+            _ => OP_REMEMBER,
         };
+        // Words taking two strings ( a1 u1 a2 u2 ); the rest take one.
         let two = matches!(p, P::JsonGet | P::JsonLen | P::FileWrite);
         let n = ex.ds.len();
         let what = format!("`{name}`");
@@ -1037,21 +1185,22 @@ impl Vm {
         self.bytes(ex, a.0, a.1, &what)?;
         self.bytes(ex, b.0, b.1, &what)?;
         let r = unsafe { host_word(op, a.0 as i32, a.1 as i32, b.0 as i32, b.1 as i32) };
-        if r == i64::MIN {
+        if r == HOST_ERR {
             let len = unsafe { host_pending_len() }.max(0) as usize;
             let mut buf = vec![0u8; len];
             unsafe { host_take(buf.as_mut_ptr() as usize as i32) };
             return Err(self.fail(ex, "host-error", format!("{what}: {}", String::from_utf8_lossy(&buf))));
         }
         ex.ds.truncate(n - if two { 4 } else { 2 });
-        match op {
-            1 | 3 | 4 => {
+        match p {
+            // `r` is the length of the result string pending in the host.
+            P::JsonGet | P::JsonStr | P::FileRead => {
                 let addr = self.salloc(ex, r.max(0) as usize)?;
                 unsafe { host_take(addr as i32) };
                 self.push(ex, addr)?;
                 self.push(ex, r)?;
             }
-            2 => self.push(ex, r)?,
+            P::JsonLen => self.push(ex, r)?,
             _ => {}
         }
         Ok(())
@@ -1075,46 +1224,39 @@ impl Vm {
     }
 
     fn define_inner(&mut self, def: &str, version: u32, src: &str) -> Result<(), String> {
-        let ns = format!("{def}/{version}");
         if prim(def).is_some() || SYNTAX.contains(&def) {
             let e = cerr(0, def, format!("definition name `{def}` collides with a core Forth word; choose another name"));
             return Err(self.compile_report(def, version, "", &e));
         }
+        let ns = format!("{def}/{version}");
         self.privs.insert(ns.clone(), BTreeMap::new());
-        let mut tmp = Exec::new();
-        let mut open: Option<Open> = None;
-        let mut forwards: Vec<(u32, u32, String)> = Vec::new();
-        let r = self.compile(&ns, src, &mut tmp, &mut open, &mut forwards);
-        let word = open.as_ref().map(|o| o.name.clone()).unwrap_or_default();
+        let mut u = Unit { ns, tmp: Exec::new(), open: None, forwards: Vec::new() };
+        let r = self.compile(&mut u, src);
+        // Errors are reported in the word that was being compiled, if any.
+        let word = u.open.as_ref().map(|o| o.name.clone()).unwrap_or_default();
         let fail = |vm: &Vm, e: CErr| Err(vm.compile_report(def, version, &word, &e));
         match r {
             Ok(()) => {}
-            Err(Ok(e)) => return fail(self, e),
-            Err(Err(json)) => return Err(json),
+            Err(CompileFail::At(e)) => return fail(self, e),
+            Err(CompileFail::Report(json)) => return Err(json),
         }
-        if let Some(o) = &open {
+        if let Some(o) = &u.open {
             return fail(self, cerr(0, &o.name, format!("definition `{}` is not closed: missing `;`", o.name)));
         }
-        for (slot, line, tok) in &forwards {
-            if self.slots[*slot as usize].target.is_none() {
-                let mut msg = format!("undefined word `{tok}`");
-                if let Some(s) = self.suggest(&ns, tok) {
-                    let _ = write!(msg, "; did you mean `{s}`?");
-                }
-                return fail(self, cerr(*line, tok, msg));
+        for f in &u.forwards {
+            if self.slots[f.slot as usize].target.is_none() {
+                return fail(self, cerr(f.line, &f.token, self.undefined_word_msg(&u.ns, &f.token)));
             }
         }
-        if !tmp.ds.is_empty() {
-            let items: Vec<String> = tmp.ds.iter().map(|v| v.to_string()).collect();
+        if !u.tmp.ds.is_empty() {
+            let items: Vec<String> = u.tmp.ds.iter().map(|v| v.to_string()).collect();
             return fail(self, cerr(0, "", format!("top-level code left {} item(s) on the stack: [{}]", items.len(), items.join(" "))));
         }
-        let Some(run) = self.privs[&ns].get("run").and_then(|s| self.slots[*s as usize].target) else {
+        let Some(run) = self.privs[&u.ns].get("run").and_then(|s| self.slots[*s as usize].target) else {
             return fail(self, cerr(0, "", "the source must define `: run ( json-addr json-len -- out-addr out-len ) ... ;`"));
         };
         self.compiled.insert((def.to_string(), version), run);
-        let slot = self.public_slot(def);
-        self.slots[slot as usize].target = Some(run);
-        self.slots[slot as usize].version = version;
+        self.bind_public(def, version, run);
         Ok(())
     }
 
@@ -1133,271 +1275,271 @@ impl Vm {
             .map(|(_, c)| c.to_string())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn compile(
-        &mut self,
-        ns: &str,
-        src: &str,
-        tmp: &mut Exec,
-        open: &mut Option<Open>,
-        forwards: &mut Vec<(u32, u32, String)>,
-    ) -> Result<(), Result<CErr, String>> {
+    /// Compiles `src` token by token. Outside a definition tokens are
+    /// interpreted (run now); inside `: name ... ;` they are compiled.
+    fn compile(&mut self, u: &mut Unit, src: &str) -> Result<(), CompileFail> {
         let mut s = Src { b: src.as_bytes(), pos: 0, line: 1 };
-        while let Some((tok, line)) = s.token() {
-            let t = tok.to_lowercase();
-            let err = |m: String| Err(Ok(cerr(line, &tok, m)));
-            // Parsing words, valid in both states.
-            match t.as_str() {
-                "\\" => {
-                    s.skip_line();
-                    continue;
-                }
-                "(" => {
-                    if s.until(b')', false).is_none() {
-                        return err("unterminated comment: missing `)`".into());
-                    }
-                    continue;
-                }
-                "s\"" | "s\\\"" | ".\"" => {
-                    let Some(text) = s.until(b'"', t == "s\\\"") else {
-                        return err(format!("unterminated string after `{tok}`: missing closing \""));
-                    };
-                    let Some(a) = self.palloc(text.len()) else {
-                        return err("data space full while storing a string literal".into());
-                    };
-                    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), a as usize as *mut u8, text.len()) };
-                    let ops = [Op::Lit(a), Op::Lit(text.len() as i64)];
-                    if open.is_some() {
-                        for op in ops {
-                            self.emit(op, line, &tok);
-                        }
-                        if t == ".\"" {
-                            self.emit(Op::Prim(P::Type), line, &tok);
-                        }
-                    } else if t == ".\"" {
-                        self.console_add(&text);
-                    } else {
-                        tmp.ds.push(a);
-                        tmp.ds.push(text.len() as i64);
-                    }
-                    continue;
-                }
-                "char" | "[char]" => {
-                    let Some((c, _)) = s.token() else {
-                        return err(format!("`{tok}` needs a character after it"));
-                    };
-                    let v = i64::from(c.as_bytes()[0]);
-                    if open.is_some() {
-                        self.emit(Op::Lit(v), line, &tok);
-                    } else {
-                        tmp.ds.push(v);
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            if open.is_none() {
-                match t.as_str() {
-                    ":" | "variable" | "constant" | "create" => {
-                        let Some((name, _)) = s.token() else {
-                            return err(format!("`{tok}` needs a name after it"));
-                        };
-                        let name = name.to_lowercase();
-                        if name.parse::<i64>().is_ok() || SYNTAX.contains(&name.as_str()) {
-                            return err(format!("`{name}` cannot be used as a word name"));
-                        }
-                        let slot = match self.privs[ns].get(&name) {
-                            Some(s) => *s,
-                            None => {
-                                let s = self.new_slot(&format!("{ns}:{name}"));
-                                self.privs.get_mut(ns).expect("ns").insert(name.clone(), s);
-                                s
-                            }
-                        };
-                        let start = self.code.len() as u32;
-                        if t == ":" {
-                            *open = Some(Open { name, slot, start, ctrl: Vec::new() });
-                            continue;
-                        }
-                        let value = match t.as_str() {
-                            "variable" => match self.palloc(8) {
-                                Some(a) => {
-                                    unsafe { std::ptr::write_unaligned(a as usize as *mut i64, 0) };
-                                    a
-                                }
-                                None => return err("data space full".into()),
-                            },
-                            "constant" => match tmp.ds.pop() {
-                                Some(v) => v,
-                                None => return err(format!("`constant {name}` needs a value on the stack, e.g. `10 constant {name}`")),
-                            },
-                            _ => perm_base() + self.here as i64,
-                        };
-                        self.emit(Op::Lit(value), line, &name);
-                        self.emit(Op::Exit, line, &name);
-                        self.bind_word(ns, &name, slot, start);
-                        continue;
-                    }
-                    ";" | "if" | "else" | "then" | "begin" | "until" | "again" | "while" | "repeat" | "do" | "?do"
-                    | "loop" | "+loop" | "leave" | "exit" | "recurse" => {
-                        return err(format!("`{tok}` is only valid inside a `: name ... ;` definition"));
-                    }
-                    _ => {}
-                }
-                // Interpret: numbers push, words execute now.
-                if let Ok(v) = t.parse::<i64>() {
-                    tmp.ds.push(v);
-                    continue;
-                }
-                let op = match self.privs[ns].get(&t).copied() {
-                    Some(slot) => Op::Call(slot),
-                    None => match prim(&t) {
-                        Some((p, _, _)) => Op::Prim(p),
-                        None => match self.public.get(&t) {
-                            Some(slot) => Op::Call(*slot),
-                            None => {
-                                let mut msg = format!("undefined word `{tok}`");
-                                if let Some(s) = self.suggest(ns, &tok) {
-                                    let _ = write!(msg, "; did you mean `{s}`?");
-                                }
-                                return err(msg);
-                            }
-                        },
-                    },
-                };
-                let mark = self.code.len();
-                self.emit(op, line, &tok);
-                self.emit(Op::Halt, line, &tok);
-                tmp.ip = mark as u32;
-                tmp.word = NO_WORD;
-                let r = self.run(tmp);
-                self.code.truncate(mark);
-                self.loc.truncate(mark);
-                match r {
-                    Ok(()) => {}
-                    Err(Fail::Err(json)) => return Err(Err(json)),
-                    Err(Fail::Need(_)) => {
-                        return err(format!(
-                            "`{tok}` is loaded lazily and cannot run at load time; call it from inside a word instead"
-                        ));
-                    }
-                }
+        while let Some((raw, line)) = s.token() {
+            let tk = Token { t: raw.to_lowercase(), raw, line };
+            if self.parse_word(u, &mut s, &tk)? {
                 continue;
             }
-            // Compiling.
-            let here = self.code.len() as u32;
-            let o = open.as_mut().expect("open");
-            match t.as_str() {
-                ";" => {
-                    if let Some(c) = o.ctrl.last() {
-                        let what = match c {
-                            Ctrl::If(_) | Ctrl::Else(_) => "IF without THEN",
-                            Ctrl::Begin(_) => "BEGIN without UNTIL/AGAIN/REPEAT",
-                            Ctrl::While(..) => "WHILE without REPEAT",
-                            Ctrl::Do(..) => "DO without LOOP",
-                        };
-                        return err(format!("`;` reached with an unclosed control structure in `{}`: {what}", o.name));
-                    }
-                    let (name, slot, start) = (o.name.clone(), o.slot, o.start);
-                    self.emit(Op::Exit, line, &tok);
-                    self.bind_word(ns, &name, slot, start);
-                    *open = None;
-                }
-                ":" | "variable" | "constant" | "create" => {
-                    return err(format!("`{tok}` inside the definition of `{}`: missing `;` before it?", o.name));
-                }
-                "if" => {
-                    o.ctrl.push(Ctrl::If(here));
-                    self.emit(Op::ZBranch(0), line, &tok);
-                }
-                "else" => {
-                    let Some(Ctrl::If(at)) = o.ctrl.pop() else {
-                        return err("ELSE without a matching IF".into());
-                    };
-                    o.ctrl.push(Ctrl::Else(here));
-                    self.emit(Op::Branch(0), line, &tok);
-                    self.code[at as usize] = Op::ZBranch(here + 1);
-                }
-                "then" => match o.ctrl.pop() {
-                    Some(Ctrl::If(at)) => self.code[at as usize] = Op::ZBranch(here),
-                    Some(Ctrl::Else(at)) => self.code[at as usize] = Op::Branch(here),
-                    _ => return err("THEN without a matching IF".into()),
-                },
-                "begin" => o.ctrl.push(Ctrl::Begin(here)),
-                "until" | "again" => {
-                    let Some(Ctrl::Begin(b)) = o.ctrl.pop() else {
-                        return err(format!("{} without a matching BEGIN", t.to_uppercase()));
-                    };
-                    self.emit(if t == "until" { Op::ZBranch(b) } else { Op::Branch(b) }, line, &tok);
-                }
-                "while" => {
-                    let Some(Ctrl::Begin(b)) = o.ctrl.pop() else {
-                        return err("WHILE without a matching BEGIN".into());
-                    };
-                    o.ctrl.push(Ctrl::While(b, here));
-                    self.emit(Op::ZBranch(0), line, &tok);
-                }
-                "repeat" => {
-                    let Some(Ctrl::While(b, w)) = o.ctrl.pop() else {
-                        return err("REPEAT without a matching BEGIN ... WHILE".into());
-                    };
-                    self.emit(Op::Branch(b), line, &tok);
-                    self.code[w as usize] = Op::ZBranch(here + 1);
-                }
-                "do" | "?do" => {
-                    o.ctrl.push(Ctrl::Do(here + 1, if t == "?do" { vec![here] } else { vec![] }));
-                    self.emit(if t == "do" { Op::Do } else { Op::QDo(0) }, line, &tok);
-                }
-                "loop" | "+loop" => {
-                    let Some(Ctrl::Do(body, leaves)) = o.ctrl.pop() else {
-                        return err(format!("{} without a matching DO", t.to_uppercase()));
-                    };
-                    self.emit(if t == "loop" { Op::Loop(body) } else { Op::PLoop(body) }, line, &tok);
-                    let after = here + 1;
-                    for l in leaves {
-                        self.code[l as usize] = match self.code[l as usize] {
-                            Op::QDo(_) => Op::QDo(after),
-                            _ => Op::Leave(after),
-                        };
-                    }
-                }
-                "leave" => {
-                    let Some(Ctrl::Do(_, leaves)) = o.ctrl.iter_mut().rev().find(|c| matches!(c, Ctrl::Do(..))) else {
-                        return err("LEAVE outside a DO loop".into());
-                    };
-                    leaves.push(here);
-                    self.emit(Op::Leave(0), line, &tok);
-                }
-                "exit" => self.emit(Op::Exit, line, &tok),
-                "recurse" => {
-                    let slot = o.slot;
-                    self.emit(Op::Call(slot), line, &tok);
-                }
-                _ => {
-                    if let Ok(v) = t.parse::<i64>() {
-                        self.emit(Op::Lit(v), line, &tok);
-                        continue;
-                    }
-                    let op = if let Some(slot) = self.privs[ns].get(&t) {
-                        Op::Call(*slot)
-                    } else if let Some((p, _, _)) = prim(&t) {
-                        Op::Prim(p)
-                    } else if let Some(slot) = self.public.get(&t) {
-                        Op::Call(*slot)
-                    } else if unsafe { host_known(t.as_ptr() as usize as i32, t.len() as i32) } == 1 {
-                        Op::Call(self.public_slot(&t))
-                    } else {
-                        // Forward reference within this definition; checked at the end.
-                        let slot = self.new_slot(&format!("{ns}:{t}"));
-                        self.privs.get_mut(ns).expect("ns").insert(t.clone(), slot);
-                        forwards.push((slot, line, tok.clone()));
-                        Op::Call(slot)
-                    };
-                    self.emit(op, line, &tok);
-                }
+            if u.open.is_none() {
+                self.interpret_token(u, &mut s, &tk)?;
+            } else {
+                self.compile_token(u, &tk)?;
             }
         }
         Ok(())
+    }
+
+    /// Parsing words read the source after them and work in both states.
+    /// Returns false if `tk` is not one.
+    fn parse_word(&mut self, u: &mut Unit, s: &mut Src, tk: &Token) -> Result<bool, CompileFail> {
+        match tk.t.as_str() {
+            "\\" => s.skip_line(),
+            "(" => {
+                if s.until(b')', false).is_none() {
+                    return Err(tk.err("unterminated comment: missing `)`"));
+                }
+            }
+            "s\"" | "s\\\"" | ".\"" => self.string_literal(u, s, tk)?,
+            "char" | "[char]" => {
+                let Some((c, _)) = s.token() else {
+                    return Err(tk.err(format!("`{}` needs a character after it", tk.raw)));
+                };
+                let v = i64::from(c.as_bytes()[0]);
+                if u.open.is_some() {
+                    self.emit(Op::Lit(v), tk.line, &tk.raw);
+                } else {
+                    u.tmp.ds.push(v);
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// `s" ..."`, `s\" ..."` (with escapes) and `." ..."`. The text is stored
+    /// in data space; inside a definition the word pushes (or types) it, at
+    /// top level it is pushed (or printed) now.
+    fn string_literal(&mut self, u: &mut Unit, s: &mut Src, tk: &Token) -> Result<(), CompileFail> {
+        let Some(text) = s.until(b'"', tk.t == "s\\\"") else {
+            return Err(tk.err(format!("unterminated string after `{}`: missing closing \"", tk.raw)));
+        };
+        let Some(a) = self.palloc(text.len()) else {
+            return Err(tk.err("data space full while storing a string literal"));
+        };
+        unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), a as usize as *mut u8, text.len()) };
+        let typed = tk.t == ".\"";
+        if u.open.is_some() {
+            self.emit(Op::Lit(a), tk.line, &tk.raw);
+            self.emit(Op::Lit(text.len() as i64), tk.line, &tk.raw);
+            if typed {
+                self.emit(Op::Prim(P::Type), tk.line, &tk.raw);
+            }
+        } else if typed {
+            self.console_add(&text);
+        } else {
+            u.tmp.ds.push(a);
+            u.tmp.ds.push(text.len() as i64);
+        }
+        Ok(())
+    }
+
+    /// Outside a definition: defining words, numbers (pushed now) and words
+    /// (run now on the load-time stack).
+    fn interpret_token(&mut self, u: &mut Unit, s: &mut Src, tk: &Token) -> Result<(), CompileFail> {
+        match tk.t.as_str() {
+            ":" | "variable" | "constant" | "create" => return self.define_name(u, s, tk),
+            ";" | "if" | "else" | "then" | "begin" | "until" | "again" | "while" | "repeat" | "do" | "?do" | "loop"
+            | "+loop" | "leave" | "exit" | "recurse" => {
+                return Err(tk.err(format!("`{}` is only valid inside a `: name ... ;` definition", tk.raw)));
+            }
+            _ => {}
+        }
+        if let Ok(v) = tk.t.parse::<i64>() {
+            u.tmp.ds.push(v);
+            return Ok(());
+        }
+        let Some(op) = self.resolve(&u.ns, &tk.t) else {
+            return Err(tk.err(self.undefined_word_msg(&u.ns, &tk.raw)));
+        };
+        self.run_now(u, op, tk)
+    }
+
+    /// Runs `op` at load time through a two-instruction stub (op, HALT) that
+    /// is removed again afterwards.
+    fn run_now(&mut self, u: &mut Unit, op: Op, tk: &Token) -> Result<(), CompileFail> {
+        let mark = self.code.len();
+        self.emit(op, tk.line, &tk.raw);
+        self.emit(Op::Halt, tk.line, &tk.raw);
+        u.tmp.ip = mark as u32;
+        u.tmp.word = NO_WORD;
+        let r = self.run(&mut u.tmp);
+        self.code.truncate(mark);
+        self.loc.truncate(mark);
+        match r {
+            Ok(()) => Ok(()),
+            Err(Fail::Err(json)) => Err(CompileFail::Report(json)),
+            Err(Fail::Need(_)) => Err(tk.err(format!(
+                "`{}` is loaded lazily and cannot run at load time; call it from inside a word instead",
+                tk.raw
+            ))),
+        }
+    }
+
+    /// `:`, `variable`, `constant` or `create` NAME: a word in this
+    /// definition's private namespace. `:` opens a definition; the others
+    /// compile a word that pushes their value.
+    fn define_name(&mut self, u: &mut Unit, s: &mut Src, tk: &Token) -> Result<(), CompileFail> {
+        let Some((name, _)) = s.token() else {
+            return Err(tk.err(format!("`{}` needs a name after it", tk.raw)));
+        };
+        let name = name.to_lowercase();
+        if name.parse::<i64>().is_ok() || SYNTAX.contains(&name.as_str()) {
+            return Err(tk.err(format!("`{name}` cannot be used as a word name")));
+        }
+        let slot = self.private_slot(&u.ns, &name);
+        let start = self.code.len() as u32;
+        let value = match tk.t.as_str() {
+            ":" => {
+                u.open = Some(Open { name, slot, start, ctrl: Vec::new() });
+                return Ok(());
+            }
+            "variable" => {
+                let Some(a) = self.palloc(8) else { return Err(tk.err("data space full")) };
+                unsafe { std::ptr::write_unaligned(a as usize as *mut i64, 0) };
+                a
+            }
+            "constant" => match u.tmp.ds.pop() {
+                Some(v) => v,
+                None => return Err(tk.err(format!("`constant {name}` needs a value on the stack, e.g. `10 constant {name}`"))),
+            },
+            // create: the address of the data space that follows.
+            _ => perm_base() + self.here as i64,
+        };
+        self.emit(Op::Lit(value), tk.line, &name);
+        self.emit(Op::Exit, tk.line, &name);
+        self.bind_word(&u.ns, &name, slot, start);
+        Ok(())
+    }
+
+    /// Inside `: name ... ;`. Control words emit branches and patch their
+    /// targets once known; anything else compiles a literal or a call.
+    fn compile_token(&mut self, u: &mut Unit, tk: &Token) -> Result<(), CompileFail> {
+        let (t, line, tok) = (tk.t.as_str(), tk.line, tk.raw.as_str());
+        let here = self.code.len() as u32;
+        let o = u.open.as_mut().expect("open");
+        match t {
+            ";" => {
+                if let Some(c) = o.ctrl.last() {
+                    let what = match c {
+                        Ctrl::If(_) | Ctrl::Else(_) => "IF without THEN",
+                        Ctrl::Begin(_) => "BEGIN without UNTIL/AGAIN/REPEAT",
+                        Ctrl::While(..) => "WHILE without REPEAT",
+                        Ctrl::Do(..) => "DO without LOOP",
+                    };
+                    return Err(tk.err(format!("`;` reached with an unclosed control structure in `{}`: {what}", o.name)));
+                }
+                let (name, slot, start) = (o.name.clone(), o.slot, o.start);
+                self.emit(Op::Exit, line, tok);
+                self.bind_word(&u.ns, &name, slot, start);
+                u.open = None;
+            }
+            ":" | "variable" | "constant" | "create" => {
+                return Err(tk.err(format!("`{tok}` inside the definition of `{}`: missing `;` before it?", o.name)));
+            }
+            "if" => {
+                o.ctrl.push(Ctrl::If(here));
+                self.emit(Op::ZBranch(0), line, tok);
+            }
+            "else" => {
+                let Some(Ctrl::If(at)) = o.ctrl.pop() else {
+                    return Err(tk.err("ELSE without a matching IF"));
+                };
+                o.ctrl.push(Ctrl::Else(here));
+                self.emit(Op::Branch(0), line, tok);
+                self.code[at as usize] = Op::ZBranch(here + 1);
+            }
+            "then" => match o.ctrl.pop() {
+                Some(Ctrl::If(at)) => self.code[at as usize] = Op::ZBranch(here),
+                Some(Ctrl::Else(at)) => self.code[at as usize] = Op::Branch(here),
+                _ => return Err(tk.err("THEN without a matching IF")),
+            },
+            "begin" => o.ctrl.push(Ctrl::Begin(here)),
+            "until" | "again" => {
+                let Some(Ctrl::Begin(b)) = o.ctrl.pop() else {
+                    return Err(tk.err(format!("{} without a matching BEGIN", t.to_uppercase())));
+                };
+                self.emit(if t == "until" { Op::ZBranch(b) } else { Op::Branch(b) }, line, tok);
+            }
+            "while" => {
+                let Some(Ctrl::Begin(b)) = o.ctrl.pop() else {
+                    return Err(tk.err("WHILE without a matching BEGIN"));
+                };
+                o.ctrl.push(Ctrl::While(b, here));
+                self.emit(Op::ZBranch(0), line, tok);
+            }
+            "repeat" => {
+                let Some(Ctrl::While(b, w)) = o.ctrl.pop() else {
+                    return Err(tk.err("REPEAT without a matching BEGIN ... WHILE"));
+                };
+                self.emit(Op::Branch(b), line, tok);
+                self.code[w as usize] = Op::ZBranch(here + 1);
+            }
+            "do" | "?do" => {
+                // ?DO jumps past the loop like a LEAVE, so it is patched with them.
+                o.ctrl.push(Ctrl::Do(here + 1, if t == "?do" { vec![here] } else { vec![] }));
+                self.emit(if t == "do" { Op::Do } else { Op::QDo(0) }, line, tok);
+            }
+            "loop" | "+loop" => {
+                let Some(Ctrl::Do(body, leaves)) = o.ctrl.pop() else {
+                    return Err(tk.err(format!("{} without a matching DO", t.to_uppercase())));
+                };
+                self.emit(if t == "loop" { Op::Loop(body) } else { Op::PLoop(body) }, line, tok);
+                let after = here + 1;
+                for l in leaves {
+                    self.code[l as usize] = match self.code[l as usize] {
+                        Op::QDo(_) => Op::QDo(after),
+                        _ => Op::Leave(after),
+                    };
+                }
+            }
+            "leave" => {
+                let Some(Ctrl::Do(_, leaves)) = o.ctrl.iter_mut().rev().find(|c| matches!(c, Ctrl::Do(..))) else {
+                    return Err(tk.err("LEAVE outside a DO loop"));
+                };
+                leaves.push(here);
+                self.emit(Op::Leave(0), line, tok);
+            }
+            "exit" => self.emit(Op::Exit, line, tok),
+            "recurse" => {
+                let slot = o.slot;
+                self.emit(Op::Call(slot), line, tok);
+            }
+            _ => self.compile_word(u, tk),
+        }
+        Ok(())
+    }
+
+    /// A number or a word inside a definition. A word that does not resolve
+    /// yet is either a live userspace definition (called through its public
+    /// slot and compiled lazily) or a forward reference within this source,
+    /// checked when the source ends.
+    fn compile_word(&mut self, u: &mut Unit, tk: &Token) {
+        let op = if let Ok(v) = tk.t.parse::<i64>() {
+            Op::Lit(v)
+        } else if let Some(op) = self.resolve(&u.ns, &tk.t) {
+            op
+        } else if unsafe { host_known(tk.t.as_ptr() as usize as i32, tk.t.len() as i32) } == 1 {
+            Op::Call(self.public_slot(&tk.t))
+        } else {
+            let slot = self.private_slot(&u.ns, &tk.t);
+            u.forwards.push(Forward { slot, line: tk.line, token: tk.raw.clone() });
+            Op::Call(slot)
+        };
+        self.emit(op, tk.line, &tk.raw);
     }
 
     fn bind_word(&mut self, ns: &str, name: &str, slot: u32, start: u32) {
@@ -1413,9 +1555,9 @@ impl Vm {
         let ex = unsafe { &mut *(&raw mut MAIN) };
         unsafe { CUR = ex as *mut Exec };
         ex.ds.clear();
-        ex.rs.clear();
-        ex.us.clear();
-        ex.ls.clear();
+        ex.frames.clear();
+        ex.rstack.clear();
+        ex.loops.clear();
         self.builders.clear();
         self.console.clear();
         self.scratch_top = 0;
@@ -1435,10 +1577,9 @@ impl Vm {
     fn continue_main(&mut self) -> i32 {
         let ex = unsafe { &mut *(&raw mut MAIN) };
         match self.run(ex) {
+            // ctx_version is already the called version: `call` set it from
+            // the slot, and `resume` updates it if that slot was loaded lazily.
             Ok(()) => {
-                if let Some(Op::Call(s)) = self.code.first() {
-                    self.ctx_version = self.slots[*s as usize].version;
-                }
                 let n = ex.ds.len();
                 if n != 2 || !self.in_data(ex.ds[0], ex.ds[1]) {
                     let what = if n != 2 {
@@ -1585,20 +1726,15 @@ pub extern "C" fn cmh_bind(name_len: i32, version: i32) -> i32 {
     let name = mail_str(0, name_len as usize);
     let vm = vm();
     let Some(run) = vm.compiled.get(&(name.clone(), version as u32)).copied() else { return 0 };
-    let slot = vm.public_slot(&name);
-    vm.slots[slot as usize].target = Some(run);
-    vm.slots[slot as usize].version = version as u32;
+    vm.bind_public(&name, version as u32, run);
     1
 }
 
+/// Unbinds public slot `name`; its next call suspends with NEED (lazy load).
 #[unsafe(no_mangle)]
 pub extern "C" fn cmh_unbind(name_len: i32) {
     let name = mail_str(0, name_len as usize);
-    let vm = vm();
-    if let Some(s) = vm.public.get(&name).copied() {
-        vm.slots[s as usize].target = None;
-        vm.slots[s as usize].version = 0;
-    }
+    vm().unbind_public(&name);
 }
 
 /// Version bound to public slot `name`, 0 if unbound.

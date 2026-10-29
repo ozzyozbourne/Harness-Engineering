@@ -70,6 +70,11 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}\n... (truncated, {} bytes total)", &s[..cut], s.len())
 }
 
+/// At most `max` characters of `s`, with "..." if anything was cut.
+pub fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { format!("{}...", s.chars().take(max).collect::<String>()) }
+}
+
 fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
     input.get(key).and_then(Value::as_str).ok_or(format!("`{key}` (string) is required"))
 }
@@ -173,12 +178,24 @@ pub fn read_file(work_dir: &Path, input: &Value) -> Result<String, String> {
 pub fn write_file(work_dir: &Path, input: &Value, protected: &[PathBuf]) -> Result<String, String> {
     let path = resolve(work_dir, str_arg(input, "path")?);
     let content = str_arg(input, "content")?;
-    if let Some(p) = protected.iter().find(|p| path.starts_with(p)) {
+    if let Some(p) = protected_by(&path, protected) {
         return Err(format!("refused: {} is inside protected path {}", path.display(), p.display()));
     }
+    write_creating_dirs(&path, content.as_bytes())?;
+    Ok(format!("wrote {} bytes to {}", content.len(), path.display()))
+}
+
+/// The protected path containing `path`, if any. Both must be resolved
+/// (`resolve`) for the prefix test to mean anything.
+pub fn protected_by<'a>(path: &Path, protected: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    protected.iter().find(|p| path.starts_with(p))
+}
+
+/// Writes a file, creating its parent directories (`write_file` and the
+/// `file-write` host word).
+pub fn write_creating_dirs(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(format!("wrote {} bytes to {}", content.len(), path.display()))
+    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
 }

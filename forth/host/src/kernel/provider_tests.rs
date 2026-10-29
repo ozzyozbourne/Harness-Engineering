@@ -1,15 +1,16 @@
 //! Unit tests for the request shape (OAuth system blocks, base URL).
 
 use super::provider::{CLAUDE_CODE_IDENTITY, ModelRequest, messages_url, request_body};
-use serde_json::json;
+use serde_json::{Value, json};
 
-fn req() -> ModelRequest {
-    ModelRequest { system: vec!["BASE".into(), "SUPP".into()], tools: vec![json!({"name": "bash"})], messages: vec![] }
+fn req(tools: &[Value]) -> ModelRequest<'_> {
+    ModelRequest { system: vec!["BASE".into(), "SUPP".into()], tools, messages: &[] }
 }
 
 #[test]
 fn oauth_identity_is_first_system_block() {
-    let b = request_body("m", &req(), true);
+    let tools = [json!({"name": "bash"})];
+    let b = request_body("m", &req(&tools), true);
     assert_eq!(b["system"][0]["text"], CLAUDE_CODE_IDENTITY);
     assert_eq!(b["system"][1]["text"], "BASE");
     assert_eq!(b["system"][2]["text"], "SUPP");
@@ -18,7 +19,8 @@ fn oauth_identity_is_first_system_block() {
 
 #[test]
 fn api_key_has_base_prompt_first() {
-    let b = request_body("m", &req(), false);
+    let tools = [json!({"name": "bash"})];
+    let b = request_body("m", &req(&tools), false);
     assert_eq!(b["system"][0]["text"], "BASE");
 }
 
