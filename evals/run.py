@@ -161,6 +161,32 @@ def expand(value, ctx):
 
 # ---------------------------------------------------------------- episodes
 
+EPISODE_MEM_MB = 2500  # summed RSS of one episode's process session
+
+
+def session_rss_mb(sid):
+    """Resident memory of every process in session `sid`, in MB."""
+    total = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            stat = open(f"/proc/{d}/stat").read()
+            fields = stat[stat.rindex(")") + 2:].split()
+            if int(fields[3]) == sid:  # field 6 of stat: session id
+                total += int(fields[21]) * os.sysconf("SC_PAGE_SIZE")  # field 24: rss pages
+        except (OSError, ValueError, IndexError):
+            continue
+    return total // (1 << 20)
+
+
+def kill_session(p):
+    try:
+        os.killpg(p.pid, 9)
+    except ProcessLookupError:
+        pass
+    p.wait()
+
 def run_episode(h, suite_dir, ep, idx, state, model, proxy_port, usage, tag, timeout, logs_dir):
     work = pathlib.Path(tempfile.mkdtemp(prefix="cmh-eval-work-"))
     try:
@@ -178,17 +204,28 @@ def run_episode(h, suite_dir, ep, idx, state, model, proxy_port, usage, tag, tim
             (state / "models.json").write_text(json.dumps({"providers": {"anthropic": {"baseUrl": base}}}))
         cmd = expand(h["cmd"], ctx)
         t0 = time.time()
-        try:
-            p = subprocess.run(cmd, cwd=work, env=env, capture_output=True, text=True, timeout=timeout,
-                               stdin=subprocess.DEVNULL)
-            rc, out, err = p.returncode, p.stdout, p.stderr
-        except subprocess.TimeoutExpired as e:
-            text = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
-            rc, out, err = "timeout", text(e.stdout), text(e.stderr)
-        secs = time.time() - t0
         answer = logs_dir / f"{tag}.stdout.txt"
-        answer.write_text(out)
-        (logs_dir / f"{tag}.stderr.txt").write_text(err[-200_000:])
+        errlog = logs_dir / f"{tag}.stderr.txt"
+        # Output goes to files and the episode runs in its own session, so one runaway
+        # episode can neither fill the runner's memory nor outlive its limits.
+        with open(answer, "w") as out_f, open(errlog, "w") as err_f:
+            p = subprocess.Popen(cmd, cwd=work, env=env, stdout=out_f, stderr=err_f,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            rc = None
+            while rc is None:
+                try:
+                    rc = p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    if time.time() - t0 > timeout:
+                        rc = "timeout"
+                    elif session_rss_mb(p.pid) > EPISODE_MEM_MB:
+                        rc = "memory-limit"
+                    if rc is not None:
+                        kill_session(p)
+        secs = time.time() - t0
+        if rc == "memory-limit":
+            with open(errlog, "a") as err_f:
+                err_f.write(f"\n[eval] killed: episode processes exceeded {EPISODE_MEM_MB} MB\n")
         chk = subprocess.run([sys.executable, str(suite_dir / ep["check"]), str(suite_dir), str(answer)],
                              cwd=work, capture_output=True, text=True, timeout=300,
                              env={**os.environ, "EVAL_EPISODE": str(idx + 1)})
@@ -284,6 +321,12 @@ def main():
     if (out / "summary.md").exists():
         # A supervised service reruns its command when it exits; never append a second run.
         sys.exit(f"{out} already holds a finished run")
+    # Resume an interrupted run: whole suites already recorded are not rerun.
+    done_rows = {}
+    if (out / "results.jsonl").exists():
+        for line in open(out / "results.jsonl"):
+            r = json.loads(line)
+            done_rows.setdefault((r["harness"], r["suite"], r["trial"], r["episode"]), r)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     all_h = load_harnesses()
@@ -294,8 +337,15 @@ def main():
         suites = [s for s in suites if s.name in wanted]
     usage = Usage()
     port = start_proxy(usage, out / "proxy-errors.jsonl", a.upstream)
-    jobs = [(n, s, t) for t in range(1, a.trials + 1) for s in suites for n in names]
-    rows = []
+    episodes = {s.name: len(json.loads((s / "suite.json").read_text())["episodes"]) for s in suites}
+    def recorded(n, s, t):
+        return all((n, s.name, t, e) in done_rows for e in range(1, episodes[s.name] + 1))
+    jobs = [(n, s, t) for t in range(1, a.trials + 1) for s in suites for n in names if not recorded(n, s, t)]
+    rows = [r for r in done_rows.values() if r["harness"] in names and r["suite"] in episodes]
+    if done_rows:
+        print(f"resuming: {len(rows)} recorded episodes kept, {len(jobs)} suite runs left", flush=True)
+        with open(out / "results.jsonl", "w") as f:  # drop duplicate rows from the interrupted run
+            f.writelines(json.dumps(r) + "\n" for r in done_rows.values())
     with cf.ThreadPoolExecutor(a.jobs) as pool, open(out / "results.jsonl", "a") as f:
         futs = [pool.submit(run_suite, n, all_h[n], s, t, a.model, port, usage, a.timeout, logs,
                             a.fresh_state) for n, s, t in jobs]
