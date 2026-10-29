@@ -7,6 +7,10 @@
 //!   and returning JSON strings, frees its own allocations, and runs the user
 //!   function under `catch_unwind` so panics become errors.
 //!
+//! Why one cdylib per version: a new version is a new library file with its
+//! own symbols, so loading it never touches code an older version may still
+//! be running, and replacing a definition needs no restart.
+//!
 //! Libraries are never unloaded (old versions are leaked on purpose), so
 //! function pointers stay valid for the life of the process.
 
@@ -35,8 +39,6 @@ pub struct Userspace {
     build_root: PathBuf,
     target_dir: PathBuf,
     loaded: HashMap<PathBuf, Loaded>,
-    /// Wall time of the most recent cargo invocation, for tracing.
-    pub last_build: Option<Duration>,
 }
 
 /// The entry point a definition must provide, decided by kind and name.
@@ -52,6 +54,10 @@ pub fn entry_kind(kind: &str, name: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Content hash of everything that goes into a library. It names the package
+/// and the library file, so different code never shares a file name (the
+/// dynamic loader would hand back the already-loaded one) and identical code
+/// is compiled only once.
 fn fnv1a(parts: &[&str]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for p in parts {
@@ -65,53 +71,85 @@ fn fnv1a(parts: &[&str]) -> u64 {
 
 impl Userspace {
     pub fn new(state_dir: &Path, target_dir: PathBuf) -> Userspace {
-        Userspace { build_root: state_dir.join("build"), target_dir, loaded: HashMap::new(), last_build: None }
+        Userspace { build_root: state_dir.join("build"), target_dir, loaded: HashMap::new() }
     }
 
     /// Builds (if not cached) and loads the library for one definition version.
-    pub fn load(&mut self, name: &str, version: u32, kind: &str, source: &str) -> Result<Loaded, String> {
-        let entry = entry_kind(kind, name)?;
+    /// Also returns how long cargo ran, when it had to run (the gate traces it).
+    pub fn load(&mut self, name: &str, version: u32, kind: &str, source: &str) -> (Option<Duration>, Result<Loaded, String>) {
+        let entry = match entry_kind(kind, name) {
+            Ok(entry) => entry,
+            Err(e) => return (None, Err(e)),
+        };
         let hash = fnv1a(&[&WRAPPER_ABI.to_string(), entry, name, source]);
         let pkg = format!("cmh_us_{name}_{hash:016x}");
         let file = format!("{}{pkg}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
         let dir = self.build_root.join(format!("{name}_v{version}"));
         let lib_path = dir.join(&file);
         if let Some(l) = self.loaded.get(&lib_path) {
-            return Ok(*l);
+            return (None, Ok(*l));
         }
-        self.last_build = None;
+        let mut build_time = None;
         if !lib_path.exists() {
-            self.build(&dir, &pkg, &file, entry, source, &lib_path)?;
+            let (time, built) = self.build(&dir, &pkg, &file, entry, source);
+            build_time = time;
+            if let Err(e) = built {
+                return (build_time, Err(e));
+            }
         }
-        let loaded = open(&lib_path)?;
-        self.loaded.insert(lib_path, loaded);
-        Ok(loaded)
+        let loaded = open(&lib_path);
+        if let Ok(l) = loaded {
+            self.loaded.insert(lib_path, l);
+        }
+        (build_time, loaded)
     }
 
-    fn build(&mut self, dir: &Path, pkg: &str, file: &str, entry: &str, source: &str, lib_path: &Path) -> Result<(), String> {
+    /// Writes the crate into `dir` and puts its library at `dir/file`,
+    /// compiling it unless identical code was compiled before. Returns the
+    /// cargo wall time if cargo ran.
+    fn build(&self, dir: &Path, pkg: &str, file: &str, entry: &str, source: &str) -> (Option<Duration>, Result<(), String>) {
         let io = |e: std::io::Error| format!("build dir {}: {e}", dir.display());
-        std::fs::create_dir_all(dir.join("src")).map_err(io)?;
-        std::fs::write(dir.join("Cargo.toml"), cargo_toml(pkg)).map_err(io)?;
-        std::fs::write(dir.join("src/lib.rs"), wrapper(entry)).map_err(io)?;
-        std::fs::write(dir.join("src/user.rs"), source).map_err(io)?;
+        let written = std::fs::create_dir_all(dir.join("src"))
+            .and_then(|()| std::fs::write(dir.join("Cargo.toml"), cargo_toml(pkg)))
+            .and_then(|()| std::fs::write(dir.join("src/lib.rs"), wrapper(entry)))
+            .and_then(|()| std::fs::write(dir.join("src/user.rs"), source));
+        if let Err(e) = written {
+            return (None, Err(io(e)));
+        }
+        let lib_path = dir.join(file);
 
         // Identical source compiled before (any state dir): reuse that library.
         let shared = self.target_dir.join("cmh-libs").join(file);
-        if !shared.exists() {
-            let started = Instant::now();
-            let mut out = self.cargo(dir, true)?;
-            if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("offline") {
-                // Dependency not in the local registry cache yet: fetch once.
-                out = self.cargo(dir, false)?;
-            }
-            self.last_build = Some(started.elapsed());
-            if !out.status.success() {
-                return Err(trim_compiler_output(&String::from_utf8_lossy(&out.stderr)));
-            }
-            let built = self.target_dir.join("debug").join(file);
-            atomic_copy(&built, &shared)?;
+        if shared.exists() {
+            return (None, atomic_copy(&shared, &lib_path));
         }
-        atomic_copy(&shared, lib_path)
+        let started = Instant::now();
+        let out = match self.cargo_fetching_once(dir) {
+            Ok(out) => out,
+            Err(e) => return (None, Err(e)),
+        };
+        let build_time = Some(started.elapsed());
+        if !out.status.success() {
+            return (build_time, Err(trim_compiler_output(&String::from_utf8_lossy(&out.stderr))));
+        }
+        let built = self.target_dir.join("debug").join(file);
+        (build_time, atomic_copy(&built, &shared).and_then(|()| atomic_copy(&shared, &lib_path)))
+    }
+
+    /// `cargo build --offline`, retried once online when the failure is about
+    /// being offline.
+    fn cargo_fetching_once(&self, dir: &Path) -> Result<std::process::Output, String> {
+        let out = self.cargo(dir, true)?;
+        // `--offline` fails with a message that mentions "offline" (for example
+        // "you're using offline mode" or "--offline was specified") when a
+        // dependency is not in the local registry cache yet, as on a fresh
+        // machine. Fetch once then. Any other failure is a real compile error
+        // and is reported as is (a compile error that happens to contain the
+        // word only costs one redundant retry).
+        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("offline") {
+            return self.cargo(dir, false);
+        }
+        Ok(out)
     }
 
     fn cargo(&self, dir: &Path, offline: bool) -> Result<std::process::Output, String> {
@@ -164,6 +202,12 @@ fn open(path: &Path) -> Result<Loaded, String> {
 impl Loaded {
     /// Calls the entry point on a worker thread. A call that does not return
     /// within `timeout` is an error; the runaway thread is abandoned.
+    ///
+    /// Why the wall: userspace code is written by the model and may panic or
+    /// loop forever. Panics are caught inside the library (`catch_unwind` in
+    /// the wrapper, since unwinding across the C ABI is not allowed) and come
+    /// back as errors; the thread plus timeout keeps a hang from stalling the
+    /// kernel. Both count as a failed use, so a bad trial is reverted.
     pub fn call(&self, input: &Value, timeout: Duration) -> Result<String, String> {
         let arg = CString::new(input.to_string()).map_err(|e| e.to_string())?;
         let (call, free) = (self.call, self.free);
@@ -314,11 +358,7 @@ fn trim_compiler_output(stderr: &str) -> String {
         .collect();
     let mut text = kept.join("\n").trim().to_string();
     if text.len() > 4000 {
-        let mut cut = 4000;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
+        text.truncate(text.floor_char_boundary(4000));
         text.push_str("\n... (compiler output truncated)");
     }
     format!("compile error:\n{text}")

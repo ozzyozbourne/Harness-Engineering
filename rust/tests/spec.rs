@@ -102,7 +102,7 @@ fn t2_gate_rejection() {
         "tests": [], "input_schema": {"type": "object"}});
     assert!(k.propose_def(&no_tests).is_err());
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
-    let out = k.call_def("word_count", &json!({"text": "a b c"}), |_| Ok(())).unwrap();
+    let out = k.call_def("word_count", &json!({"text": "a b c"})).unwrap();
     assert_eq!(out, "3");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -118,12 +118,12 @@ pub fn run(input: &serde_json::Value) -> Result<String, String> {
     Ok(format!("v2:{}", t.split_whitespace().count()))
 }"#;
     k.propose_def(&word_count_v2(src, "v2:2")).unwrap();
-    assert_eq!(k.call_def("word_count", &json!({"text": "a"}), |_| Ok(())).unwrap(), "v2:1");
-    let err = k.call_def("word_count", &json!({"text": ""}), |_| Ok(())).unwrap_err();
+    assert_eq!(k.call_def("word_count", &json!({"text": "a"})).unwrap(), "v2:1");
+    let err = k.call_def("word_count", &json!({"text": ""})).unwrap_err();
     assert!(err.contains("panic: empty text"), "{err}");
     assert_eq!(status(&k, "word_count"), (Some(1), "kept".into()));
     assert_eq!(k.state.defs["word_count"].get(2).unwrap().status, "reverted");
-    assert_eq!(k.call_def("word_count", &json!({"text": "a b"}), |_| Ok(())).unwrap(), "2");
+    assert_eq!(k.call_def("word_count", &json!({"text": "a b"})).unwrap(), "2");
     let v = k.state.verdicts.iter().find(|v| v.name == "word_count" && v.version == 2).expect("verdict");
     assert_eq!(v.outcome, "reverted");
     assert!(v.text.contains("panic: empty text"), "{}", v.text);
@@ -137,12 +137,12 @@ fn t4_soak_keep() {
     k.propose_def(&word_count_v2(V2_TAGGED, "v2:2")).unwrap();
     for i in 0..3 {
         assert_eq!(status(&k, "word_count"), (Some(2), "trial".into()), "before use {i}");
-        k.call_def("word_count", &json!({"text": "a b"}), |_| Ok(())).unwrap();
+        k.call_def("word_count", &json!({"text": "a b"})).unwrap();
     }
     assert_eq!(status(&k, "word_count"), (Some(2), "kept".into()));
     assert!(k.state.verdicts.iter().any(|v| v.version == 2 && v.outcome == "kept"));
     // Runtime errors from a kept version do not revert it.
-    assert!(k.call_def("word_count", &json!({}), |_| Ok(())).is_err());
+    assert!(k.call_def("word_count", &json!({})).is_err());
     assert_eq!(status(&k, "word_count"), (Some(2), "kept".into()));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -152,7 +152,7 @@ fn t5_persistence() {
     let dir = fresh_dir("persist");
     let (mut k, _) = open(&dir, vec![], 3);
     k.propose_def(&word_count_v2(V2_TAGGED, "v2:2")).unwrap();
-    k.call_def("word_count", &json!({"text": "a b"}), |_| Ok(())).unwrap();
+    k.call_def("word_count", &json!({"text": "a b"})).unwrap();
     k.remember("Prefer small userspace changes.", "remember").unwrap();
     k.propose_def(&json!({"name": "style", "kind": "note", "source": "Answer tersely.", "description": "style"})).unwrap();
     let before = k.state.clone();
@@ -163,7 +163,7 @@ fn t5_persistence() {
     std::fs::remove_dir_all(dir.join("build")).unwrap();
     let (mut k2, _) = open(&dir, vec![], 3);
     assert_eq!(k2.state, before);
-    assert_eq!(k2.call_def("word_count", &json!({"text": "a b c"}), |_| Ok(())).unwrap(), "v2:3");
+    assert_eq!(k2.call_def("word_count", &json!({"text": "a b c"})).unwrap(), "v2:3");
     assert_eq!(k2.state.defs["word_count"].soak_uses, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -233,12 +233,15 @@ pub fn run(input: &serde_json::Value) -> Result<String, String> {
     let script_path = dir.join("script.json");
     std::fs::write(&script_path, script.to_string()).unwrap();
     let state = dir.join("state");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cmh"))
-        .env("CMH_TARGET_DIR", target_dir())
-        .args(["--state", state.to_str().unwrap(), "--provider", "mock", "--script", script_path.to_str().unwrap()])
-        .args(["--no-reflect", "run", "reverse hello"])
-        .output()
-        .unwrap();
+    let run_cli = |state: &Path, script: &Path, task: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_cmh"))
+            .env("CMH_TARGET_DIR", target_dir())
+            .args(["--state", state.to_str().unwrap(), "--provider", "mock", "--script", script.to_str().unwrap()])
+            .args(["--no-reflect", "run", task])
+            .output()
+            .unwrap()
+    };
+    let out = run_cli(&state, &script_path, "reverse hello");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "olleh\n", "stdout must be only the answer");
@@ -256,12 +259,7 @@ pub fn run(input: &serde_json::Value) -> Result<String, String> {
 
     // A failing run exits nonzero (script exhausted).
     std::fs::write(&script_path, "[]").unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cmh"))
-        .env("CMH_TARGET_DIR", target_dir())
-        .args(["--state", state.to_str().unwrap(), "--provider", "mock", "--script", script_path.to_str().unwrap()])
-        .args(["--no-reflect", "run", "anything"])
-        .output()
-        .unwrap();
+    let out = run_cli(&state, &script_path, "anything");
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let _ = std::fs::remove_dir_all(&dir);

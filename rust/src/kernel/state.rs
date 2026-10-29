@@ -44,6 +44,13 @@ impl Def {
     pub fn next_version(&self) -> u32 {
         self.versions.iter().map(|v| v.version).max().unwrap_or(0) + 1
     }
+    /// Ends a version's trial with `status`; the soak count starts over.
+    fn set_status(&mut self, version: u32, status: &str) {
+        if let Some(v) = self.get_mut(version) {
+            v.status = status.into();
+        }
+        self.soak_uses = 0;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -79,11 +86,22 @@ pub struct State {
     pub tasks: Vec<TaskRecord>,
 }
 
-fn s(ev: &Value, k: &str) -> String {
+// Field accessors for journal events and tool inputs. A missing or mistyped
+// field reads as empty / zero (`opt_u` as `None`).
+pub(crate) fn s(ev: &Value, k: &str) -> String {
     ev.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
 }
-fn u(ev: &Value, k: &str) -> u32 {
-    ev.get(k).and_then(Value::as_u64).unwrap_or(0) as u32
+pub(crate) fn opt_u(ev: &Value, k: &str) -> Option<u32> {
+    ev.get(k).and_then(Value::as_u64).map(|v| v as u32)
+}
+pub(crate) fn u(ev: &Value, k: &str) -> u32 {
+    opt_u(ev, k).unwrap_or(0)
+}
+pub(crate) fn u64_field(ev: &Value, k: &str) -> u64 {
+    ev.get(k).and_then(Value::as_u64).unwrap_or(0)
+}
+pub(crate) fn i(ev: &Value, k: &str) -> i64 {
+    ev.get(k).and_then(Value::as_i64).unwrap_or(0)
 }
 
 impl State {
@@ -115,53 +133,43 @@ impl State {
                 }
             }
             "def_kept" => {
-                let version = u(ev, "version");
                 if let Some(def) = self.defs.get_mut(&name) {
-                    if let Some(v) = def.get_mut(version) {
-                        v.status = "kept".into();
-                    }
-                    def.soak_uses = 0;
+                    def.set_status(u(ev, "version"), "kept");
                 }
                 self.push_verdict(ev, "kept");
             }
             "def_reverted" => {
-                let version = u(ev, "version");
                 if let Some(def) = self.defs.get_mut(&name) {
-                    if let Some(v) = def.get_mut(version) {
-                        v.status = "reverted".into();
-                    }
-                    def.live = ev.get("restored").and_then(Value::as_u64).map(|r| r as u32);
-                    def.soak_uses = 0;
+                    def.set_status(u(ev, "version"), "reverted");
+                    def.live = opt_u(ev, "restored");
                 }
                 self.push_verdict(ev, "reverted");
             }
             "lesson_added" => self.lessons.push(Lesson {
-                id: ev.get("id").and_then(Value::as_i64).unwrap_or(0),
+                id: i(ev, "id"),
                 text: s(ev, "text"),
                 score: 0,
                 retired: false,
                 origin: s(ev, "origin"),
             }),
             "lesson_scored" => {
-                let id = ev.get("id").and_then(Value::as_i64).unwrap_or(0);
-                if let Some(l) = self.lessons.iter_mut().find(|l| l.id == id) {
+                if let Some(l) = self.lesson_mut(i(ev, "id")) {
                     l.score = ev.get("score").and_then(Value::as_i64).unwrap_or(l.score);
                 }
             }
             "lesson_retired" => {
-                let id = ev.get("id").and_then(Value::as_i64).unwrap_or(0);
-                if let Some(l) = self.lessons.iter_mut().find(|l| l.id == id) {
+                if let Some(l) = self.lesson_mut(i(ev, "id")) {
                     l.retired = true;
                 }
             }
             "task_started" => self.tasks.push(TaskRecord {
-                id: ev.get("task_id").and_then(Value::as_u64).unwrap_or(0),
+                id: u64_field(ev, "task_id"),
                 task: s(ev, "task"),
                 success: None,
                 summary: String::new(),
             }),
             "task_finished" => {
-                let id = ev.get("task_id").and_then(Value::as_u64).unwrap_or(0);
+                let id = u64_field(ev, "task_id");
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     t.success = ev.get("success").and_then(Value::as_bool);
                     t.summary = s(ev, "summary");
@@ -188,6 +196,19 @@ impl State {
         self.defs.get(name).and_then(Def::live_version)
     }
 
+    /// Every definition whose live version is of `kind`, in name order.
+    pub fn live_defs(&self, kind: &str) -> impl Iterator<Item = (&Def, &DefVersion)> {
+        self.defs.values().filter_map(move |d| d.live_version().filter(|v| v.kind == kind).map(|v| (d, v)))
+    }
+
+    pub fn lesson(&self, id: i64) -> Option<&Lesson> {
+        self.lessons.iter().find(|l| l.id == id)
+    }
+
+    fn lesson_mut(&mut self, id: i64) -> Option<&mut Lesson> {
+        self.lessons.iter_mut().find(|l| l.id == id)
+    }
+
     pub fn active_lessons(&self) -> impl Iterator<Item = &Lesson> {
         self.lessons.iter().filter(|l| !l.retired)
     }
@@ -198,7 +219,8 @@ impl State {
 
     pub fn has_lesson_text(&self, text: &str) -> bool {
         let norm = |t: &str| t.trim().to_lowercase();
-        self.lessons.iter().any(|l| norm(&l.text) == norm(text))
+        let text = norm(text);
+        self.lessons.iter().any(|l| norm(&l.text) == text)
     }
 }
 

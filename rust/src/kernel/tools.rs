@@ -51,11 +51,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut cut = max;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}\n... (truncated, {} bytes total)", &s[..cut], s.len())
+    format!("{}\n... (truncated, {} bytes total)", &s[..s.floor_char_boundary(max)], s.len())
 }
 
 fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {

@@ -80,6 +80,9 @@ pub fn messages_url(base: &str) -> String {
 
 impl Provider for Anthropic {
     fn complete(&mut self, req: &ModelRequest) -> Result<ModelResponse, String> {
+        if matches!(self.auth, Auth::Missing) {
+            return Err("no credentials: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN".into());
+        }
         let oauth = matches!(self.auth, Auth::Bearer(_));
         let body = request_body(&self.model, req, oauth);
         let mut attempt = 0;
@@ -95,7 +98,7 @@ impl Provider for Anthropic {
                 Auth::Bearer(t) => r
                     .set("authorization", &format!("Bearer {t}"))
                     .set("anthropic-beta", "oauth-2025-04-20"),
-                Auth::Missing => return Err("no credentials: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN".into()),
+                Auth::Missing => unreachable!("rejected before the retry loop"),
             };
             match r.send_json(&body) {
                 Ok(resp) => {
@@ -105,13 +108,12 @@ impl Provider for Anthropic {
                     return Ok(ModelResponse { content, stop_reason });
                 }
                 Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
+                    let mut text = resp.into_string().unwrap_or_default();
                     let retryable = matches!(code, 429 | 500 | 502 | 503 | 504 | 529);
                     if retryable && attempt < 4 {
                         std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
                         continue;
                     }
-                    let mut text = text;
                     text.truncate(text.char_indices().nth(1000).map_or(text.len(), |(i, _)| i));
                     return Err(format!("API error {code}: {text}"));
                 }

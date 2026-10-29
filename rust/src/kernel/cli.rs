@@ -21,8 +21,9 @@ struct Args {
     provider: String,
     script: Option<PathBuf>,
     model: String,
-    soak: u32,
-    reflect: bool,
+    /// `None` keeps `Config::new`'s defaults.
+    soak: Option<u32>,
+    no_reflect: bool,
     rest: Vec<String>,
 }
 
@@ -32,8 +33,8 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
         provider: "anthropic".into(),
         script: None,
         model: std::env::var("CMH_MODEL").ok().filter(|m| !m.is_empty()).unwrap_or_else(|| "claude-sonnet-5-5".into()),
-        soak: 3,
-        reflect: true,
+        soak: None,
+        no_reflect: false,
         rest: Vec::new(),
     };
     let mut it = args.into_iter();
@@ -44,13 +45,13 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
             "--provider" => a.provider = val("--provider")?,
             "--script" => a.script = Some(val("--script")?.into()),
             "--model" => a.model = val("--model")?,
-            "--soak" => a.soak = val("--soak")?.parse().map_err(|_| "--soak needs a positive integer")?,
-            "--no-reflect" => a.reflect = false,
+            "--soak" => a.soak = Some(val("--soak")?.parse().map_err(|_| "--soak needs a positive integer")?),
+            "--no-reflect" => a.no_reflect = true,
             "-h" | "--help" => return Err(String::new()),
             _ => a.rest.push(arg),
         }
     }
-    if a.soak == 0 {
+    if a.soak == Some(0) {
         return Err("--soak needs a positive integer".into());
     }
     Ok(a)
@@ -83,8 +84,12 @@ pub fn main(args: Vec<String>) -> i32 {
         return 2;
     };
     let mut cfg = Config::new(a.state.clone());
-    cfg.soak = a.soak;
-    cfg.reflect = a.reflect;
+    if let Some(soak) = a.soak {
+        cfg.soak = soak;
+    }
+    if a.no_reflect {
+        cfg.reflect = false;
+    }
     cfg.echo_text = cmd == "repl";
     let kernel = provider(&a).and_then(|p| Kernel::open(cfg, p));
     let mut k = match kernel {
@@ -145,13 +150,13 @@ fn repl(k: &mut Kernel) -> i32 {
                 k.refine();
             }
             ["/show", name] => print_result(k.show_def(name, None)),
-            ["/show", name, v] => match v.trim_start_matches('v').parse() {
-                Ok(v) => print_result(k.show_def(name, Some(v))),
-                Err(_) => eprintln!("usage: /show NAME [VERSION]"),
+            ["/show", name, v] => match parse_version(v) {
+                Some(v) => print_result(k.show_def(name, Some(v))),
+                None => eprintln!("usage: /show NAME [VERSION]"),
             },
-            ["/rollback", name, v] => match v.trim_start_matches('v').parse() {
-                Ok(v) => print_result(k.rollback_def(name, v)),
-                Err(_) => eprintln!("usage: /rollback NAME VERSION"),
+            ["/rollback", name, v] => match parse_version(v) {
+                Some(v) => print_result(k.rollback_def(name, v)),
+                None => eprintln!("usage: /rollback NAME VERSION"),
             },
             [cmd, ..] if cmd.starts_with('/') => eprintln!("unknown command {cmd}"),
             _ => {
@@ -159,6 +164,11 @@ fn repl(k: &mut Kernel) -> i32 {
             }
         }
     }
+}
+
+/// `3` or `v3`.
+fn parse_version(v: &str) -> Option<u32> {
+    v.trim_start_matches('v').parse().ok()
 }
 
 fn print_result(r: Result<String, String>) {
