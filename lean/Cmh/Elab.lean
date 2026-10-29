@@ -40,7 +40,7 @@ def leanSysroot : IO System.FilePath := do
   catch _ =>
     let home := (← IO.getEnv "HOME").getD "/root"
     let elanHome := (← IO.getEnv "ELAN_HOME").getD (home ++ "/.elan")
-    return System.FilePath.mk elanHome / "toolchains" / "leanprover--lean4---v4.35.0"
+    return System.FilePath.mk elanHome / "toolchains" / s!"leanprover--lean4---v{Lean.versionString}"
 
 /-- The base environment, imported once per process on first use. -/
 def getBaseEnv : IO Environment := do
@@ -51,22 +51,27 @@ def getBaseEnv : IO Environment := do
   baseEnvRef.set (some env)
   return env
 
-/-- The fixed entry declaration appended to each kind's source; it type-checks the contract. -/
-def entryDecl (kind name : String) : Option String :=
-  match kind, name with
-  | "tool", _ => some "def __cmh_entry : Lean.Json → IO String := run"
-  | "hook", "compose_system" => some "def __cmh_entry : List String → List String → String := composeSystem"
-  | "hook", "select_lessons" =>
-    some "def __cmh_entry : String → List (Nat × String × Int) → List Nat := selectLessons"
-  | _, _ => none
+/-- What a definition of one (kind, name) must provide. -/
+structure Contract where
+  /-- The declaration the source must define, as shown to the model on elaboration errors. -/
+  signature : String
+  /-- The fixed entry declaration appended after the source; it type-checks the contract. -/
+  entry : String
 
-def contractText (kind name : String) : String :=
+/-- The contract table. Notes have none. `evalEntryImpl` must evaluate each entry at the type
+written here, and the `propose_def` tool description repeats the signatures. -/
+def contract? (kind name : String) : Option Contract :=
   match kind, name with
-  | "tool", _ => "def run (input : Lean.Json) : IO String"
-  | "hook", "compose_system" => "def composeSystem (notes lessons : List String) : String"
-  | "hook", "select_lessons" =>
-    "def selectLessons (task : String) (lessons : List (Nat × String × Int)) : List Nat"
-  | _, _ => "(none)"
+  | "tool", _ => some {
+      signature := "def run (input : Lean.Json) : IO String"
+      entry := "def __cmh_entry : Lean.Json → IO String := run" }
+  | "hook", "compose_system" => some {
+      signature := "def composeSystem (notes lessons : List String) : String"
+      entry := "def __cmh_entry : List String → List String → String := composeSystem" }
+  | "hook", "select_lessons" => some {
+      signature := "def selectLessons (task : String) (lessons : List (Nat × String × Int)) : List Nat"
+      entry := "def __cmh_entry : String → List (Nat × String × Int) → List Nat := selectLessons" }
+  | _, _ => none
 
 /-- Tokens whose presence rejects a proposal before elaboration (Lean-specific gate rule). -/
 def bannedWords : List String :=
@@ -77,6 +82,7 @@ def bannedIn (src : String) : List String :=
   let toks := src.splitToList (fun c => !(c.isAlphanum || c == '_' || c == '#'))
   bannedWords.filter (toks.contains ·)
 
+/-- One case per row of `contract?`, at that row's entry type. -/
 unsafe def evalEntryImpl (kind name : String) (env : Environment) (n : Name) : Except String Compiled :=
   match kind, name with
   | "tool", _ => (env.evalConst (Json → IO String) {} n (checkMeta := false)).map .tool
@@ -102,13 +108,13 @@ Returns the compiled entry or an error text containing the elaborator's messages
 def elaborate (name kind : String) (version : Nat) (source : String) (maxHeartbeats : Nat := 200000) :
     IO (Except String Compiled) := do
   if kind == "note" then return .ok .note
-  let some entry := entryDecl kind name | return .error s!"unsupported kind/name {kind}/{name}"
+  let some contract := contract? kind name | return .error s!"unsupported kind/name {kind}/{name}"
   let banned := bannedIn source
   unless banned.isEmpty do
     return .error s!"rejected before elaboration: source contains forbidden token(s) {banned} \
       (sorry/axiom/unsafe/implemented_by/extern/#eval/import/initialize are not allowed)"
   let ns := s!"Cmh.Def.{name}.v{version}"
-  let full := s!"namespace {ns}\n{source}\n{entry}\nend {ns}\n"
+  let full := s!"namespace {ns}\n{source}\n{contract.entry}\nend {ns}\n"
   let opts : Options := (Options.empty.set `maxHeartbeats maxHeartbeats).set `Elab.async false
   try
     let env ← getBaseEnv
@@ -116,10 +122,10 @@ def elaborate (name kind : String) (version : Nat) (source : String) (maxHeartbe
     -- errors first: they are what the model needs to fix
     let (errs, others) := msgs.toList.partition (·.severity == .error)
     let rendered ← (errs ++ others).mapM fmtMessage
-    let usesSorry := rendered.any (hasSub · "sorry")
+    let usesSorry := rendered.any (·.contains "sorry")
     if msgs.hasErrors || usesSorry then
       return .error s!"elaboration failed:\n{String.intercalate "\n" rendered}\n\
-        (contract: {contractText kind name}; theorems/examples must check; \
+        (contract: {contract.signature}; theorems/examples must check; \
         the last source line is followed by the kernel's entry declaration)"
     match evalEntry kind name env' s!"{ns}.__cmh_entry".toName with
     | .ok c =>

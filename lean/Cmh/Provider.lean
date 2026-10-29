@@ -18,9 +18,9 @@ def Request.toJson (r : Request) : Json :=
 structure Response where
   content : Array Json
   stopReason : String
+deriving Inhabited
 
 structure Provider where
-  name : String
   complete : Request → IO Response
 
 def oauthPreamble : String := "You are Claude Code, Anthropic's official CLI for Claude."
@@ -33,7 +33,6 @@ initialize mockRequests : IO.Ref (Array Json) ← IO.mkRef #[]
 def mockProvider (script : Array Json) : IO Provider := do
   let idx ← IO.mkRef 0
   return {
-    name := "mock"
     complete := fun req => do
       mockRequests.modify (·.push req.toJson)
       let i ← idx.modifyGet fun i => (i, i + 1)
@@ -65,15 +64,36 @@ private def runCurl (url bodyPath respPath : String) (config : String) : IO (UIn
   let code ← child.wait
   return (code, strTrim out, strTrim err)
 
+/-- POST the request body (already written to `bodyPath`) and parse the reply. Transient failures
+(curl errors, 429, 529, 5xx) are retried up to 4 times, waiting 4, 8, 16 and 32 seconds. -/
+private partial def postMessages (url bodyPath respPath config : String) (attempt : Nat := 0) :
+    IO Response := do
+  let (code, http, err) ← runCurl url bodyPath respPath config
+  let resp ← IO.FS.readFile respPath <|> pure ""
+  let status := http.toNat?.getD 0
+  let retryable := code != 0 || status == 429 || status == 529 || status ≥ 500
+  if retryable && attempt < 4 then
+    let attempt := attempt + 1
+    IO.eprintln s!"[provider] retry {attempt} after curl exit {code} http {http} {strTake err 200}"
+    IO.sleep (UInt32.ofNat (2000 * 2 ^ attempt))
+    return ← postMessages url bodyPath respPath config attempt
+  if code != 0 then throw (IO.userError s!"curl failed (exit {code}): {err}")
+  match Json.parse resp with
+  | .error e => throw (IO.userError s!"http {http}: unparsable response ({e}): {strTake resp 500}")
+  | .ok j =>
+    if status != 200 then
+      throw (IO.userError s!"http {http}: {strTake (j.getObjValD "error").compress 800}")
+    return { content := jArr j "content", stopReason := jStr j "stop_reason" }
+
 /-- Anthropic Messages API. Auth: `ANTHROPIC_API_KEY` (x-api-key) or `CLAUDE_CODE_OAUTH_TOKEN`
 (Bearer + oauth beta header + Claude Code system preamble). Headers, including the secret, go to
 curl through a config file on stdin, never argv. Honors `ANTHROPIC_BASE_URL` (http or https). -/
 def anthropicProvider (model : String) : IO Provider := do
-  let apiKey := (← IO.getEnv "ANTHROPIC_API_KEY").filter (· != "")
-  let oauth := (← IO.getEnv "CLAUDE_CODE_OAUTH_TOKEN").filter (· != "")
+  let apiKey ← envNonEmpty? "ANTHROPIC_API_KEY"
+  let oauth ← envNonEmpty? "CLAUDE_CODE_OAUTH_TOKEN"
   if apiKey.isNone && oauth.isNone then
     throw (IO.userError "anthropic provider: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN")
-  let base := ((← IO.getEnv "ANTHROPIC_BASE_URL").filter (· != "")).getD "https://api.anthropic.com"
+  let base := (← envNonEmpty? "ANTHROPIC_BASE_URL").getD "https://api.anthropic.com"
   let base := if base.endsWith "/" then (base.dropEnd 1).toString else base
   let url := base ++ "/v1/messages"
   let authLines := match apiKey with
@@ -81,7 +101,6 @@ def anthropicProvider (model : String) : IO Provider := do
     | none => s!"header = \"authorization: Bearer {oauth.getD ""}\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\n"
   let config := "header = \"content-type: application/json\"\nheader = \"anthropic-version: 2023-06-01\"\n" ++ authLines
   return {
-    name := "anthropic"
     complete := fun req => do
       let sys := (if apiKey.isNone then #[oauthPreamble] else #[]) ++ req.system.filter (· != "")
       let mut fields : List (String × Json) := [("model", model), ("max_tokens", (32000 : Nat)),
@@ -93,25 +112,7 @@ def anthropicProvider (model : String) : IO Provider := do
       bh.putStr body; bh.flush
       let (_, respPath) ← IO.FS.createTempFile
       try
-        let mut attempt := 0
-        repeat
-          let (code, http, err) ← runCurl url bodyPath.toString respPath.toString config
-          let resp ← IO.FS.readFile respPath <|> pure ""
-          let status := http.toNat?.getD 0
-          let retryable := code != 0 || status == 429 || status == 529 || status ≥ 500
-          if retryable && attempt < 4 then
-            attempt := attempt + 1
-            IO.eprintln s!"[provider] retry {attempt} after curl exit {code} http {http} {strTake err 200}"
-            IO.sleep (UInt32.ofNat (2000 * 2 ^ attempt))
-            continue
-          if code != 0 then throw (IO.userError s!"curl failed (exit {code}): {err}")
-          match Json.parse resp with
-          | .error e => throw (IO.userError s!"http {http}: unparsable response ({e}): {strTake resp 500}")
-          | .ok j =>
-            if status != 200 then
-              throw (IO.userError s!"http {http}: {strTake (jVal j "error").compress 800}")
-            return { content := jArr j "content", stopReason := jStr j "stop_reason" }
-        throw (IO.userError "unreachable")
+        postMessages url bodyPath.toString respPath.toString config
       finally
         try IO.FS.removeFile bodyPath catch _ => pure ()
         try IO.FS.removeFile respPath catch _ => pure () }

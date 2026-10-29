@@ -25,6 +25,13 @@ def text (s : String) : Json := Json.arr #[Json.mkObj [("type", "text"), ("text"
 
 def liveOf (k : Kernel) (n : String) : IO (Option Def) := return (← k.st).liveDef? n
 
+/-- (version, status) of the live version of `n`. -/
+def liveState (k : Kernel) (n : String) : IO (Option (Nat × String)) :=
+  return (← liveOf k n).map fun d => (d.version, d.status)
+
+def lessonById (k : Kernel) (id : Nat) : IO (Option Entry) :=
+  return (← k.st).knowledge.find? (·.id == id)
+
 def wcV2 : String := "
 def run (input : Lean.Json) : IO String := do
   let t := (input.getObjValAs? String \"text\").toOption.getD \"\"
@@ -50,7 +57,7 @@ def testLateBinding : IO Unit := do
   check "v2 accepted" ok msg
   let (o2, err) ← k.callTool "word_count" (parseJ "{\"text\": \"x y z\"}")
   check "next call uses v2" (o2 == "words=3" && !err) o2
-  check "v2 is live trial" (((← liveOf k "word_count").map fun d => (d.version, d.status)) == some (2, "trial"))
+  check "v2 is live trial" ((← liveState k "word_count") == some (2, "trial"))
 
 /-- 2. Gate rejection: compile errors, failing tests, sorry and false theorems are rejected. -/
 def testGateRejection : IO Unit := do
@@ -65,12 +72,11 @@ def testGateRejection : IO Unit := do
   for (label, src, tests) in cases do
     let (msg, ok) ← propose k "word_count" "tool" src tests
     check s!"{label} rejected" (!ok && msg.startsWith "rejected") msg
-  let d ← liveOf k "word_count"
-  check "live version unchanged" ((d.map fun d => (d.version, d.status)) == some (1, "kept"))
+  check "live version unchanged" ((← liveState k "word_count") == some (1, "kept"))
   let (o, _) ← k.callTool "word_count" (parseJ "{\"text\": \"x y\"}")
   check "v1 still answers" (o == "2") o
   let (msg, _) ← propose k "word_count" "tool" "def run (input : Lean.Json) : IO String := pure (1 + \"x\")" wcTests
-  check "elaborator message returned" (hasSub msg "line 1") msg
+  check "elaborator message returned" (msg.contains "line 1") msg
 
 /-- 3. Soak revert: a version that throws reverts on that use; a verdict is recorded. -/
 def testSoakRevert : IO Unit := do
@@ -86,14 +92,13 @@ def run (input : Lean.Json) : IO String := do
   let (_, err1) ← k.callTool "word_count" (parseJ "{\"text\": \"a b\"}")
   check "clean use ok" (!err1)
   let (o, err) ← k.callTool "word_count" (parseJ "{\"text\": \"boom\"}")
-  check "error returned to model" (err && hasSub o "exploded") o
-  let d ← liveOf k "word_count"
-  check "previous version live again" ((d.map fun d => (d.version, d.status)) == some (1, "kept"))
+  check "error returned to model" (err && o.contains "exploded") o
+  check "previous version live again" ((← liveState k "word_count") == some (1, "kept"))
   check "v2 marked reverted" ((((← k.st).find? "word_count" 2).map (·.status)) == some "reverted")
   let vs := (← k.st).verdicts
-  check "verdict entry exists" (vs.any fun v => hasSub v.text "word_count v2" && hasSub v.text "reverted"
-    && hasSub v.text "exploded") (toString (vs.map (·.text)))
-  -- a new tool with no previous version is removed on revert
+  check "verdict entry exists" (vs.any fun v => v.text.contains "word_count v2" && v.text.contains "reverted"
+    && v.text.contains "exploded") (toString (vs.map (·.text)))
+  -- a proposal without tests is rejected
   let flaky := "def run (input : Lean.Json) : IO String := throw (IO.userError \"no\")"
   let (_, ok2) ← k.propose "flaky" "tool" flaky "always fails" (parseJ "[]") Json.null
   check "flaky without tests rejected" (!ok2)
@@ -107,9 +112,8 @@ def testSoakKeep : IO Unit := do
     let d ← liveOf k "word_count"
     check s!"trial before use {i + 1}" ((d.map (·.status)) == some "trial")
     discard <| k.callTool "word_count" (parseJ "{\"text\": \"one two\"}")
-  let d ← liveOf k "word_count"
-  check "kept after 3 clean uses" ((d.map fun d => (d.version, d.status)) == some (2, "kept"))
-  check "keep verdict" ((← k.st).verdicts.any fun v => hasSub v.text "word_count v2" && hasSub v.text "kept")
+  check "kept after 3 clean uses" ((← liveState k "word_count") == some (2, "kept"))
+  check "keep verdict" ((← k.st).verdicts.any fun v => v.text.contains "word_count v2" && v.text.contains "kept")
 
 /-- 5. Persistence: a fresh kernel on the same state dir has identical state. -/
 def testPersistence : IO Unit := do
@@ -145,8 +149,8 @@ def composeSystem (notes lessons : List String) : String :=
   discard <| k.runTask "hello"
   let reqs ← mockRequests.get
   let sys := (jArr (reqs[0]?.getD Json.null) "system").toList.filterMap (·.getStr?.toOption)
-  check "custom supplement in system prompt" (sys.any (hasSub · "CUSTOM-SUPPLEMENT")) (toString sys)
-  check "base prompt still first" (sys.headD "" == k.basePrompt && hasSub k.basePrompt "You are cmh")
+  check "custom supplement in system prompt" (sys.any (·.contains "CUSTOM-SUPPLEMENT")) (toString sys)
+  check "base prompt still first" (sys.headD "" == k.basePrompt && k.basePrompt.contains "You are cmh")
   check "hook use counted" ((((← liveOf k "compose_system").map (·.soakUses))) == some 1)
   let tools := (jArr (reqs[0]?.getD Json.null) "tools").toList.map (jStr · "name")
   check "tool list has kernel and userspace tools" (tools.contains "propose_def" && tools.contains "word_count")
@@ -158,16 +162,16 @@ def testLessonScoring : IO Unit := do
   discard <| k.remember "parser bugs usually hide in tokenizer edge cases"
   let lid := ((← k.st).lessons.headD default).id
   let score := fun (k : Kernel) => do
-    return (((← k.st).knowledge.find? (·.id == lid)).map (·.score)).getD 99
+    return ((← lessonById k lid).map (·.score)).getD 99
   let o ← k.runTask "debug the parser crash"
   check "first task succeeds" o.success
   check "score +1" ((← score k) == 1)
   for _ in [0:3] do discard <| k.runTask "debug the parser crash"
   check "score -2 after three failures" ((← score k) == -2)
-  check "not yet retired" (!(((← k.st).knowledge.find? (·.id == lid)).map (·.retired)).getD true)
+  check "not yet retired" (!((← lessonById k lid).map (·.retired)).getD true)
   discard <| k.runTask "debug the parser crash"
   check "score -3" ((← score k) == -3)
-  check "retired at -3" ((((← k.st).knowledge.find? (·.id == lid)).map (·.retired)) == some true)
+  check "retired at -3" (((← lessonById k lid).map (·.retired)) == some true)
   mockRequests.set #[]
   discard <| k.runTask "debug the parser crash"
   check "retired lesson not scored again" ((← score k) == -3)
@@ -203,11 +207,11 @@ def testEndToEnd : IO Unit := do
   let tools := (jArr (reqs[1]?.getD Json.null) "tools").toList.map (jStr · "name")
   check "new tool offered on the next request" (tools.contains "reverse") (toString tools)
   let toolResult := (jArr (reqs[2]?.getD Json.null) "messages").back?.map (·.compress) |>.getD ""
-  check "tool result is olleh" (hasSub toolResult "olleh") toolResult
+  check "tool result is olleh" (toolResult.contains "olleh") toolResult
   let k ← mkKernel dir
   let d ← liveOf k "reverse"
   check "reverse is live trial with 1 use" ((d.map fun d => (d.status, d.soakUses)) == some ("trial", 1))
-  check "reflection lesson added" ((← k.st).lessons.any (hasSub ·.text "string transforms"))
+  check "reflection lesson added" ((← k.st).lessons.any (·.text.contains "string transforms"))
   IO.FS.removeFile scriptPath
 
 def main : IO UInt32 := do

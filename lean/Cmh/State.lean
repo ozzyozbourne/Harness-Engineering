@@ -28,7 +28,7 @@ deriving Inhabited
 def Def.toJson (d : Def) : Json :=
   Json.mkObj [("name", d.name), ("kind", d.kind), ("version", d.version), ("status", d.status),
     ("description", d.description), ("soak_uses", d.soakUses),
-    ("prev", match d.prev with | some v => Lean.toJson v | none => Json.null),
+    ("prev", Lean.toJson d.prev),
     ("origin", d.origin), ("error", d.error), ("tests", d.tests),
     ("input_schema", d.inputSchema), ("source", d.source)]
 
@@ -48,7 +48,6 @@ structure TaskRec where
   id : Nat
   task : String
   success : Option Bool := none
-  summary : String := ""
 deriving Inhabited
 
 structure St where
@@ -105,12 +104,13 @@ end St
 def apply (s : St) (ev : Json) : St :=
   let name := jStr ev "name"
   let ver := (jNat? ev "version").getD 0
+  let id := (jNat? ev "id").getD 0  -- lesson and task events
   match jStr ev "type" with
   | "def_proposed" =>
     let d : Def := {
         name, version := ver, kind := jStr ev "kind", source := jStr ev "source",
-        description := jStr ev "description", tests := jVal ev "tests",
-        inputSchema := jVal ev "input_schema", status := "proposed", origin := jStr ev "origin" }
+        description := jStr ev "description", tests := ev.getObjValD "tests",
+        inputSchema := ev.getObjValD "input_schema", status := "proposed", origin := jStr ev "origin" }
     { s with defs := s.defs.push d }
   | "def_rejected" => s.updDef name ver (fun d => { d with status := "rejected", error := jStr ev "error" })
   | "def_trial" =>
@@ -125,18 +125,16 @@ def apply (s : St) (ev : Json) : St :=
     (s.updDef name ver (fun d => { d with status := "reverted", error := jStr ev "error" })).setLive name
       (jNat? ev "restored")
   | "lesson_added" =>
-    let e : Entry := { id := (jNat? ev "id").getD 0, kind := jStr ev "kind" "lesson", text := jStr ev "text" }
+    let e : Entry := { id, kind := jStr ev "kind" "lesson", text := jStr ev "text" }
     { s with knowledge := s.knowledge.push e }
-  | "lesson_scored" => s.updEntry ((jNat? ev "id").getD 0) (fun d => { d with score := jInt ev "score" })
-  | "lesson_retired" => s.updEntry ((jNat? ev "id").getD 0) (fun d => { d with retired := true })
+  | "lesson_scored" => s.updEntry id (fun d => { d with score := jInt ev "score" })
+  | "lesson_retired" => s.updEntry id (fun d => { d with retired := true })
   | "task_started" =>
-    let t : TaskRec := { id := (jNat? ev "id").getD 0, task := jStr ev "task" }
+    let t : TaskRec := { id, task := jStr ev "task" }
     { s with tasks := s.tasks.push t }
   | "task_finished" =>
-    let id := (jNat? ev "id").getD 0
     { s with tasks := s.tasks.map fun t =>
-        if t.id == id then { t with success := some (jBool ev "success"), summary := jStr ev "summary" }
-        else t }
+        if t.id == id then { t with success := some (jBool ev "success") } else t }
   | _ => s
 
 /-- Read every event of the journal (a torn final line from a crash is skipped). -/

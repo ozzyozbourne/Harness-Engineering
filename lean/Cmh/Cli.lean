@@ -42,14 +42,15 @@ def mkProvider (a : Args) : IO Provider := do
     let some f := a.script | throw (IO.userError "--provider mock needs --script FILE")
     mockProviderFromFile f
   | "anthropic" =>
-    let model := a.model.getD (((← IO.getEnv "CMH_MODEL").filter (· != "")).getD "claude-sonnet-5-5")
+    let model := a.model.getD ((← envNonEmpty? "CMH_MODEL").getD "claude-sonnet-5-5")
     anthropicProvider model
   | p => throw (IO.userError s!"unknown provider {p}")
 
-def showDef (k : Kernel) (name : String) (ver : Option Nat) : IO Unit := do
-  let (out, _) ← k.kernelTool "show_def" (Json.mkObj ([("name", Json.str name)] ++
-    (match ver with | some v => [("version", toJson v)] | none => [])))
-  IO.println out
+/-- Run one task, print its final answer (if any), and return the exit code: 0 on success. -/
+def runAndReport (k : Kernel) (task : String) : IO UInt32 := do
+  let o ← k.runTask task
+  if o.answer != "" then IO.println o.answer
+  return if o.success then 0 else 1
 
 partial def repl (k : Kernel) : IO Unit := do
   let stdin ← IO.getStdin
@@ -64,8 +65,8 @@ partial def repl (k : Kernel) : IO Unit := do
     | ["/quit"] => break
     | ["/defs"] => IO.println (← k.listDefs)
     | ["/knowledge"] => IO.println (← k.knowledgeText)
-    | ["/show", n] => showDef k n none
-    | ["/show", n, v] => showDef k n v.toNat?
+    | ["/show", n] => IO.println (← k.showDef n none).1
+    | ["/show", n, v] => IO.println (← k.showDef n v.toNat?).1
     | ["/rollback", n, v] => IO.println (← k.rollback n (v.toNat?.getD 0)).1
     | ["/refine"] => discard <| k.runTask (← k.refinePrompt)
     | w :: _ =>
@@ -81,19 +82,13 @@ def cliMain (argv : List String) : IO UInt32 := do
   let needsModel := match a.rest with | "run" :: _ | ["refine"] | ["repl"] => true | _ => false
   try
     let provider ← if needsModel then mkProvider a
-      else pure { name := "none", complete := fun _ => throw (IO.userError "no provider") }
+      else pure { complete := fun _ => throw (IO.userError "no provider") }
     let isRepl := a.rest == ["repl"]
     let k ← Kernel.open { stateDir := a.state, workDir := ← IO.currentDir, soak := a.soak,
                           reflect := a.reflect, echo := isRepl } provider
     match a.rest with
-    | ["run", task] =>
-      let o ← k.runTask task
-      if o.answer != "" then IO.println o.answer
-      return if o.success then 0 else 1
-    | ["refine"] =>
-      let o ← k.runTask (← k.refinePrompt)
-      if o.answer != "" then IO.println o.answer
-      return if o.success then 0 else 1
+    | ["run", task] => runAndReport k task
+    | ["refine"] => runAndReport k (← k.refinePrompt)
     | ["repl"] => repl k; return 0
     | ["defs"] => IO.println (← k.listDefs); return 0
     | ["knowledge"] => IO.println (← k.knowledgeText); return 0

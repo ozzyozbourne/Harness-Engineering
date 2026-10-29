@@ -9,10 +9,6 @@ def strTrim (s : String) : String := s.trimAscii.toString
 
 def strTake (s : String) (n : Nat) : String := (s.take n).toString
 
-/-- `true` if `sub` occurs in `s`. -/
-def hasSub (s sub : String) : Bool :=
-  sub.isEmpty || (s.splitOn sub).length > 1
-
 /-- Truncate to at most `n` bytes-ish (characters), marking the cut. -/
 def truncate (s : String) (n : Nat) : String :=
   if s.length ≤ n then s else strTake s n ++ s!"\n... [truncated, {s.length} chars total]"
@@ -21,7 +17,9 @@ def truncate (s : String) (n : Nat) : String :=
 def words (s : String) : List String :=
   (s.toLower.splitToList (fun c => !c.isAlphanum)).filter (!·.isEmpty)
 
-/-- Lower-cased words of 4+ letters (the seed `select_lessons` rule). -/
+/-- Lower-cased words of 4+ letters (the seed `select_lessons` rule).
+Deliberately duplicates `longWords` in `userspace/select_lessons.lean`: seeds are elaborated in
+their own isolated environment, and this copy backs the kernel's builtin fallback. -/
 def longWords (s : String) : List String :=
   (s.toLower.splitToList (fun c => !c.isAlpha)).filter (·.length ≥ 4)
 
@@ -43,13 +41,13 @@ def jInt (j : Json) (k : String) (d : Int := 0) : Int :=
 def jBool (j : Json) (k : String) (d : Bool := false) : Bool :=
   (j.getObjValAs? Bool k).toOption.getD d
 
-def jVal (j : Json) (k : String) : Json :=
-  (j.getObjVal? k).toOption.getD Json.null
-
+/-- The array at key `k`, or `#[]` if it is missing or not an array. -/
 def jArr (j : Json) (k : String) : Array Json :=
-  match j.getObjVal? k with
-  | .ok (.arr a) => a
-  | _ => #[]
+  ((j.getObjValD k).getArr?).toOption.getD #[]
+
+/-- An environment variable, treating an empty value as unset. -/
+def envNonEmpty? (name : String) : IO (Option String) :=
+  return (← IO.getEnv name).filter (· != "")
 
 /-- Civil date from days since 1970-01-01 (Howard Hinnant's algorithm). -/
 private def civil (z : Int) : Int × Nat × Nat :=
