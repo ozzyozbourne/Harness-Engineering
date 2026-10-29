@@ -18,3 +18,5 @@ kept, and the harness carries lessons and verdicts across runs.
 | [forth/](forth/) | a small late-bound Forth | runs inside WebAssembly (Wasmtime) with fuel, a memory cap and snapshot rollback; failures come back as structured errors |
 
 All four share the immutable base prompt in [base-prompt.md](base-prompt.md).
+
+Known gaps, planned improvements and experiment ideas are in [ROADMAP.md](ROADMAP.md).
