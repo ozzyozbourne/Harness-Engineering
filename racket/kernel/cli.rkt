@@ -11,6 +11,13 @@ cmh [--state DIR] [--provider anthropic|mock] [--script FILE] [--model M]
 EOF
   )
 
+;; Run one task, print its answer, and return the exit code.
+(define (task! k text)
+  (define-values (ok? answer) (run-task k text))
+  (displayln answer)
+  (flush-output)
+  (if ok? 0 1))
+
 (define (main argv)
   (define state ".cmh")
   (define provider-kind "anthropic")
@@ -40,11 +47,6 @@ EOF
         [else (raise-user-error (format "unknown provider ~a" provider-kind))]))
     (define (open needs-provider?)
       (open-kernel state #:provider (and needs-provider? (make-provider)) #:soak soak #:reflect? reflect?))
-    (define (task! k text)
-      (define-values (ok? answer) (run-task k text))
-      (displayln answer)
-      (flush-output)
-      (if ok? 0 1))
     (cond
       [(null? args) (eprintf "~a\n" usage) 2]
       [else
@@ -82,6 +84,6 @@ EOF
             (trace! "[gate] rollback ~a -> ~a" (cadr parts) (one-line msg 120))
             (displayln msg))
           (loop)]
-         [(equal? l "/refine") (let-values ([(ok? a) (run-task k (refine-task-text k))]) (displayln a)) (loop)]
+         [(equal? l "/refine") (task! k (refine-task-text k)) (loop)]
          [(string-prefix? l "/") (displayln "commands: /defs /show NAME [VERSION] /knowledge /refine /rollback NAME VERSION /quit") (loop)]
-         [else (let-values ([(ok? a) (run-task k l)]) (displayln a)) (loop)])])))
+         [else (task! k l) (loop)])])))

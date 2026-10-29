@@ -1,8 +1,8 @@
 #lang racket/base
 ;; The immutable base system prompt: read from ../base-prompt.md (relative to
 ;; the flavor directory) at startup, else the embedded copy below.
-(require racket/runtime-path racket/file)
-(provide base-prompt embedded-base-prompt base-prompt-file)
+(require racket/runtime-path racket/file "util.rkt")
+(provide base-prompt base-prompt-file)
 
 (define-runtime-path base-prompt-file "../../base-prompt.md")
 
@@ -31,6 +31,6 @@ EOF
 (define base-prompt
   (let ([text (with-handlers ([exn:fail? (λ (_) #f)])
                 (file->string base-prompt-file))])
-    (if (and text (regexp-match? #px"\\S" text))
+    (if (and text (not (blank? text)))
         (regexp-replace #px"\\s+$" text "")
         embedded-base-prompt)))

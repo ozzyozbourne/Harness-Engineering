@@ -5,15 +5,16 @@
 
 (define (journal-append! path ev)
   (define full (hash-set ev 'ts (now-iso)))
+  ;; Closing the port (when call-with-output-file returns) flushes the line.
   (call-with-output-file path #:exists 'append
-    (λ (o) (write-json full o) (newline o) (flush-output o)))
+    (λ (o) (write-json full o) (newline o)))
   full)
 
 ;; All events in order. A torn final line (crash mid-write) is skipped.
 (define (journal-read path)
   (if (file-exists? path)
       (for*/list ([line (in-list (file->lines path))]
-                  #:when (regexp-match? #px"\\S" line)
+                  #:unless (blank? line)
                   [ev (in-value (with-handlers ([exn:fail? (λ (_)
                                                              (trace! "[journal] skipping unreadable line")
                                                              #f)])

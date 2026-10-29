@@ -4,8 +4,7 @@
 ;; evaluator that is thrown away. Only plain data crosses the boundary: inputs
 ;; are quoted jsexprs, results are checked to be strings / lists of ids.
 (require racket/sandbox json)
-(provide new-evaluator destroy-evaluator load-source! check-entry! invoke-entry
-         test-output entry-signature sandbox-time-limit sandbox-memory-mb)
+(provide new-evaluator destroy-evaluator load-source! check-entry! invoke-entry test-output)
 
 (define sandbox-time-limit (make-parameter 10))  ; seconds per evaluation
 (define sandbox-memory-mb (make-parameter 128))  ; MB per evaluation
@@ -25,45 +24,57 @@
   (ev (regexp-replace #px"^\\s*#lang[^\n]*" source ""))
   (void))
 
-(define (select-hook? kind name) (and (equal? kind "hook") (equal? name "select_lessons")))
+(define (check-string sym result)
+  (unless (string? result)
+    (error (format "~a must return a string, got ~e" sym result)))
+  (string->immutable-string result))
 
-(define (entry kind name)
-  (cond [(equal? kind "tool") (values 'run 1)]
-        [(select-hook? kind name) (values 'select-lessons 2)]
-        [else (values 'compose-system 2)]))
+(define (check-lesson-ids _sym result)
+  (unless (and (list? result) (andmap exact-integer? result))
+    (error (format "select-lessons must return a list of lesson ids, got ~e" result)))
+  result)
 
-(define (entry-signature kind name)
-  (cond [(equal? kind "tool") "(define (run input) ...)"]
-        [(select-hook? kind name) "(define (select-lessons task lessons) ...)"]
-        [else "(define (compose-system notes lessons) ...)"]))
+;; One entry point per kind of definition:
+;;   symbol     the procedure the source must define
+;;   arity      how many arguments it must accept
+;;   signature  shown to the model when the definition is missing
+;;   args       input jsexpr -> the argument list for the call
+;;   check      (symbol result) -> the checked result, or raises
+(struct entry (symbol arity signature args check))
+
+(define tool-entry
+  (entry 'run 1 "(define (run input) ...)"
+         (λ (input) (list input))
+         check-string))
+
+(define select-lessons-entry
+  (entry 'select-lessons 2 "(define (select-lessons task lessons) ...)"
+         (λ (input) (list (hash-ref input 'task "") (hash-ref input 'lessons '())))
+         check-lesson-ids))
+
+(define compose-system-entry
+  (entry 'compose-system 2 "(define (compose-system notes lessons) ...)"
+         (λ (input) (list (hash-ref input 'notes '()) (hash-ref input 'lessons '())))
+         check-string))
+
+(define (entry-for kind name)
+  (cond [(equal? kind "tool") tool-entry]
+        [(and (equal? kind "hook") (equal? name "select_lessons")) select-lessons-entry]
+        [else compose-system-entry]))
 
 (define (check-entry! ev kind name)
-  (define-values (sym arity) (entry kind name))
-  (define v (with-handlers ([exn:fail? (λ (_) #f)]) (ev sym)))
-  (unless (and (procedure? v) (procedure-arity-includes? v arity))
-    (error (string-append "source must define " (entry-signature kind name)))))
+  (define e (entry-for kind name))
+  (define v (with-handlers ([exn:fail? (λ (_) #f)]) (ev (entry-symbol e))))
+  (unless (and (procedure? v) (procedure-arity-includes? v (entry-arity e)))
+    (error (string-append "source must define " (entry-signature e)))))
 
 ;; Call the entry point inside the evaluator (time and memory limits apply)
-;; and check the shape of the result.
+;; and check the shape of the result. Arguments cross as quoted data.
 (define (invoke-entry ev kind name input)
-  (define-values (sym _arity) (entry kind name))
-  (define result
-    (cond [(equal? kind "tool") (ev `(run (quote ,input)))]
-          [(select-hook? kind name)
-           (ev `(select-lessons (quote ,(hash-ref input 'task ""))
-                                (quote ,(hash-ref input 'lessons '()))))]
-          [else
-           (ev `(compose-system (quote ,(hash-ref input 'notes '()))
-                                (quote ,(hash-ref input 'lessons '()))))]))
-  (cond
-    [(select-hook? kind name)
-     (unless (and (list? result) (andmap exact-integer? result))
-       (error (format "select-lessons must return a list of lesson ids, got ~e" result)))
-     result]
-    [else
-     (unless (string? result)
-       (error (format "~a must return a string, got ~e" sym result)))
-     (string->immutable-string result)]))
+  (define e (entry-for kind name))
+  (define sym (entry-symbol e))
+  (define call `(,sym ,@(for/list ([a (in-list ((entry-args e) input))]) `(quote ,a))))
+  ((entry-check e) sym (ev call)))
 
 ;; Output used by tests: strings as-is, select_lessons JSON-encoded.
 (define (test-output ev kind name input)

@@ -3,7 +3,7 @@
 ;; scoring, note soak, and reflection.
 (require racket/list racket/string json
          "util.rkt" "core.rkt" "tools.rkt" "provider.rkt" "base-prompt.rkt")
-(provide run-task refine-task-text system-blocks max-turns)
+(provide run-task refine-task-text)
 
 (define max-turns (make-parameter 40))
 
@@ -21,52 +21,21 @@
 
 ;; Returns (values success? answer).
 (define (run-task k task)
-  (define p (kernel-provider k))
   (define task-id (add1 (length (kernel-tasks k))))
   (emit! k (hasheq 'type "task_started" 'task_id task-id 'task task))
   (define lesson-ids (select-lesson-ids k task))
   (define trial-notes (live-trial-notes k))
   (define system (system-blocks k lesson-ids))
-  (define transcript '())                 ; compact lines for reflection
+  (define transcript '())                 ; compact lines for reflection, newest first
   (define (log! fmt . args) (set! transcript (cons (one-line (apply format fmt args) 300) transcript)))
   (log! "task: ~a" task)
-  (define tool-errors '())                ; most recent first
-  (define kernel-error #f)
-  (define stop #f)
-  (define answer "")
-  (let loop ([messages (list (hasheq 'role "user" 'content task))] [turn 1])
-    (cond
-      [(> turn (max-turns)) (set! kernel-error (format "turn limit ~a reached" (max-turns)))]
-      [else
-       (define resp
-         (with-handlers ([always? (λ (e) (set! kernel-error (error-text e)) #f)])
-           (provider-call p system (tool-specs k) messages)))
-       (when resp
-         (define content (hash-ref resp 'content '()))
-         (set! stop (hash-ref resp 'stop_reason #f))
-         (define text (text-of content))
-         (unless (string=? text "") (log! "assistant: ~a" text) (set! answer text))
-         (define uses (filter (λ (b) (equal? (block-type b) "tool_use")) content))
-         (cond
-           [(null? uses) (void)]
-           [else
-            (unless (string=? text "") (trace! "[assistant] ~a" text))
-            (define results
-              (for/list ([u uses])
-                (define name (hash-ref u 'name ""))
-                (define-values (err? out) (run-tool k name (hash-ref u 'input (hasheq))))
-                (set! tool-errors (cons err? tool-errors))
-                (log! "tool ~a ~a -> ~a~a" name (json-brief (hash-ref u 'input (hasheq)) 120)
-                      (if err? "ERROR " "") (one-line out 160))
-                (hasheq 'type "tool_result" 'tool_use_id (hash-ref u 'id "")
-                        'content (if (string=? out "") "(empty)" out) 'is_error err?)))
-            (loop (append messages (list (hasheq 'role "assistant" 'content content)
-                                         (hasheq 'role "user" 'content results)))
-                  (add1 turn))]))]))
+  (define-values (stop answer kernel-error tool-errors) (run-turns k system task log!))
   (when kernel-error (trace! "[kernel] error: ~a" (one-line kernel-error 200)) (log! "kernel error: ~a" kernel-error))
+  ;; A task succeeds when the model ended its turn normally, nothing broke in
+  ;; the kernel, and its last two tool calls (if any) did not fail.
   (define success?
     (and (equal? stop "end_turn") (not kernel-error)
-         (not (ormap values (take tool-errors (min 2 (length tool-errors)))))))
+         (not (ormap values (take-up-to tool-errors 2)))))
   ;; Notes soak over tasks: a failed task counts as an error for trial notes.
   (for ([n trial-notes])
     (record-use! k (car n) (cdr n) success? (if success? #f (or kernel-error "task failed")) #f))
@@ -76,6 +45,54 @@
   (trace! "[task] #~a ~a" task-id (if success? "succeeded" "failed"))
   (when (kernel-reflect? k) (reflect! k task success? (reverse transcript)))
   (values success? (if (and kernel-error (string=? answer "")) (string-append "error: " kernel-error) answer)))
+
+;; Model/tool turns until the model stops calling tools, the provider fails,
+;; or the turn limit is hit. Returns (values stop answer kernel-error tool-errors):
+;; the last stop_reason, the last non-empty assistant text, the error that ended
+;; the loop or #f, and one error flag per tool call, most recent first.
+(define (run-turns k system task log!)
+  (define p (kernel-provider k))
+  (let loop ([messages (list (hasheq 'role "user" 'content task))]
+             [turn 1] [stop #f] [answer ""] [tool-errors '()])
+    (cond
+      [(> turn (max-turns))
+       (values stop answer (format "turn limit ~a reached" (max-turns)) tool-errors)]
+      [else
+       (define-values (resp provider-error)
+         (with-handlers ([always? (λ (e) (values #f (error-text e)))])
+           (values (provider-call p system (tool-specs k) messages) #f)))
+       (cond
+         [(not resp) (values stop answer provider-error tool-errors)]
+         [else
+          (define content (hash-ref resp 'content '()))
+          (define stop* (hash-ref resp 'stop_reason #f))
+          (define text (text-of content))
+          (unless (string=? text "") (log! "assistant: ~a" text))
+          (define answer* (if (string=? text "") answer text))
+          (define uses (filter tool-use? content))
+          (cond
+            [(null? uses) (values stop* answer* #f tool-errors)]
+            [else
+             (unless (string=? text "") (trace! "[assistant] ~a" text))
+             (define-values (results tool-errors*)
+               (for/fold ([results '()] [errors tool-errors]
+                          #:result (values (reverse results) errors))
+                         ([u (in-list uses)])
+                 (define-values (err? result) (run-tool-use k u log!))
+                 (values (cons result results) (cons err? errors))))
+             (loop (append messages (list (hasheq 'role "assistant" 'content content)
+                                          (hasheq 'role "user" 'content results)))
+                   (add1 turn) stop* answer* tool-errors*)])])])))
+
+;; Run one tool_use block. Returns (values error? tool_result-block).
+(define (run-tool-use k u log!)
+  (define name (hash-ref u 'name ""))
+  (define input (hash-ref u 'input (hasheq)))
+  (define-values (err? out) (run-tool k name input))
+  (log! "tool ~a ~a -> ~a~a" name (json-brief input 120) (if err? "ERROR " "") (one-line out 160))
+  (values err?
+          (hasheq 'type "tool_result" 'tool_use_id (hash-ref u 'id "")
+                  'content (if (string=? out "") "(empty)" out) 'is_error err?)))
 
 (define reflect-prompt #<<EOF
 Reflect on the finished task below. Reply with only a JSON array of 0 to 3
@@ -89,7 +106,7 @@ EOF
 (define (parse-lessons text)
   (define m (regexp-match #px"\\[.*\\]" text))
   (define v (and m (with-handlers ([exn:fail? (λ (_) #f)]) (string->jsexpr (car m)))))
-  (if (list? v) (filter string? (take v (min 3 (length v)))) #f))
+  (if (list? v) (filter string? (take-up-to v 3)) #f))
 
 (define (reflect! k task success? transcript)
   (with-handlers ([always? (λ (e) (trace! "[reflect] error: ~a" (one-line (error-text e) 200)))])

@@ -289,3 +289,6 @@
     (check-regexp-match #rx"refused" m2)
     (define-values (e3 m3) (run-tool k "propose_def" (hasheq 'name "bash" 'kind "tool" 'source "" 'description "")))
     (check-regexp-match #rx"kernel tool" m3)))
+
+(test-case "kernel-tool-names (core) lists exactly the kernel-tool-specs (tools)"
+  (check-equal? (map (λ (s) (hash-ref s 'name)) kernel-tool-specs) kernel-tool-names))

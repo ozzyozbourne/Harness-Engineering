@@ -22,6 +22,7 @@ Tests: [{"input": {...}, "expect": "substring of the output"}]. Hooks get their 
 EOF
   )
 
+;; The names here must match kernel-tool-names in core.rkt.
 (define kernel-tool-specs
   (list
    (hasheq 'name "bash"
@@ -101,9 +102,7 @@ EOF
        (if (path? parent) (loop parent (cons name rest)) full)])))
 
 (define (inside? p dir)
-  (define pe (explode-path p))
-  (define de (explode-path dir))
-  (and (<= (length de) (length pe)) (equal? (take pe (length de)) de)))
+  (list-prefix? (explode-path dir) (explode-path p)))
 
 (define (write-file-tool k path content)
   (define target (real-path path))
@@ -116,8 +115,8 @@ EOF
      (values #t "refused: the base prompt is immutable")]
     [else
      (make-parent-directory* target)
-     (call-with-output-file target #:exists 'truncate/replace (λ (o) (write-string content o)))
-     (values #f (format "wrote ~a bytes to ~a" (bytes-length (string->bytes/utf-8 content)) path))]))
+     (display-to-file content target #:exists 'truncate/replace)
+     (values #f (format "wrote ~a bytes to ~a" (string-utf-8-length content) path))]))
 
 ;; ---------------------------------------------------------------- dispatch
 
@@ -129,8 +128,8 @@ EOF
     [("write_file") (write-file-tool k (need-string input 'path) (need-string input 'content))]
     [("list_defs") (values #f (defs-text k))]
     [("show_def")
-     (let ([d (get-def k (need-string input 'name))])
-       (values (not d) (show-def-text k (need-string input 'name) (opt-int input 'version #f))))]
+     (let ([name (need-string input 'name)])
+       (values (not (get-def k name)) (show-def-text k name (opt-int input 'version #f))))]
     [("propose_def") (let-values ([(ok? msg) (propose! k input)]) (values (not ok?) msg))]
     [("rollback_def")
      (let-values ([(ok? msg) (rollback! k (need-string input 'name) (opt-int input 'version #f))])
@@ -158,8 +157,9 @@ EOF
 (define (result-brief name err? out)
   (cond
     [(member name '("propose_def" "rollback_def"))
-     (let ([m (regexp-match #px"^(trial v\\d+|rejected v\\d+: .*|invalid proposal: .*)" out)])
-       (one-line (if m (regexp-replace #px"^(trial v\\d+):.*" (cadr m) "\\1") out) 120))]
+     ;; "trial vN: live now; ..." shortens to "trial vN"; anything else becomes one line.
+     (let ([m (regexp-match #px"^trial v\\d+" out)])
+       (if m (car m) (one-line out 120)))]
     [err? (string-append "error: " (one-line out 120))]
     [(equal? name "bash") (let ([m (regexp-match #px"\\[(exit code \\d+)\\]$" out)]) (if m (cadr m) "ok"))]
     [(member name '("read_file" "list_defs" "show_def" "recall")) (format "~a chars" (string-length out))]

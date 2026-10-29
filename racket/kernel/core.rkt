@@ -6,15 +6,17 @@
 (require racket/list racket/string racket/file racket/runtime-path json
          "util.rkt" "journal.rkt" "sandbox.rkt")
 (provide (struct-out kernel) (struct-out def) (struct-out lesson)
-         open-kernel emit! get-def def-record live-record live-status
+         open-kernel emit! get-def def-record live-status
          propose! rollback! use-def! record-use!
          select-lesson-ids compose-supplemental live-trial-notes userspace-tools
          userspace-tool? add-lesson! score-lessons! active-lessons recall-text
          defs-text show-def-text knowledge-text recent-tasks-text verdicts-text
-         kernel-snapshot hook-names kernel-tool-names)
+         kernel-snapshot kernel-tool-names)
 
 (define-runtime-path seed-dir "../seed")
 (define hook-names '("compose_system" "select_lessons"))
+;; Must list exactly the names in kernel-tool-specs (tools.rkt, which requires
+;; this module); the test suite checks that they agree.
 (define kernel-tool-names '("bash" "read_file" "write_file" "list_defs" "show_def"
                             "propose_def" "rollback_def" "remember" "recall"))
 (define max-verdicts-in-prompt 30)
@@ -22,6 +24,8 @@
 ;; versions: version -> record (immutable hasheq). live/kept: version or #f.
 (struct def (name kind versions [live #:mutable] [kept #:mutable] [soak-count #:mutable]))
 (struct lesson (id text [score #:mutable] [retired? #:mutable]))
+;; defs: name -> def. lessons: id -> lesson. evcache: name -> (version . evaluator)
+;; for the version that was live when last used (see live-evaluator).
 (struct kernel (dir journal provider soak reflect? defs lessons
                     [verdicts #:mutable] [tasks #:mutable] evcache))
 
@@ -57,27 +61,19 @@
                         'rollback_of (f 'rollback_of 'null) 'status "proposed"))]
     [("def_rejected") (when d (set-status! d v "rejected" (f 'error)))]
     [("def_trial")
-     (when d
-       (set-status! d v "trial" #f)
-       (set-def-live! d v)
-       (set-def-soak-count! d 0)
-       (drop-evaluators! k d))]
+     (when d (gate-decision! d v "trial" #f #:live v))]
     [("def_use")
-     (when (and d (eq? (f 'ok) #t) (eqv? (def-live d) v) (equal? (live-status d) "trial"))
+     (when (and d (eq? (f 'ok) #t) (in-soak? d v))
        (set-def-soak-count! d (add1 (def-soak-count d))))]
     [("def_kept")
      (when d
-       (set-status! d v "kept" #f)
        (set-def-kept! d v)
-       (set-def-live! d v)
-       (set-def-soak-count! d 0)
+       (gate-decision! d v "kept" #f #:live v)
        (add-verdict! k (f 'verdict)))]
     [("def_reverted")
      (when d
-       (set-status! d v "reverted" (f 'error))
-       (let ([r (f 'restored)]) (set-def-live! d (and (exact-integer? r) r)))
-       (set-def-soak-count! d 0)
-       (drop-evaluators! k d)
+       (let ([r (f 'restored)])
+         (gate-decision! d v "reverted" (f 'error) #:live (and (exact-integer? r) r)))
        (add-verdict! k (f 'verdict)))]
     [("lesson_added")
      (hash-set! (kernel-lessons k) (f 'id) (lesson (f 'id) (f 'text) 0 #f))]
@@ -86,6 +82,7 @@
     [("lesson_retired")
      (let ([l (hash-ref (kernel-lessons k) (f 'id) #f)]) (when l (set-lesson-retired?! l #t)))]
     [("task_finished")
+     ;; O(n) append per task; fine at the journal sizes cmh sees.
      (set-kernel-tasks! k (append (kernel-tasks k)
                                   (list (hasheq 'task_id (f 'task_id) 'task (f 'task "")
                                                 'success (f 'success) 'summary (f 'summary "")))))]
@@ -98,23 +95,36 @@
                (let ([r (hash-set rec 'status status)])
                  (if (string? err) (hash-set r 'error err) r)))))
 
+;; Record a trial / kept / reverted decision for version v and make `live` the
+;; live version. Every such decision restarts the soak count.
+(define (gate-decision! d v status err #:live live)
+  (set-status! d v status err)
+  (set-def-live! d live)
+  (set-def-soak-count! d 0))
+
+;; True while version v is live and still on trial (its uses count toward soak).
+(define (in-soak? d v)
+  (and (eqv? (def-live d) v) (equal? (live-status d) "trial")))
+
 (define (add-verdict! k v)
   (when (string? v) (set-kernel-verdicts! k (append (kernel-verdicts k) (list v)))))
-
-;; Kill cached evaluators of versions that are no longer live.
-(define (drop-evaluators! k d)
-  (define cache (kernel-evcache k))
-  (for ([key (in-list (hash-keys cache))]
-        #:when (and (equal? (car key) (def-name d)) (not (eqv? (cdr key) (def-live d)))))
-    (destroy-evaluator (hash-ref cache key))
-    (hash-remove! cache key)))
 
 (define (get-def k name) (hash-ref (kernel-defs k) name #f))
 (define (def-record d v) (and d v (hash-ref (def-versions d) v #f)))
 (define (live-record d) (and d (def-record d (def-live d))))
 (define (live-status d) (let ([r (live-record d)]) (and r (hash-ref r 'status))))
 (define (max-version d) (if d (apply max 0 (hash-keys (def-versions d))) 0))
+(define (sorted-versions d) (sort (hash-keys (def-versions d)) <))
 (define (sorted-defs k) (sort (hash-values (kernel-defs k)) string<? #:key def-name))
+;; Live version records of one kind ("tool", "note" or "hook"), sorted by name.
+(define (live-defs k kind)
+  (for*/list ([d (in-list (sorted-defs k))]
+              #:when (equal? (def-kind d) kind)
+              [rec (in-value (live-record d))]
+              #:when rec)
+    rec))
+(define (lessons-by-id k) (sort (hash-values (kernel-lessons k)) < #:key lesson-id))
+(define (max-lesson-id k) (apply max 0 (hash-keys (kernel-lessons k))))
 
 ;; ---------------------------------------------------------------- seeds
 
@@ -139,7 +149,7 @@
   (with-handlers ([always? error-text])
     (cond
       [(equal? kind "note")
-       (unless (regexp-match? #px"\\S" source) (error "a note's source must be non-empty text"))
+       (when (blank? source) (error "a note's source must be non-empty text"))
        #f]
       [else
        (when (null? tests) (error "tools and hooks need at least one test"))
@@ -254,18 +264,28 @@
 (define (record-use! k name version ok? err input)
   (emit! k (hasheq 'type "def_use" 'name name 'version version 'ok ok? 'error (if ok? 'null err)))
   (define d (get-def k name))
-  (when (and d (eqv? (def-live d) version) (equal? (live-status d) "trial"))
+  (when (and d (in-soak? d version))
     (cond [(not ok?) (revert! k d err input)]
           [(>= (def-soak-count d) (kernel-soak k)) (keep! k d)])))
 
+;; One cached evaluator per name, for the version used last. When another
+;; version is live now, the stale evaluator is killed and a fresh one loaded.
 (define (live-evaluator k d rec)
-  (define key (cons (def-name d) (hash-ref rec 'version)))
-  (or (hash-ref (kernel-evcache k) key #f)
-      (let ([ev (new-evaluator)])
-        (with-handlers ([always? (λ (e) (destroy-evaluator ev) (raise e))])
-          (load-source! ev (hash-ref rec 'source)))
-        (hash-set! (kernel-evcache k) key ev)
-        ev)))
+  (define cache (kernel-evcache k))
+  (define name (def-name d))
+  (define version (hash-ref rec 'version))
+  (define cached (hash-ref cache name #f))
+  (cond
+    [(and cached (eqv? (car cached) version)) (cdr cached)]
+    [else
+     (when cached
+       (destroy-evaluator (cdr cached))
+       (hash-remove! cache name))
+     (define ev (new-evaluator))
+     (with-handlers ([always? (λ (e) (destroy-evaluator ev) (raise e))])
+       (load-source! ev (hash-ref rec 'source)))
+     (hash-set! cache name (cons version ev))
+     ev]))
 
 ;; Late binding: look the name up in the registry on every call.
 ;; Returns (values ok? result-or-error-text).
@@ -284,25 +304,24 @@
      (values ok? out)]))
 
 (define (userspace-tool? k name)
-  (define d (get-def k name))
-  (and d (equal? (def-kind d) "tool") (live-record d) #t))
+  (for/or ([rec (in-list (live-defs k "tool"))])
+    (equal? (hash-ref rec 'name) name)))
 
+;; Tool specs for the live userspace tools, in the shape the model sees.
 (define (userspace-tools k)
-  (for/list ([d (in-list (sorted-defs k))]
-             #:when (equal? (def-kind d) "tool")
-             #:when (live-record d))
-    (define rec (live-record d))
-    (hasheq 'name (def-name d)
+  (for/list ([rec (in-list (live-defs k "tool"))])
+    (define name (hash-ref rec 'name))
+    (hasheq 'name name
             'description (let ([s (hash-ref rec 'description "")])
-                           (if (string=? s "") (format "userspace tool ~a" (def-name d)) s))
+                           (if (string=? s "") (format "userspace tool ~a" name) s))
             'input_schema (let ([s (hash-ref rec 'input_schema 'null)])
                             (if (hash? s) s (hasheq 'type "object"))))))
 
+;; (name . version) of each note still on trial.
 (define (live-trial-notes k)
-  (for/list ([d (in-list (sorted-defs k))]
-             #:when (equal? (def-kind d) "note")
-             #:when (equal? (live-status d) "trial"))
-    (cons (def-name d) (def-live d))))
+  (for/list ([rec (in-list (live-defs k "note"))]
+             #:when (equal? (hash-ref rec 'status) "trial"))
+    (cons (hash-ref rec 'name) (hash-ref rec 'version))))
 
 ;; ---------------------------------------------------------------- hooks
 
@@ -318,8 +337,6 @@
                    (loop (add1 tries))])]
       [else (fallback)])))
 
-(define (take-up-to xs n) (take xs (min n (length xs))))
-
 (define (lesson->jsexpr l) (hasheq 'id (lesson-id l) 'text (lesson-text l) 'score (lesson-score l)))
 
 (define (select-lesson-ids k task)
@@ -330,9 +347,12 @@
   (define active-ids (map lesson-id active))
   (remove-duplicates (filter (λ (i) (memv i active-ids)) ids)))
 
+(define (bullet s) (string-append "- " s))
 (define (bullets items)
-  (apply string-append (map (λ (s) (string-append "- " s "\n")) items)))
+  (apply string-append (map (λ (s) (string-append (bullet s) "\n")) items)))
 
+;; Fallback when no compose_system hook is live. It deliberately mirrors
+;; seed/compose_system.rktl: seeds run sandboxed, so they cannot share code.
 (define (default-compose notes lessons)
   (string-append
    (if (null? notes) "" (string-append "## Notes\n" (string-join notes "\n\n") "\n"))
@@ -340,10 +360,7 @@
    (if (null? lessons) "" (string-append "## Lessons\n" (bullets lessons)))))
 
 (define (live-notes k)
-  (for/list ([d (in-list (sorted-defs k))]
-             #:when (equal? (def-kind d) "note")
-             #:when (live-record d))
-    (hash-ref (live-record d) 'source)))
+  (for/list ([rec (in-list (live-defs k "note"))]) (hash-ref rec 'source)))
 
 ;; Supplemental system prompt: compose_system output, then the verdicts,
 ;; which always reach the model (they bypass select_lessons and the hook).
@@ -352,8 +369,7 @@
   (define lessons (for/list ([i (in-list lesson-ids)]) (lesson-text (hash-ref (kernel-lessons k) i))))
   (define body (hook-call k "compose_system" (hasheq 'notes notes 'lessons lessons)
                           (λ () (default-compose notes lessons))))
-  (define vs (kernel-verdicts k))
-  (define recent (if (> (length vs) max-verdicts-in-prompt) (take-right vs max-verdicts-in-prompt) vs))
+  (define recent (take-right-up-to (kernel-verdicts k) max-verdicts-in-prompt))
   (string-trim
    (string-append body
                   (if (null? recent)
@@ -377,7 +393,7 @@
     [(for/or ([l (in-hash-values (kernel-lessons k))]) (string=? (norm-text (lesson-text l)) (norm-text t)))
      (values #f "already known (duplicate of an existing lesson)")]
     [else
-     (define id (add1 (apply max 0 (hash-keys (kernel-lessons k)))))
+     (define id (add1 (max-lesson-id k)))
      (emit! k (hasheq 'type "lesson_added" 'id id 'text t 'source source))
      (values id (format "lesson #~a added" id))]))
 
@@ -393,8 +409,8 @@
         (trace! "[lesson] #~a retired at score ~a" id new)))))
 
 (define (recall-text k query)
-  (define qw (content-words (if (string? query) query "") 3))
-  (define (hit? s) (for/or ([w (in-list (content-words s 3))]) (and (member w qw) #t)))
+  (define qw (content-words (if (string? query) query "")))
+  (define (hit? s) (for/or ([w (in-list (content-words s))]) (and (member w qw) #t)))
   (define ls (filter (λ (l) (hit? (lesson-text l))) (active-lessons k)))
   (define vs (filter hit? (reverse (kernel-verdicts k))))
   (if (and (null? ls) (null? vs))
@@ -433,7 +449,7 @@
       (format "~a v~a (~a, ~a)~a\n" name v (hash-ref rec 'kind) (hash-ref rec 'status)
               (if (eqv? v (def-live d)) " [live]" ""))
       (format "versions: ~a\n"
-              (string-join (for/list ([i (sort (hash-keys (def-versions d)) <)])
+              (string-join (for/list ([i (in-list (sorted-versions d))])
                              (format "v~a ~a" i (hash-ref (def-record d i) 'status)))
                            ", "))
       (format "description: ~a\n" (hash-ref rec 'description ""))
@@ -447,17 +463,17 @@
 (define (verdicts-text k)
   (if (null? (kernel-verdicts k))
       "(none)"
-      (string-join (for/list ([v (kernel-verdicts k)]) (string-append "- " v)) "\n")))
+      (string-join (map bullet (kernel-verdicts k)) "\n")))
 
 (define (knowledge-text k)
-  (define ls (sort (hash-values (kernel-lessons k)) < #:key lesson-id))
+  (define ls (lessons-by-id k))
   (string-append
    "Lessons:\n"
    (if (null? ls)
        "(none)"
        (string-join (for/list ([l ls])
-                      (format "- #~a [score ~a~a] ~a" (lesson-id l) (lesson-score l)
-                              (if (lesson-retired? l) ", retired" "") (lesson-text l)))
+                      (bullet (format "#~a [score ~a~a] ~a" (lesson-id l) (lesson-score l)
+                                      (if (lesson-retired? l) ", retired" "") (lesson-text l))))
                     "\n"))
    "\nVerdicts:\n" (verdicts-text k)))
 
@@ -466,7 +482,7 @@
   (if (null? ts)
       "(none)"
       (string-join
-       (for/list ([t (take-right ts (min n (length ts)))])
+       (for/list ([t (take-right-up-to ts n)])
          (format "- #~a ~a: ~a -> ~a" (hash-ref t 'task_id) (if (hash-ref t 'success) "succeeded" "failed")
                  (one-line (hash-ref t 'task) 120) (one-line (hash-ref t 'summary) 160)))
        "\n")))
@@ -476,9 +492,9 @@
   (list
    (for/list ([d (in-list (sorted-defs k))])
      (list (def-name d) (def-kind d) (def-live d) (def-kept d) (def-soak-count d)
-           (for/list ([v (sort (hash-keys (def-versions d)) <)])
+           (for/list ([v (in-list (sorted-versions d))])
              (cons v (hash-ref (def-record d v) 'status)))))
-   (for/list ([l (sort (hash-values (kernel-lessons k)) < #:key lesson-id)])
+   (for/list ([l (in-list (lessons-by-id k))])
      (list (lesson-id l) (lesson-text l) (lesson-score l) (lesson-retired? l)))
    (kernel-verdicts k)
    (kernel-tasks k)))

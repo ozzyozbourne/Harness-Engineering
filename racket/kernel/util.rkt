@@ -1,8 +1,8 @@
 #lang racket/base
-;; Small shared helpers: time, text, tracing.
+;; Small shared helpers: time, text, lists, tracing.
 (require racket/string racket/list racket/date json)
-(provide now-iso content-words truncate-text one-line trace! trace-port
-         json-brief error-text always?)
+(provide now-iso content-words blank? truncate-text one-line trace! trace-port
+         json-brief error-text always? take-up-to take-right-up-to)
 
 ;; ISO-8601 UTC timestamp.
 (define (now-iso)
@@ -11,10 +11,17 @@
     (string-append (date->string d #t) "Z")))
 
 ;; Lowercased alphanumeric words of at least `min-len` characters.
-(define (content-words s [min-len 4])
+(define (content-words s [min-len 3])
   (remove-duplicates
    (filter (λ (w) (>= (string-length w) min-len))
            (regexp-split #px"[^a-z0-9]+" (string-downcase s)))))
+
+;; True when s has no non-whitespace character.
+(define (blank? s) (not (regexp-match? #px"\\S" s)))
+
+;; The first / last n elements, or all of xs when it is shorter.
+(define (take-up-to xs n) (take xs (min n (length xs))))
+(define (take-right-up-to xs n) (take-right xs (min n (length xs))))
 
 (define (truncate-text s n)
   (if (> (string-length s) n)

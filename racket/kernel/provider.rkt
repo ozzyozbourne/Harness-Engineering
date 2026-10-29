@@ -1,29 +1,28 @@
 #lang racket/base
 ;; Model providers: anthropic (Messages API over HTTP(S)) and mock (scripted).
 (require racket/list racket/string racket/port net/http-client net/url json "util.rkt")
-(provide provider-call provider-name make-mock-provider load-mock-script mock-requests
-         make-anthropic-provider anthropic-request messages-url
-         claude-code-identity default-model)
+(provide provider-call tool-use? make-mock-provider load-mock-script mock-requests
+         make-anthropic-provider anthropic-request claude-code-identity default-model)
 
-;; fn: (system-strings tools messages) -> hasheq with 'content and 'stop_reason
-(struct provider (name fn requests))
+;; fn: (system-strings tools messages) -> hasheq with 'content and 'stop_reason.
+;; requests: a box of the requests seen, newest first. Only the mock records
+;; them, so tests can inspect exactly what the model was sent.
+(struct provider (fn requests))
 (define (provider-call p system tools messages) ((provider-fn p) system tools messages))
 
-;; ---------------------------------------------------------------- mock
-
 (define (tool-use? b) (and (hash? b) (equal? (hash-ref b 'type #f) "tool_use")))
+
+;; ---------------------------------------------------------------- mock
 
 ;; Replays assistant content arrays in order and records every request.
 (define (make-mock-provider script)
   (define requests (box '()))
   (define remaining script)
-  (define n 0)
-  (provider "mock"
-            (λ (system tools messages)
-              (set! n (add1 n))
+  (provider (λ (system tools messages)
               (set-box! requests (cons (hasheq 'system system 'tools tools 'messages messages)
                                        (unbox requests)))
-              (when (null? remaining) (error 'mock "script exhausted at request ~a" n))
+              (when (null? remaining)
+                (error 'mock "script exhausted at request ~a" (length (unbox requests))))
               (define content (car remaining))
               (set! remaining (cdr remaining))
               (hasheq 'content content
@@ -44,8 +43,8 @@
 (define default-model "claude-sonnet-5-5")
 
 (define (env name)
-  (define v (getenv name))
-  (and v (not (string=? (string-trim v) "")) (string-trim v)))
+  (define v (let ([raw (getenv name)]) (and raw (string-trim raw))))
+  (and v (not (blank? v)) v))
 
 (define (messages-url)
   (string-append (regexp-replace #px"/+$" (or (env "ANTHROPIC_BASE_URL") "https://api.anthropic.com") "")
@@ -103,25 +102,31 @@
     [else (raise r)]))
 
 (define retryable '(408 429 500 502 503 504 529))
+(define max-attempts 4)
 
+;; Network errors and retryable HTTP statuses are retried with exponential
+;; backoff (2, 4, 8 s); the last attempt's failure is raised.
 (define (make-anthropic-provider model)
   (provider
-   "anthropic"
    (λ (system tools messages)
      (define-values (url headers body) (anthropic-request model system tools messages))
      (define data (jsexpr->bytes body))
      (let loop ([attempt 1])
+       (define (retry!) (sleep (expt 2 attempt)) (loop (add1 attempt)))
+       (define retries-left? (< attempt max-attempts))
+       (define (retryable-network-error? e)
+         (and retries-left? (exn:fail? e) (not (exn:fail:user? e))))
+       ;; code is #f when the request failed with a retryable network error.
        (define-values (code resp)
-         (with-handlers ([(λ (e) (and (exn:fail? e) (not (exn:fail:user? e)) (< attempt 4)))
+         (with-handlers ([retryable-network-error?
                           (λ (e) (trace! "[provider] network error (attempt ~a): ~a" attempt (exn-message e))
-                            (values 'retry #f))])
+                            (values #f #f))])
            (http-post url headers data 600)))
        (cond
-         [(eq? code 'retry) (sleep (expt 2 attempt)) (loop (add1 attempt))]
+         [(not code) (retry!)]
          [(= code 200) (bytes->jsexpr resp)]
-         [(and (memv code retryable) (< attempt 4))
+         [(and (memv code retryable) retries-left?)
           (trace! "[provider] HTTP ~a, retrying" code)
-          (sleep (expt 2 attempt))
-          (loop (add1 attempt))]
+          (retry!)]
          [else (error 'anthropic "HTTP ~a: ~a" code (one-line (bytes->string/utf-8 resp #\?) 600))])))
    (box '())))
