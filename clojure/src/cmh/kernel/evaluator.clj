@@ -24,18 +24,31 @@
                                     (when-let [m (.getMessage t)] (str ": " m))))]
     (if (identical? root e) (msg e) (str (msg e) " (cause " (msg root) ")"))))
 
+(def hooks
+  "The hooks the kernel calls, by name: entry-point symbol, how a map input
+  (live call or test input) becomes the argument vector, and the return shape
+  (:string, or :ids for a sequence of lesson ids)."
+  {"compose_system" {:entry 'compose-system
+                     :args (fn [input] [(vec (:notes input)) (vec (:lessons input))])
+                     :returns :string}
+   "select_lessons" {:entry 'select-lessons
+                     :args (fn [input] [(str (:task input)) (vec (:lessons input))])
+                     :returns :ids}})
+
+(defn- hook [kind name] (when (= kind "hook") (get hooks name)))
+
 (defn entry-sym
   "The fixed entry-point name for a definition."
   [kind name]
   (case kind
     "tool" 'run
-    "hook" (case name "compose_system" 'compose-system "select_lessons" 'select-lessons nil)
+    "hook" (:entry (hook kind name))
     nil))
 
 (defn load-into!
-  "Create (or recreate) namespace ns-sym and evaluate source inside it."
+  "Create namespace ns-sym, which must not exist yet, and evaluate source
+  inside it. On failure the namespace is removed again."
   [ns-sym source ms]
-  (when (find-ns ns-sym) (remove-ns ns-sym))
   (let [n (create-ns ns-sym)]
     (try
       (with-timeout ms (fn []
@@ -50,7 +63,7 @@
     (when (and (var? v) (fn? @v)) v)))
 
 (defn- check-return [kind name r]
-  (if (and (= kind "hook") (= name "select_lessons"))
+  (if (= :ids (:returns (hook kind name)))
     (if (and (or (nil? r) (sequential? r))
              (every? #(or (string? %) (number? %)) r))
       (vec r)
@@ -64,9 +77,8 @@
 (defn args-for
   "Argument vector for a kind/name from a map input (tool input or hook test input)."
   [kind name input]
-  (case [kind name]
-    ["hook" "compose_system"] [(vec (:notes input)) (vec (:lessons input))]
-    ["hook" "select_lessons"] [(str (:task input)) (vec (:lessons input))]
+  (if-let [h (hook kind name)]
+    ((:args h) input)
     [input]))
 
 (defn invoke
@@ -92,7 +104,8 @@
 
 (defn validate-in-scratch
   "Evaluate source in a fresh scratch namespace, check the entry point and
-  run the tests. The scratch namespace is always removed. nil = ok."
+  run the tests. The scratch namespace is always removed, so a failing
+  proposal never touches the live version's namespace. nil = ok."
   [{:keys [kind name source tests]} ms]
   (let [ns-sym (symbol (str "cmh.scratch." name "." (random-uuid)))]
     (try

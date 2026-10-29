@@ -7,7 +7,7 @@
             [cmh.kernel.gate :as gate]
             [cmh.kernel.knowledge :as kn]
             [cmh.kernel.state :as st])
-  (:import [java.io File]
+  (:import [java.nio.file Path]
            [java.util.concurrent TimeUnit]))
 
 (defn- obj [props & required]
@@ -73,11 +73,12 @@
           {:content (truncate (str (deref out 1000 "") "\n[timed out after " t " s]") 20000)
            :is_error true}))))
 
-(defn- canonical ^String [p] (.getCanonicalPath (io/file p)))
+(defn- canonical ^Path [p] (.toPath (.getCanonicalFile (io/file p))))
 
-(defn- inside? [path dir]
-  (let [p (canonical path) d (canonical dir)]
-    (or (= p d) (str/starts-with? p (str d File/separator)))))
+(defn- inside?
+  "True when path is dir or below it (compared by path components)."
+  [path dir]
+  (.startsWith (canonical path) (canonical dir)))
 
 (defn- write-file [k {:keys [path content]}]
   (cond
@@ -92,7 +93,7 @@
 (defn defs-table [s]
   (let [rows (for [name (sort (keys (:defs s)))
                    :let [d (get-in s [:defs name])
-                         latest (get-in d [:versions (apply max (keys (:versions d)))])
+                         latest (get-in d [:versions (st/latest-version s name)])
                          live (st/live-record s name)
                          r (or live latest)]]
                (str name "  " (:kind d) "  "
@@ -102,10 +103,14 @@
                     "  " (:description r)))]
     (if (seq rows) (str/join "\n" rows) "(no definitions)")))
 
+(defn- version-arg
+  "Models may send the version as a string (\"2\") instead of an integer."
+  [v]
+  (some-> v str parse-long))
+
 (defn- show-def [k {:keys [name version]}]
   (let [s @(:state k)
-        v (or (some-> version str parse-long) (get-in s [:defs name :live])
-              (some->> (keys (get-in s [:defs name :versions])) seq (apply max)))]
+        v (or (version-arg version) (get-in s [:defs name :live]) (st/latest-version s name))]
     (if-let [rec (get-in s [:defs name :versions v])]
       {:content (json/write-str rec :indent true)}
       {:content (str "no such definition/version: " name " " version) :is_error true})))
@@ -128,7 +133,7 @@
       "show_def" (show-def k input)
       "propose_def" (let [r (gate/propose! k input)]
                       {:content (:msg r) :is_error (not (:ok r)) :verdict r})
-      "rollback_def" (let [r (gate/rollback! k (str (:name input)) (some-> (:version input) str parse-long))]
+      "rollback_def" (let [r (gate/rollback! k (str (:name input)) (version-arg (:version input)))]
                        {:content (:msg r) :is_error (not (:ok r)) :verdict r})
       "remember" (if-let [id (kn/add! k "lesson" (:text input) "model")]
                    {:content (str "remembered as " id)}

@@ -54,14 +54,18 @@
     (when (empty? events) (install-seeds! k))
     k))
 
-(defn- trace [k & xs] ((:trace k) (apply str xs)))
-
 (defn- clip [s n] (let [s (str s)] (if (> (count s) n) (str (subs s 0 n) "...") s)))
+
+(defn- bullets
+  "One \"- item\" line per x, item being (f x)."
+  [f xs]
+  (str/join "\n" (map #(str "- " (f %)) xs)))
 
 ;; ---- prompt assembly ------------------------------------------------------------
 
 (defn- call-hook
-  "Call a hook late-bound. A failing trial is reverted by the gate and the
+  "Call a hook late-bound: the live version is looked up by name on every
+  call, so a hook redefined mid-task applies to the next request. A failing trial is reverted by the gate and the
   restored version is tried once; otherwise fall back to the builtin and
   record a kernel error."
   [k errors name input desc fallback]
@@ -72,7 +76,7 @@
         (:missing r) (fallback)
         (and (= "trial" (:status r)) (zero? tries)) (recur 1)
         :else (do (swap! errors conj (str name " v" (:version r) ": " (:error r)))
-                  (trace k "[kernel] hook " name " failed: " (:error r) "; using builtin")
+                  (st/trace k "[kernel] hook " name " failed: " (:error r) "; using builtin")
                   (fallback))))))
 
 (defn select-lessons [k errors task]
@@ -82,7 +86,7 @@
       []
       (->> (call-hook k errors "select_lessons" {:task task :lessons lessons}
                       (str "(task " (pr-str (clip task 80)) ", " (count lessons) " lessons)")
-                      #(mapv :id (take 3 (sort-by (comp - :score) lessons))))
+                      #(mapv :id (take 3 (sort-by :score > lessons))))
            (map str) (filter valid) distinct vec))))
 
 (defn supplemental [k errors lesson-ids]
@@ -97,7 +101,7 @@
      (str composed
           (when (seq verdicts)
             (str "\n\n## Verdicts on past userspace changes\n"
-                 (str/join "\n" (map #(str "- " (:text %)) verdicts))))))))
+                 (bullets :text verdicts)))))))
 
 (defn system-blocks [k errors lesson-ids]
   (let [sup (supplemental k errors lesson-ids)]
@@ -105,7 +109,7 @@
       (not (str/blank? sup)) (conj {:type "text" :text sup}))))
 
 (defn tool-list [k]
-  (into (vec tools/specs)
+  (into tools/specs
         (for [r (st/live-defs @(:state k) "tool")]
           {:name (:name r) :description (or (:description r) "") :input_schema (:input_schema r)})))
 
@@ -125,11 +129,9 @@
              :is_error true}))))))
 
 (defn- trace-tool [k name input {:keys [content is_error verdict]}]
-  (trace k "[tool] " name
-         (cond
-           (#{"propose_def" "rollback_def"} name)
+  (st/trace k "[tool] " name
+         (if (#{"propose_def" "rollback_def"} name)
            (str " " (:name input) " -> " (first (str/split-lines (str (:msg verdict)))))
-           :else
            (str (when-let [v (first (vals input))] (str " " (pr-str (clip v 60))))
                 " -> " (when is_error "ERROR ")
                 (clip (str/replace (str content) #"\s+" " ") 100)))))
@@ -155,9 +157,84 @@
                      (filter #(<= (count %) 400)) (take 3)
                      (keep #(kn/add! k "lesson" % "reflection"))
                      doall)]
-      (trace k "[reflect] " (count added) " new lesson(s)"))
+      (st/trace k "[reflect] " (count added) " new lesson(s)"))
     (catch Throwable e
-      (trace k "[reflect] failed: " (ev/describe-error e)))))
+      (st/trace k "[reflect] failed: " (ev/describe-error e)))))
+
+(defn- run-tool-uses
+  "Execute the tool_use blocks of one assistant turn in order. Returns the
+  tool_result blocks for the next user message."
+  [k transcript uses]
+  (vec (for [{tool-use-id :id :keys [name input]} uses]
+         (let [input (or input {})
+               {:keys [content is_error] :as r} (exec-tool k name input)]
+           (trace-tool k name input r)
+           (swap! transcript conj
+                  (str "TOOL " name " " (clip (json/write-str input) 200)
+                       " -> " (when is_error "ERROR ")
+                       (clip content 200)))
+           (cond-> {:type "tool_result" :tool_use_id tool-use-id
+                    :content (if (str/blank? content) "(empty)" content)}
+             is_error (assoc :is_error true))))))
+
+(defn- run-turns
+  "The model/tool loop. Returns {:stop_reason s :answer string
+  :tool-errors [bool ...]}, one tool-errors entry per tool call."
+  [k task {:keys [errors lesson-ids transcript on-text]}]
+  (loop [messages [{:role "user" :content task}] tool-errors [] turn 0 answer ""]
+    (if (>= turn (:max-turns k))
+      (do (swap! errors conj "max turns exceeded")
+          {:stop_reason "max_turns" :answer answer :tool-errors tool-errors})
+      (let [resp (try (provider/complete (:provider k)
+                                         {:system (system-blocks k errors lesson-ids)
+                                          :messages messages
+                                          :tools (tool-list k)})
+                      (catch Throwable e
+                        (swap! errors conj (str "model request failed: " (ev/describe-error e)))
+                        (st/trace k "[kernel] model request failed: " (ev/describe-error e))
+                        nil))]
+        (if-not resp
+          {:stop_reason "error" :answer answer :tool-errors tool-errors}
+          (let [content (vec (:content resp))
+                text (text-of content)
+                answer (if (str/blank? text) answer text)
+                messages (conj messages {:role "assistant" :content content})
+                uses (filter #(= "tool_use" (:type %)) content)]
+            (when-not (str/blank? text)
+              (on-text text)
+              (swap! transcript conj (str "ASSISTANT: " (clip text 400))))
+            (if (and (= "tool_use" (:stop_reason resp)) (seq uses))
+              (let [blocks (run-tool-uses k transcript uses)]
+                (recur (conj messages {:role "user" :content blocks})
+                       (into tool-errors (map #(boolean (:is_error %)) blocks))
+                       (inc turn) answer))
+              {:stop_reason (:stop_reason resp) :answer answer :tool-errors tool-errors})))))))
+
+(defn- soak-notes!
+  "Notes are never called, so a finished task counts as one use of each note
+  that was on trial when it started: success is a clean use, failure reverts."
+  [k trial-notes success error]
+  (doseq [n trial-notes]
+    ;; skip notes superseded or reverted during the task
+    (when (= (:version n) (:version (st/live-record @(:state k) (:name n))))
+      (gate/record-use! k n success (when-not success (str "task failed: " error)) nil))))
+
+(defn- finish-task!
+  "Journal the outcome, score the selected lessons, soak trial notes and
+  reflect. Returns result with :success :error :errors added."
+  [k {:keys [id errors lesson-ids trial-notes transcript]} {:keys [stop_reason tool-errors] :as result}]
+  (let [error (cond (seq @errors) (str/join "; " @errors)
+                    (not= "end_turn" stop_reason) (str "stop_reason " stop_reason)
+                    (some true? (take-last 2 tool-errors)) "tool error in final tool results")
+        success (nil? error)]
+    (st/emit! k {:type "task_finished" :id id :success success :error error})
+    (st/trace k "[task] " (if success "success" (str "failed: " error)))
+    (kn/score! k lesson-ids success)
+    (soak-notes! k trial-notes success error)
+    (when (:reflect k)
+      (swap! transcript conj (str "OUTCOME: " (if success "success" (str "failed: " error))))
+      (reflect! k (str/join "\n" @transcript)))
+    (assoc result :success success :error error :errors @errors)))
 
 (defn run-task!
   "Run one task. on-text is called with each assistant text. Returns
@@ -169,66 +246,9 @@
          lesson-ids (select-lessons k errors task)
          trial-notes (filter #(= "trial" (:status %)) (st/live-defs @(:state k) "note"))
          _ (st/emit! k {:type "task_started" :id id :task task :lessons lesson-ids})
-         transcript (atom [(str "TASK: " (clip task 500))])
-         result
-         (loop [messages [{:role "user" :content task}] tool-errors [] turn 0 answer ""]
-           (if (>= turn (:max-turns k))
-             (do (swap! errors conj "max turns exceeded")
-                 {:stop_reason "max_turns" :answer answer :tool-errors tool-errors})
-             (let [resp (try (provider/complete (:provider k)
-                                                {:system (system-blocks k errors lesson-ids)
-                                                 :messages messages
-                                                 :tools (tool-list k)})
-                             (catch Throwable e
-                               (swap! errors conj (str "model request failed: " (ev/describe-error e)))
-                               (trace k "[kernel] model request failed: " (ev/describe-error e))
-                               nil))]
-               (if-not resp
-                 {:stop_reason "error" :answer answer :tool-errors tool-errors}
-                 (let [content (vec (:content resp))
-                       text (text-of content)
-                       answer (if (str/blank? text) answer text)
-                       messages (conj messages {:role "assistant" :content content})
-                       uses (filter #(= "tool_use" (:type %)) content)]
-                   (when-not (str/blank? text)
-                     (on-text text)
-                     (swap! transcript conj (str "ASSISTANT: " (clip text 400))))
-                   (if (and (= "tool_use" (:stop_reason resp)) (seq uses))
-                     (let [results (vec (for [{:keys [id name input]} uses]
-                                          (let [input (or input {})
-                                                r (exec-tool k name input)]
-                                            (trace-tool k name input r)
-                                            (swap! transcript conj
-                                                   (str "TOOL " name " " (clip (json/write-str input) 200)
-                                                        " -> " (when (:is_error r) "ERROR ")
-                                                        (clip (:content r) 200)))
-                                            (assoc r :id id))))
-                           blocks (mapv (fn [{:keys [id content is_error]}]
-                                          (cond-> {:type "tool_result" :tool_use_id id
-                                                   :content (if (str/blank? content) "(empty)" content)}
-                                            is_error (assoc :is_error true)))
-                                        results)]
-                       (recur (conj messages {:role "user" :content blocks})
-                              (into tool-errors (map #(boolean (:is_error %)) results))
-                              (inc turn) answer))
-                     {:stop_reason (:stop_reason resp) :answer answer :tool-errors tool-errors}))))))
-         success (and (= "end_turn" (:stop_reason result))
-                      (empty? @errors)
-                      (not-any? true? (take-last 2 (:tool-errors result))))
-         error (cond (seq @errors) (str/join "; " @errors)
-                     (not= "end_turn" (:stop_reason result)) (str "stop_reason " (:stop_reason result))
-                     (not success) "tool error in final tool results")]
-     (st/emit! k {:type "task_finished" :id id :success success :error error})
-     (trace k "[task] " (if success "success" (str "failed: " error)))
-     (kn/score! k lesson-ids success)
-     ;; notes soak over tasks
-     (doseq [n trial-notes]
-       (when (= (:version n) (get-in @(:state k) [:defs (:name n) :live]))
-         (gate/record-use! k n success (when-not success (str "task failed: " error)) nil)))
-     (when (:reflect k)
-       (swap! transcript conj (str "OUTCOME: " (if success "success" (str "failed: " error))))
-       (reflect! k (str/join "\n" @transcript)))
-     (assoc result :success success :error error :errors @errors))))
+         ctx {:id id :errors errors :lesson-ids lesson-ids :trial-notes trial-notes
+              :transcript (atom [(str "TASK: " (clip task 500))]) :on-text on-text}]
+     (finish-task! k ctx (run-turns k task ctx)))))
 
 (defn refine-prompt [k]
   (let [s @(:state k)
@@ -240,16 +260,16 @@
          "needs improving, make no changes and say so.\n\n"
          "## Recent tasks\n"
          (if (seq tasks)
-           (str/join "\n" (map #(str "- " (case (:success %) true "success" false "FAILED" "unfinished")
-                                     ": " (clip (:task %) 200)
-                                     (when (:error %) (str " (" (clip (:error %) 200) ")")))
-                               tasks))
+           (bullets #(str (case (:success %) true "success" false "FAILED" "unfinished")
+                          ": " (clip (:task %) 200)
+                          (when (:error %) (str " (" (clip (:error %) 200) ")")))
+                    tasks)
            "(none)")
          "\n\n## Verdicts\n"
-         (if (seq verdicts) (str/join "\n" (map #(str "- " (:text %)) verdicts)) "(none)")
+         (if (seq verdicts) (bullets :text verdicts) "(none)")
          "\n\n## Userspace\n" (tools/defs-table s)
          "\n\n## Lessons\n"
          (let [ls (st/active-lessons s)]
-           (if (seq ls) (str/join "\n" (map #(str "- " (:id %) " [" (:score %) "] " (:text %)) ls)) "(none)")))))
+           (if (seq ls) (bullets #(str (:id %) " [" (:score %) "] " (:text %)) ls) "(none)")))))
 
 (defn refine! [k opts] (run-task! k (refine-prompt k) opts))

@@ -9,10 +9,10 @@
             [cmh.kernel.state :as st]))
 
 (def kernel-tool-names
+  "Copy of tools/names: gate cannot require tools (tools requires gate), so
+  the set is repeated here. A test checks the two stay equal."
   #{"bash" "read_file" "write_file" "list_defs" "show_def" "propose_def"
     "rollback_def" "remember" "recall"})
-
-(defn- trace [k & xs] ((:trace k) (apply str xs)))
 
 (defn- parse-json-ish
   "Models sometimes send JSON-encoded strings for structured fields."
@@ -29,7 +29,7 @@
       (not (#{"tool" "note" "hook"} kind)) "kind must be tool, note or hook"
       (and existing (not= existing kind)) (str name " already exists with kind " existing)
       (and (= kind "tool") (kernel-tool-names name)) (str name " is a kernel tool and cannot be redefined")
-      (and (= kind "hook") (not (#{"compose_system" "select_lessons"} name)))
+      (and (= kind "hook") (not (contains? ev/hooks name)))
       "hook name must be compose_system or select_lessons"
       (str/blank? source) "source is empty"
       (and (not= kind "note")
@@ -46,13 +46,13 @@
     (st/emit! k {:type "def_reverted" :name name :version version :error error
                  :restored (get-in @(:state k) [:defs name :kept])})
     (verdict! k rec (str "reverted: " error (when input-desc (str " on input " input-desc))))
-    (trace k "[gate] " name " v" version " reverted: " error)))
+    (st/trace k "[gate] " name " v" version " reverted: " error)))
 
 (defn- keep! [k rec uses]
   (let [{:keys [name version]} rec]
     (st/emit! k {:type "def_kept" :name name :version version})
     (verdict! k rec (str "kept after " uses " clean uses"))
-    (trace k "[gate] " name " v" version " kept")))
+    (st/trace k "[gate] " name " v" version " kept")))
 
 (defn propose!
   "Run the gate. Returns {:ok bool :msg string :version n}."
@@ -60,15 +60,18 @@
   (let [s @(:state k)
         {:keys [name kind]} proposal
         version (st/next-version s name)
+        tests (parse-json-ish (:tests proposal))
         rec (cond-> {:name name :kind kind :version version
                      :source (str (:source proposal))
                      :description (str (:description proposal))
-                     :tests (if (= kind "note") (or (parse-json-ish (:tests proposal)) [])
-                                (parse-json-ish (:tests proposal)))}
+                     :tests (if (= kind "note") (or tests []) tests)}
               (= kind "tool") (assoc :input_schema (or (parse-json-ish (:input_schema proposal))
                                                        {:type "object"})))
-        err (static-check s rec)]
-    (if (and err (not (and (string? name) (seq name))))
+        err (static-check s rec)
+        ;; A proposal is journaled whenever it has a name, even when the static
+        ;; check fails; only nameless proposals are rejected without journaling.
+        unjournalable? (not (and (string? name) (seq name)))]
+    (if (and err unjournalable?)
       {:ok false :msg (str "rejected: " err)}
       (let [rec (-> (st/emit! k (assoc rec :type "def_proposed"))
                     (dissoc :type :ts))
@@ -77,7 +80,7 @@
                       (ev/validate-in-scratch rec (:validate-ms k))))]
         (if err
           (do (st/emit! k {:type "def_rejected" :name name :version version :error err})
-              (trace k "[gate] " name " v" version " rejected: " err)
+              (st/trace k "[gate] " name " v" version " rejected: " err)
               {:ok false :version version :msg (str "rejected v" version ": " err
                                                     " (live version unchanged)")})
           (do (when-let [cur (st/live-record @(:state k) name)]
@@ -92,7 +95,7 @@
   "Reinstall an older version's source as a new trial version."
   [k name version]
   (if-let [old (get-in @(:state k) [:defs name :versions version])]
-    (propose! k (select-keys old [:name :kind :source :description :tests :input_schema]))
+    (propose! k (select-keys old st/def-fields))
     {:ok false :msg (str "no version " version " of " name)}))
 
 (defn record-use!

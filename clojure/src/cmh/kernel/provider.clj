@@ -21,8 +21,7 @@
   [script]
   (let [remaining (atom (vec script))
         requests (atom [])]
-    {:kind :mock
-     :requests requests
+    {:requests requests
      :complete (fn [req]
                  (swap! requests conj req)
                  (let [[content & more] @remaining]
@@ -50,8 +49,7 @@
                    .build)]
     (when-not (or api-key token)
       (throw (ex-info "set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN" {})))
-    {:kind :anthropic
-     :complete
+    {:complete
      (fn [{:keys [system] :as req}]
        (let [system (if api-key system (into [{:type "text" :text oauth-system-block}] system))
              body (json/write-str (-> req (assoc :model model :max_tokens 32000 :system system)))

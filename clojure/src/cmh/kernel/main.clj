@@ -1,7 +1,6 @@
 (ns cmh.kernel.main
   "CLI entry point: clojure -M:run [opts] <command>."
-  (:require [clojure.data.json :as json]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [cmh.kernel.agent :as agent]
             [cmh.kernel.gate :as gate]
             [cmh.kernel.provider :as provider]
@@ -72,10 +71,10 @@
   "Run the CLI. Returns {:exit code :kernel k}."
   [args]
   (let [{:keys [command] :as opts} (parse-args args)
-        needs-model (#{"repl" "run" "refine"} command)]
-    (if-not (#{"repl" "run" "refine" "defs" "knowledge"} command)
+        needs-model #{"repl" "run" "refine"}]
+    (if-not ((into needs-model ["defs" "knowledge"]) command)
       (do (binding [*out* *err*] (println usage)) {:exit 2})
-      (let [prov (when needs-model
+      (let [prov (when (needs-model command)
                    (case (:provider opts)
                      "mock" (provider/mock-from-file
                              (or (:script opts) (throw (ex-info "--provider mock needs --script FILE" {}))))

@@ -6,13 +6,11 @@
 
 (def retire-at -3)
 
-(defn trace [k & xs] ((:trace k) (apply str xs)))
-
 (defn words [s]
   (set (filter #(>= (count %) 3)
                (map str/lower-case (re-seq #"[A-Za-z0-9]+" (str s))))))
 
-(defn- norm [s] (str/lower-case (str/join " " (str/split (str/trim (str s)) #"\s+"))))
+(defn- norm [s] (-> (str s) str/trim (str/replace #"\s+" " ") str/lower-case))
 
 (defn add!
   "Add a lesson (kind \"lesson\") or verdict (kind \"verdict\"). Lessons
@@ -20,15 +18,16 @@
   or nil."
   [k kind text source]
   (let [s @(:state k)
-        text (str/trim (str text))]
+        text (str/trim (str text))
+        normed (norm text)]
     (when-not (or (str/blank? text)
                   (and (= kind "lesson")
-                       (some #(= (norm text) (norm (:text %))) (st/lessons s))))
+                       (some #(= normed (norm (:text %))) (st/lessons s))))
       (let [prefix (if (= kind "verdict") "V" "L")
             n (inc (count (filter #(= kind (:kind %)) (st/entries s))))
             id (str prefix n)]
         (st/emit! k {:type "lesson_added" :id id :kind kind :text text :source source})
-        (when (= kind "lesson") (trace k "[lesson] +" id " " text))
+        (when (= kind "lesson") (st/trace k "[lesson] +" id " " text))
         id))))
 
 (defn recall
@@ -37,7 +36,7 @@
   (let [qw (words query)]
     (->> (concat (st/active-lessons s) (st/verdicts s))
          (filter #(seq (set/intersection qw (words (:text %)))))
-         (sort-by #(- (:score %))))))
+         (sort-by :score >))))
 
 (defn score!
   "+1 to each selected lesson on success, -1 on failure; retire at <= -3."
@@ -49,4 +48,4 @@
           (st/emit! k {:type "lesson_scored" :id id :delta (if success? 1 -1) :score score})
           (when (<= score retire-at)
             (st/emit! k {:type "lesson_retired" :id id})
-            (trace k "[lesson] " id " retired at score " score)))))))
+            (st/trace k "[lesson] " id " retired at score " score)))))))

@@ -9,7 +9,8 @@
             [cmh.kernel.knowledge :as kn]
             [cmh.kernel.main :as main]
             [cmh.kernel.provider :as provider]
-            [cmh.kernel.state :as st])
+            [cmh.kernel.state :as st]
+            [cmh.kernel.tools :as tools])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -71,6 +72,7 @@
 
 (deftest gate-rejection
   (let [k (open-k)]
+    (is (= tools/names gate/kernel-tool-names) "gate's copy of the kernel tool names is current")
     (testing "source that fails to eval"
       (let [r (gate/propose! k (assoc wc-v2 :source "(defn run [input] (str (:text input)"))]
         (is (not (:ok r)))

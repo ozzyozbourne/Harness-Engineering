@@ -9,6 +9,12 @@
 
 (def empty-state {:defs {} :knowledge {} :order [] :tasks []})
 
+(def def-fields
+  "The fields of a proposal that a definition version record keeps."
+  [:name :kind :version :source :description :tests :input_schema])
+
+(defn trace [k & xs] ((:trace k) (apply str xs)))
+
 (defn- set-status [st name version status]
   (assoc-in st [:defs name :versions version :status] status))
 
@@ -20,8 +26,7 @@
     (-> st
         (assoc-in [:defs name :kind] (:kind ev))
         (assoc-in [:defs name :versions version]
-                  (-> (select-keys ev [:name :kind :version :source :description
-                                       :tests :input_schema :ts])
+                  (-> (select-keys ev (conj def-fields :ts))
                       (assoc :status "proposed"))))
 
     "def_rejected"
@@ -104,16 +109,19 @@
   (let [d (get-in st [:defs name])]
     (when-let [v (:live d)] (get-in d [:versions v]))))
 
-(defn next-version [st name]
-  (inc (reduce max 0 (keys (get-in st [:defs name :versions])))))
+(defn latest-version
+  "Highest version number proposed for name, or nil when there is none."
+  [st name]
+  (some->> (keys (get-in st [:defs name :versions])) seq (apply max)))
+
+(defn next-version [st name] (inc (or (latest-version st name) 0)))
 
 (defn live-defs
-  "Live records, sorted by name, optionally of one kind."
-  ([st] (live-defs st nil))
-  ([st kind]
-   (->> (keys (:defs st)) sort
-        (keep #(live-record st %))
-        (filter #(or (nil? kind) (= kind (:kind %)))))))
+  "Live records of one kind, sorted by name."
+  [st kind]
+  (->> (keys (:defs st)) sort
+       (keep #(live-record st %))
+       (filter #(= kind (:kind %)))))
 
 (defn entries [st] (map (:knowledge st) (:order st)))
 (defn lessons [st] (filter #(= "lesson" (:kind %)) (entries st)))
