@@ -40,6 +40,37 @@ if [[ "$(sbcl --version 2>/dev/null)" != "SBCL $sbcl_version" ]]; then
   rm -rf "$tmp"
 fi
 
+# --- Java (latest Temurin feature release; Clojure runs on it) ------------------
+jdk_major="27"
+jdk_home="/usr/local/lib/jdk-$jdk_major"
+if [[ ! -x "$jdk_home/bin/java" ]]; then
+  step "Installing Temurin JDK $jdk_major"
+  tmp="$(mktemp -d)"
+  curl -sSL "https://api.adoptium.net/v3/binary/latest/$jdk_major/ga/linux/x64/jdk/hotspot/normal/eclipse" -o "$tmp/jdk.tar.gz"
+  mkdir -p "$jdk_home"
+  tar -xzf "$tmp/jdk.tar.gz" -C "$jdk_home" --strip-components=1
+  rm -rf "$tmp"
+fi
+for b in java javac jar; do ln -sf "$jdk_home/bin/$b" "/usr/local/bin/$b"; done
+
+# --- Racket (latest release) -----------------------------------------------------
+racket_version="9.3"
+if [[ "$(racket --version 2>/dev/null)" != *"v$racket_version "* ]]; then
+  step "Installing Racket $racket_version"
+  tmp="$(mktemp -d)"
+  curl -sSL "https://download.racket-lang.org/installers/$racket_version/racket-$racket_version-x86_64-linux-cs.sh" -o "$tmp/racket.sh"
+  sh "$tmp/racket.sh" --unix-style --dest /usr/local --create-dir >/dev/null
+  rm -rf "$tmp"
+fi
+
+# --- Lean 4 (elan; the project pins its toolchain in lean-toolchain) -------------
+if ! command -v elan >/dev/null 2>&1 && [[ ! -x "$HOME/.elan/bin/elan" ]]; then
+  step "Installing elan + Lean 4"
+  curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain stable >/dev/null
+fi
+export PATH="$HOME/.elan/bin:$PATH"
+for b in elan lean lake; do ln -sf "$HOME/.elan/bin/$b" "/usr/local/bin/$b"; done
+
 # --- Clojure (latest CLI tools) -------------------------------------------------
 clojure_version="1.12.6.1673"
 if ! command -v clj >/dev/null 2>&1 || ! grep -q "$clojure_version" <(clojure --version 2>/dev/null); then
@@ -106,7 +137,10 @@ npm install -g typescript tsx >/dev/null 2>&1 || npm install -g typescript tsx
 echo "[setup] Done:"
 echo "  $(rustc --version 2>/dev/null || echo rustc MISSING)"
 echo "  $(sbcl --version 2>/dev/null || echo sbcl MISSING)"
+echo "  $(java -version 2>&1 | head -1 || echo java MISSING)"
 echo "  $(clojure --version 2>/dev/null || echo clojure MISSING)"
+echo "  $(racket --version 2>/dev/null || echo racket MISSING)"
+echo "  $(lean --version 2>/dev/null || echo lean MISSING)"
 echo "  $(elixir --version 2>/dev/null | tail -1 || echo elixir MISSING)"
 echo "  $(python3 --version 2>/dev/null || echo python3 MISSING)"
 echo "  $(tsc --version 2>/dev/null || echo tsc MISSING)"
