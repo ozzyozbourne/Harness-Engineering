@@ -15,34 +15,41 @@ upstream (--upstream opencode, the default, or openrouter), so every harness use
 same model and key and token usage is measured the same way.
 """
 import argparse, concurrent.futures as cf, datetime, http.client, http.server, json, os
-import pathlib, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import pathlib, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
 
 # ---------------------------------------------------------------- proxy
 
+# Our usage field -> the Anthropic Messages API usage field it is summed from.
+TOKEN_FIELDS = {"input": "input_tokens", "output": "output_tokens",
+                "cache_read": "cache_read_input_tokens", "cache_write": "cache_creation_input_tokens"}
+
+
+def empty_usage():
+    return {"requests": 0, "errors": 0, **{field: 0 for field in TOKEN_FIELDS}}
+
+
 class Usage:
+    """Request and token counts per tag, filled in by the proxy threads."""
+
     def __init__(self):
         self.lock = threading.Lock()
         self.by_tag = {}
 
     def add(self, tag, status, usage):
         with self.lock:
-            u = self.by_tag.setdefault(tag, {"requests": 0, "errors": 0, "input": 0, "output": 0,
-                                             "cache_read": 0, "cache_write": 0})
+            u = self.by_tag.setdefault(tag, empty_usage())
             u["requests"] += 1
             if status != 200:
                 u["errors"] += 1
-            for k, src in (("input", "input_tokens"), ("output", "output_tokens"),
-                           ("cache_read", "cache_read_input_tokens"),
-                           ("cache_write", "cache_creation_input_tokens")):
-                u[k] += int(usage.get(src) or 0)
+            for field, api_field in TOKEN_FIELDS.items():
+                u[field] += int(usage.get(api_field) or 0)
 
     def take(self, tag):
         with self.lock:
-            return self.by_tag.pop(tag, {"requests": 0, "errors": 0, "input": 0, "output": 0,
-                                         "cache_read": 0, "cache_write": 0})
+            return self.by_tag.pop(tag, empty_usage())
 
 
 def usage_of(body: bytes) -> dict:
@@ -78,49 +85,70 @@ def secret(env_name, file_name):
     return value
 
 
-# Upstreams speaking the Anthropic Messages API: (host, path prefix, key env, key file).
+# Upstreams speaking the Anthropic Messages API. extra_headers are added to every
+# forwarded request; {key} is the upstream key and {session} a stable id per tag.
 UPSTREAMS = {
-    "openrouter": ("openrouter.ai", "/api", "OPENROUTER_API_KEY", "openrouter-key"),
-    "opencode": ("opencode.ai", "/inference/go", "OPENCODE_API_KEY", "opencode-key"),
+    "openrouter": {"host": "openrouter.ai", "prefix": "/api",
+                   "key_env": "OPENROUTER_API_KEY", "key_file": "openrouter-key", "extra_headers": {}},
+    "opencode": {"host": "opencode.ai", "prefix": "/inference/go",
+                 "key_env": "OPENCODE_API_KEY", "key_file": "opencode-key",
+                 # OpenCode Go rejects requests without a session id; one stable id per episode.
+                 "extra_headers": {"authorization": "Bearer {key}", "x-opencode-session": "{session}"}},
 }
+
+# Credentials a harness must never see; it reaches the model only through the proxy.
+SECRET_ENV_VARS = frozenset({u["key_env"] for u in UPSTREAMS.values()} | {"CLAUDE_CODE_OAUTH_TOKEN"})
+
+# Hop-by-hop and length headers are recomputed per connection; the client's own
+# credentials and beta flags are replaced or dropped before forwarding.
+DROP_REQUEST_HEADERS = {"host", "content-length", "accept-encoding", "connection",
+                        "authorization", "x-api-key", "anthropic-beta"}
+DROP_RESPONSE_HEADERS = {"transfer-encoding", "content-length", "connection", "content-encoding"}
+
+
+def parse_tag(path):
+    """Split /t/<tag>/v1/messages... into (tag, /v1/messages...); the tag attributes usage to an episode."""
+    parts = path.split("/", 3)
+    if len(parts) == 4 and parts[1] == "t":
+        return parts[2], "/" + parts[3]
+    return "untagged", path
 
 
 def start_proxy(usage: Usage, log_path: pathlib.Path, upstream: str) -> int:
+    up = UPSTREAMS[upstream]
+    key = secret(up["key_env"], up["key_file"])
     log_lock = threading.Lock()
-    host, prefix, key_env, key_file = UPSTREAMS[upstream]
-    key = secret(key_env, key_file)
-    log_lock = threading.Lock()
+
+    def upstream_headers(incoming, tag):
+        # Every harness authenticates to the proxy with a placeholder API key; the proxy
+        # swaps in the real upstream key, so no harness ever sees it.
+        headers = {k: v for k, v in incoming.items() if k.lower() not in DROP_REQUEST_HEADERS}
+        headers["x-api-key"] = key
+        session = str(uuid.uuid5(uuid.NAMESPACE_URL, "cmh-eval/" + tag))
+        for name, template in up["extra_headers"].items():
+            headers[name] = template.format(key=key, session=session)
+        return headers
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_POST(self):
-            # Path is /t/<tag>/v1/messages...; the tag attributes usage to an episode.
-            parts = self.path.split("/", 3)
-            tag, rest = (parts[2], "/" + parts[3]) if len(parts) == 4 and parts[1] == "t" else ("untagged", self.path)
+            tag, rest = parse_tag(self.path)
             body = self.rfile.read(int(self.headers.get("content-length", 0)))
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
-            out, status, resp_headers = b"", 502, []
-            # Every harness authenticates to the proxy with a placeholder API key; the proxy
-            # swaps in the real upstream key, so no harness ever sees it.
-            headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key", "anthropic-beta")}
-            headers["x-api-key"] = key
-            if upstream == "opencode":
-                # OpenCode Go rejects requests without a session id; one stable id per episode.
-                headers["authorization"] = f"Bearer {key}"
-                headers["x-opencode-session"] = str(uuid.uuid5(uuid.NAMESPACE_URL, "cmh-eval/" + tag))
+            headers = upstream_headers(self.headers, tag)
+            out, status = bytearray(), 502
+            conn = http.client.HTTPSConnection(up["host"], timeout=900)
             try:
-                conn = http.client.HTTPSConnection(host, timeout=900)
-                conn.request("POST", prefix + rest, body=body, headers=headers)
+                conn.request("POST", up["prefix"] + rest, body=body, headers=headers)
                 resp = conn.getresponse()
-                status, resp_headers = resp.status, resp.getheaders()
+                status = resp.status
                 self.send_response(status)
-                for k, v in resp_headers:
-                    if k.lower() not in ("transfer-encoding", "content-length", "connection", "content-encoding"):
+                for k, v in resp.getheaders():
+                    if k.lower() not in DROP_RESPONSE_HEADERS:
                         self.send_header(k, v)
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
+                # Relay each chunk as it arrives so streaming harnesses see tokens live.
                 while True:
                     chunk = resp.read1(65536)
                     if not chunk:
@@ -130,7 +158,9 @@ def start_proxy(usage: Usage, log_path: pathlib.Path, upstream: str) -> int:
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
             except Exception as e:  # upstream or client failure; record it
-                out = str(e).encode()
+                out = bytearray(str(e).encode())
+            finally:
+                conn.close()
             usage.add(tag, status, usage_of(out))
             if status != 200:
                 with log_lock, open(log_path, "a") as f:
@@ -145,23 +175,22 @@ def start_proxy(usage: Usage, log_path: pathlib.Path, upstream: str) -> int:
 
 # ---------------------------------------------------------------- harnesses
 
-def load_harnesses():
-    return json.loads((ROOT / "harnesses.json").read_text())
-
-
 def expand(value, ctx):
+    """Fill {name} placeholders from ctx into a harness cmd/env string or list of strings.
+
+    Plain per-key replace rather than str.format, because prompts contain literal braces.
+    """
     if isinstance(value, list):
         return [expand(v, ctx) for v in value]
-    value = os.path.expanduser(value.replace("{repo}", str(REPO)))
+    value = os.path.expanduser(value)
     for k, v in ctx.items():
         value = value.replace("{" + k + "}", v)
-    if value.startswith("$"):
-        return os.environ.get(value[1:], "")
     return value
 
 # ---------------------------------------------------------------- episodes
 
 EPISODE_MEM_MB = 2500  # summed RSS of one episode's process session
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
 
 def session_rss_mb(sid):
@@ -171,10 +200,10 @@ def session_rss_mb(sid):
         if not d.isdigit():
             continue
         try:
-            stat = open(f"/proc/{d}/stat").read()
+            stat = pathlib.Path(f"/proc/{d}/stat").read_text()
             fields = stat[stat.rindex(")") + 2:].split()
             if int(fields[3]) == sid:  # field 6 of stat: session id
-                total += int(fields[21]) * os.sysconf("SC_PAGE_SIZE")  # field 24: rss pages
+                total += int(fields[21]) * PAGE_SIZE  # field 24: rss pages
         except (OSError, ValueError, IndexError):
             continue
     return total // (1 << 20)
@@ -187,73 +216,109 @@ def kill_session(p):
         pass
     p.wait()
 
-def run_episode(h, suite_dir, ep, idx, state, model, proxy_port, usage, tag, timeout, logs_dir):
+
+def prepare_workdir(work, suite_dir, ep, script_env):
+    """Fill `work` with the episode's fixture, then run its setup script there."""
+    if ep.get("fixture"):
+        shutil.copytree(suite_dir / ep["fixture"], work, dirs_exist_ok=True)
+    if ep.get("setup"):
+        subprocess.run([sys.executable, str(suite_dir / ep["setup"]), str(suite_dir)], cwd=work, check=True,
+                       capture_output=True, timeout=120, env=script_env)
+
+
+def run_watched(cmd, cwd, env, out_f, err_f, timeout):
+    """Run cmd in its own session; return its exit code, "timeout" or "memory-limit"."""
+    t0 = time.time()
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out_f, stderr=err_f,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    rc = None
+    while rc is None:
+        try:
+            # Poll rather than wait out the whole timeout, so memory is checked every 2 s.
+            rc = p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            if time.time() - t0 > timeout:
+                rc = "timeout"
+            elif session_rss_mb(p.pid) > EPISODE_MEM_MB:
+                rc = "memory-limit"
+            if rc is not None:
+                kill_session(p)
+    if rc == "memory-limit":
+        err_f.write(f"\n[eval] killed: episode processes exceeded {EPISODE_MEM_MB} MB\n")
+    return rc
+
+
+def run_episode(h, suite_dir, ep, number, state, model, proxy_port, usage, tag, timeout, logs_dir):
+    """Run episode `number` (1-based) of a suite with harness h and check its result."""
+    script_env = {**os.environ, "EVAL_EPISODE": str(number)}  # setup and check scripts only
     work = pathlib.Path(tempfile.mkdtemp(prefix="cmh-eval-work-"))
     try:
-        if ep.get("fixture"):
-            shutil.copytree(suite_dir / ep["fixture"], work, dirs_exist_ok=True)
-        if ep.get("setup"):
-            subprocess.run([sys.executable, str(suite_dir / ep["setup"]), str(suite_dir)], cwd=work, check=True,
-                           capture_output=True, timeout=120, env={**os.environ, "EVAL_EPISODE": str(idx + 1)})
+        prepare_workdir(work, suite_dir, ep, script_env)
         base = f"http://127.0.0.1:{proxy_port}/t/{tag}"
-        ctx = {"state": str(state), "model": model, "prompt": ep["prompt"], "work": str(work), "base_url": base}
-        env = {k: v for k, v in os.environ.items() if k not in ("OPENROUTER_API_KEY", "OPENCODE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")}
+        ctx = {"repo": str(REPO), "state": str(state), "model": model, "prompt": ep["prompt"], "base_url": base}
+        env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV_VARS}
         for k, v in h.get("env", {}).items():
             env[k] = expand(v, ctx)
         if h.get("models_json"):  # Prime Agent: base URL override through its models.json
             (state / "models.json").write_text(json.dumps({"providers": {"anthropic": {"baseUrl": base}}}))
         cmd = expand(h["cmd"], ctx)
-        t0 = time.time()
         answer = logs_dir / f"{tag}.stdout.txt"
         errlog = logs_dir / f"{tag}.stderr.txt"
+        t0 = time.time()
         # Output goes to files and the episode runs in its own session, so one runaway
         # episode can neither fill the runner's memory nor outlive its limits.
         with open(answer, "w") as out_f, open(errlog, "w") as err_f:
-            p = subprocess.Popen(cmd, cwd=work, env=env, stdout=out_f, stderr=err_f,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
-            rc = None
-            while rc is None:
-                try:
-                    rc = p.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    if time.time() - t0 > timeout:
-                        rc = "timeout"
-                    elif session_rss_mb(p.pid) > EPISODE_MEM_MB:
-                        rc = "memory-limit"
-                    if rc is not None:
-                        kill_session(p)
+            rc = run_watched(cmd, work, env, out_f, err_f, timeout)
         secs = time.time() - t0
-        if rc == "memory-limit":
-            with open(errlog, "a") as err_f:
-                err_f.write(f"\n[eval] killed: episode processes exceeded {EPISODE_MEM_MB} MB\n")
         chk = subprocess.run([sys.executable, str(suite_dir / ep["check"]), str(suite_dir), str(answer)],
-                             cwd=work, capture_output=True, text=True, timeout=300,
-                             env={**os.environ, "EVAL_EPISODE": str(idx + 1)})
+                             cwd=work, capture_output=True, text=True, timeout=300, env=script_env)
         return {"passed": chk.returncode == 0, "check_output": (chk.stdout + chk.stderr)[-1500:],
                 "exit": rc, "seconds": round(secs, 1), "usage": usage.take(tag)}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def run_suite(hname, h, suite_dir, trial, model, port, usage, timeout, logs_dir, fresh_state=False):
-    spec = json.loads((suite_dir / "suite.json").read_text())
+def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, logs_dir, fresh_state=False):
     state = pathlib.Path(tempfile.mkdtemp(prefix=f"cmh-eval-state-{hname}-"))
     rows = []
     try:
-        for i, ep in enumerate(spec["episodes"]):
+        for number, ep in enumerate(spec["episodes"], start=1):
             if fresh_state:  # control: no memory carried between episodes
                 shutil.rmtree(state, ignore_errors=True)
                 state.mkdir()
-            tag = f"{hname}.{suite_dir.name}.t{trial}.e{i + 1}"
-            r = run_episode(h, suite_dir, ep, i, state, model, port, usage, tag, timeout, logs_dir)
+            tag = f"{hname}.{suite_dir.name}.t{trial}.e{number}"
+            r = run_episode(h, suite_dir, ep, number, state, model, port, usage, tag, timeout, logs_dir)
             r.update({"harness": hname, "suite": suite_dir.name, "track": spec["track"], "trial": trial,
-                      "episode": i + 1, "transfer": bool(ep.get("transfer"))})
+                      "episode": number, "transfer": bool(ep.get("transfer"))})
             rows.append(r)
-            print(f"[{hname}] {suite_dir.name} t{trial} e{i + 1}: {'PASS' if r['passed'] else 'FAIL'} "
+            print(f"[{hname}] {suite_dir.name} t{trial} e{number}: {'PASS' if r['passed'] else 'FAIL'} "
                   f"({r['seconds']}s, {r['usage']['requests']} req)", flush=True)
     finally:
         shutil.rmtree(state, ignore_errors=True)
     return rows
+
+# ---------------------------------------------------------------- results
+
+def read_rows(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
+def load_recorded(results_path):
+    """Rows already in results.jsonl, one per (harness, suite, trial, episode); the first copy wins."""
+    recorded = {}
+    if results_path.exists():
+        for r in read_rows(results_path):
+            recorded.setdefault((r["harness"], r["suite"], r["trial"], r["episode"]), r)
+    return recorded
+
+
+def pending_jobs(names, specs, trials, recorded):
+    """(harness, suite_dir, trial) runs that do not yet have every episode recorded."""
+    def done(name, suite_dir, trial):
+        episodes = range(1, len(specs[suite_dir]["episodes"]) + 1)
+        return all((name, suite_dir.name, trial, e) in recorded for e in episodes)
+    return [(n, s, t) for t in range(1, trials + 1) for s in specs for n in names if not done(n, s, t)]
 
 # ---------------------------------------------------------------- report
 
@@ -267,15 +332,17 @@ def summarize(rows, baseline, threshold):
         mine = [r for r in rows if r["harness"] == n]
         coding = [r for r in mine if r["track"] == "coding"]
         learn = [r for r in mine if r["track"] == "learning" and r["transfer"]]
-        tokens = sum(r["usage"]["input"] + r["usage"]["output"] + r["usage"]["cache_read"] + r["usage"]["cache_write"] for r in mine)
+        tokens = sum(r["usage"][field] for r in mine for field in TOKEN_FIELDS)
         table.append({"harness": n, "episodes": len(mine), "overall": rate(mine), "coding": rate(coding),
-                      "learning_transfer": rate(learn), "median_seconds": sorted(r["seconds"] for r in mine)[len(mine) // 2],
+                      "learning_transfer": rate(learn),
+                      "median_seconds": statistics.median_high(r["seconds"] for r in mine),
                       "total_tokens": tokens, "api_errors": sum(r["usage"]["errors"] for r in mine)})
     base = next((t for t in table if t["harness"] == baseline), None)
     for t in table:
         for k in ("overall", "coding", "learning_transfer"):
             t[f"{k}_vs_{baseline}"] = (t[k] / base[k]) if base and base[k] else None
-        t["meets_threshold"] = bool(base) and t[f"overall_vs_{baseline}"] is not None and t[f"overall_vs_{baseline}"] >= threshold
+        ratio = t[f"overall_vs_{baseline}"]  # None without a baseline or when it passed nothing
+        t["meets_threshold"] = ratio is not None and ratio >= threshold
     return table
 
 
@@ -311,43 +378,41 @@ def main():
     a = ap.parse_args()
 
     if a.report_only:
-        rows = [json.loads(l) for l in open(a.report_only)]
+        rows = read_rows(a.report_only)
         table = summarize(rows, a.baseline, a.threshold)
         print(markdown(table, a.baseline, a.threshold, {"started": "(re-report)", "model": rows[0].get("model", "?"), "trials": "?"}))
         return
 
     started = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = pathlib.Path(a.out or ROOT / "results" / started)
+    results_path = out / "results.jsonl"
     if (out / "summary.md").exists():
         # A supervised service reruns its command when it exits; never append a second run.
         sys.exit(f"{out} already holds a finished run")
     # Resume an interrupted run: whole suites already recorded are not rerun.
-    done_rows = {}
-    if (out / "results.jsonl").exists():
-        for line in open(out / "results.jsonl"):
-            r = json.loads(line)
-            done_rows.setdefault((r["harness"], r["suite"], r["trial"], r["episode"]), r)
+    recorded = load_recorded(results_path)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    all_h = load_harnesses()
+    harnesses = json.loads((ROOT / "harnesses.json").read_text())
     names = [n for n in a.harness.split(",") if n]
     suites = sorted(p for p in (ROOT / "suites").iterdir() if (p / "suite.json").exists())
     if a.suite:
         wanted = set(a.suite.split(","))
         suites = [s for s in suites if s.name in wanted]
+    specs = {s: json.loads((s / "suite.json").read_text()) for s in suites}
     usage = Usage()
     port = start_proxy(usage, out / "proxy-errors.jsonl", a.upstream)
-    episodes = {s.name: len(json.loads((s / "suite.json").read_text())["episodes"]) for s in suites}
-    def recorded(n, s, t):
-        return all((n, s.name, t, e) in done_rows for e in range(1, episodes[s.name] + 1))
-    jobs = [(n, s, t) for t in range(1, a.trials + 1) for s in suites for n in names if not recorded(n, s, t)]
-    rows = [r for r in done_rows.values() if r["harness"] in names and r["suite"] in episodes]
-    if done_rows:
+    jobs = pending_jobs(names, specs, a.trials, recorded)
+    suite_names = {s.name for s in specs}
+    rows = [r for r in recorded.values() if r["harness"] in names and r["suite"] in suite_names]
+    if recorded:
         print(f"resuming: {len(rows)} recorded episodes kept, {len(jobs)} suite runs left", flush=True)
-        with open(out / "results.jsonl", "w") as f:  # drop duplicate rows from the interrupted run
-            f.writelines(json.dumps(r) + "\n" for r in done_rows.values())
-    with cf.ThreadPoolExecutor(a.jobs) as pool, open(out / "results.jsonl", "a") as f:
-        futs = [pool.submit(run_suite, n, all_h[n], s, t, a.model, port, usage, a.timeout, logs,
+        # A partly recorded suite reruns from its first episode and appends rows again, so
+        # rewrite the file with one row per episode before appending to it.
+        with open(results_path, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in recorded.values())
+    with cf.ThreadPoolExecutor(a.jobs) as pool, open(results_path, "a") as f:
+        futs = [pool.submit(run_suite, n, harnesses[n], s, specs[s], t, a.model, port, usage, a.timeout, logs,
                             a.fresh_state) for n, s, t in jobs]
         for fut in cf.as_completed(futs):
             for r in fut.result():

@@ -1,8 +1,7 @@
 import random
 
-ANSWER = None
-
 def build():
+    """Return (ini_text, conflicting_key), the key as SECTION.KEY."""
     rnd = random.Random(12)
     words = ["alpha", "beta", "cache", "delta", "edge", "flux", "gate", "hub", "ion", "jet", "kite", "lane"]
     sections = []

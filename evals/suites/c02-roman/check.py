@@ -11,19 +11,18 @@ def ref(n):
             out += s; n -= v
     return out
 
+def raises(f, errors):
+    try:
+        f()
+    except errors:
+        return True
+    return False
+
 for n in range(1, 4000):
     assert to_roman(n) == ref(n), n
     assert from_roman(ref(n)) == n, n
 for bad in (0, -1, 4000, 2.5, True, "5"):
-    try:
-        to_roman(bad); raise AssertionError(f"to_roman({bad!r}) did not raise")
-    except ValueError:
-        pass
-    except TypeError:
-        pass
+    assert raises(lambda: to_roman(bad), (ValueError, TypeError)), f"to_roman({bad!r}) did not raise"
 for bad in ("", "IIII", "IC", "MMMM", "iv", "VX", "IIV", "XM", "CMC", "VV", "LXL", "ABC", "MCMXCIVI"):
-    try:
-        from_roman(bad); raise AssertionError(f"from_roman({bad!r}) did not raise")
-    except ValueError:
-        pass
+    assert raises(lambda: from_roman(bad), ValueError), f"from_roman({bad!r}) did not raise"
 print("pass")

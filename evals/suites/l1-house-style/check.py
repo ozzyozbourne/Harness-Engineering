@@ -16,11 +16,13 @@ present = [f for f in cases if pathlib.Path(f).exists()]
 assert len(present) == 1, f"expected exactly one target file, found {present}"
 name = present[0]
 src = pathlib.Path(name).read_text()
-assert src.splitlines()[0] == "# owner: team-orion", f"first line is {src.splitlines()[0]!r}"
+first_line = src.splitlines()[0]
+assert first_line == "# owner: team-orion", f"first line is {first_line!r}"
 for node in ast.walk(ast.parse(src)):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         assert ast.get_docstring(node), f"function {node.name} has no docstring"
 for p in pathlib.Path(".").glob("*.py"):
+    # An agent-written check.py is exempt from the header rule.
     if p.name != "check.py":
         assert p.read_text().splitlines()[:1] == ["# owner: team-orion"], f"{p} lacks the owner header"
 import importlib

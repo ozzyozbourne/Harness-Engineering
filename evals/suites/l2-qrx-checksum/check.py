@@ -1,11 +1,10 @@
-import os, sys
+import sys
 sys.path.insert(0, sys.argv[1])
-from setup import blobs, qrx, EPISODES
-ep = int(os.environ.get("EVAL_EPISODE", "1"))
+from setup import blobs, qrx, EPISODES, episode
 b = blobs()
-files = EPISODES[ep - 1]
+files = EPISODES[episode() - 1]
 lines = open("answer.txt").read().strip().splitlines()
-if ep < 4:
+if len(files) == 1:  # single file: just the checksum
     assert lines == [qrx(b[files[0]])], (lines, qrx(b[files[0]]))
 else:
     want = [f"{n} {qrx(b[n])}" for n in sorted(files)]
