@@ -2,7 +2,7 @@
 """Eval runner: runs every harness on the same suites and compares them with Prime Agent.
 
 A suite is a directory under evals/suites/ with suite.json:
-  {"track": "coding" | "learning",
+  {"track": "coding" | "learning" | "reuse",
    "episodes": [{"prompt": str, "fixture": dir?, "setup": file?, "check": file,
                  "transfer": bool?}]}
 Episodes of one suite run in order, each in a fresh working directory and a fresh
@@ -343,7 +343,29 @@ def summarize(rows, baseline, threshold):
             t[f"{k}_vs_{baseline}"] = (t[k] / base[k]) if base and base[k] else None
         ratio = t[f"overall_vs_{baseline}"]  # None without a baseline or when it passed nothing
         t["meets_threshold"] = ratio is not None and ratio >= threshold
+        t["curve"] = learning_curve([r for r in rows if r["harness"] == t["harness"]])
     return table
+
+
+CURVE_TRACKS = ("learning", "reuse")  # multi-episode tracks where later episodes should get cheaper
+
+
+def learning_curve(rows):
+    """{track: [per episode position: runs, pass rate, mean tokens, seconds and requests]}."""
+    curve = {}
+    for track in CURVE_TRACKS:
+        mine = [r for r in rows if r["track"] == track]
+        points = []
+        for e in sorted({r["episode"] for r in mine}):
+            sel = [r for r in mine if r["episode"] == e]
+            mean = lambda f: round(statistics.mean(f(r) for r in sel), 1)
+            points.append({"episode": e, "runs": len(sel), "pass_rate": sum(r["passed"] for r in sel) / len(sel),
+                           "mean_tokens": mean(lambda r: sum(r["usage"][f] for f in TOKEN_FIELDS)),
+                           "mean_seconds": mean(lambda r: r["seconds"]),
+                           "mean_requests": mean(lambda r: r["usage"]["requests"])})
+        if points:
+            curve[track] = points
+    return curve
 
 
 def markdown(table, baseline, threshold, meta):
@@ -357,6 +379,18 @@ def markdown(table, baseline, threshold, meta):
         lines.append(f"| {t['harness']} | {pct(t['overall'])} | {pct(t[f'overall_vs_{baseline}'])} | {pct(t['coding'])} | "
                      f"{pct(t['learning_transfer'])} | {t['median_seconds']} | {t['total_tokens']:,} | {t['api_errors']} | "
                      f"{'yes' if t['meets_threshold'] else 'NO'} |")
+    for track in CURVE_TRACKS:
+        if not any(track in t["curve"] for t in table):
+            continue
+        lines += ["", f"## Learning curve: {track} track", "",
+                  "Means over every suite and trial of the track, by episode position. "
+                  "A harness that learns gets cheaper on later episodes.", "",
+                  "| Harness | Episode | Runs | Pass | Mean tokens | Mean s | Mean requests |",
+                  "|---|---|---|---|---|---|---|"]
+        for t in table:
+            for p in t["curve"].get(track, []):
+                lines.append(f"| {t['harness']} | {p['episode']} | {p['runs']} | {pct(p['pass_rate'])} | "
+                             f"{p['mean_tokens']:,.0f} | {p['mean_seconds']} | {p['mean_requests']} |")
     return "\n".join(lines) + "\n"
 
 
