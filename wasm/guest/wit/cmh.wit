@@ -1,0 +1,95 @@
+/// The contract between the cmh hypervisor (host) and a cmh kernel image
+/// (guest). Owned by the host: kernel proposals cannot change this file,
+/// and an image that does not match it fails to boot.
+package cmh:harness@0.1.0;
+
+interface types {
+    /// How one task ended. `error` is set for kernel-level failures (model
+    /// request failed, turn limit, a trap the guest could not recover from).
+    record task-outcome {
+        success: bool,
+        answer: string,
+        error: option<string>,
+    }
+
+    record bash-output {
+        /// Combined stdout and stderr, already capped by the host.
+        output: string,
+        /// -1 when the command was killed (timeout or signal).
+        exit-code: s32,
+        timed-out: bool,
+    }
+}
+
+/// Everything the guest can do to the outside world. Files are read through
+/// WASI read-only preopens (the work dir, the state dir, the kernel source);
+/// every write and every side effect goes through these narrow functions.
+interface host {
+    use types.{bash-output};
+
+    /// One line of trace on stderr.
+    log: func(line: string);
+    /// Text for the user on stdout (the repl echoes assistant text).
+    print: func(text: string);
+    now-ms: func() -> u64;
+    /// ISO-8601 UTC with milliseconds.
+    now-iso: func() -> string;
+
+    /// Facts about this run as a JSON object: state-dir, work-dir,
+    /// kernel-dir, soak, reflect, max-turns, base-prompt, image, echo-text.
+    config: func() -> string;
+
+    /// One Messages API request. `body` is a JSON object with `system` (an
+    /// array of strings), `messages` and optionally `tools`. The host adds
+    /// model, max_tokens and auth, always puts the immutable base prompt
+    /// first, and returns the response JSON (content, stop_reason, usage).
+    post-messages: func(body: string) -> result<string, string>;
+
+    /// bash -c `command` in the work dir, in a sandbox where the state dir,
+    /// the kernel source and base-prompt.md are read-only.
+    bash: func(command: string, timeout-s: u32) -> result<bash-output, string>;
+
+    /// Writes a file (creating parent directories). Refuses the state dir,
+    /// the kernel source and base-prompt.md.
+    write-file: func(path: string, content: string) -> result<string, string>;
+
+    /// Appends one event (a JSON object with `type`) to journal.jsonl. The
+    /// host checks it against the stable journal schema, stamps `ts` and
+    /// `image`, and returns the stored event.
+    journal-append: func(event: string) -> result<string, string>;
+    /// Every event, one JSON object per entry, oldest first.
+    journal-read: func() -> list<string>;
+
+    /// Saves the in-flight task (JSON: task-id, task, selected, messages,
+    /// transcript, tool-errors) so that after a trap the host can boot a
+    /// fresh instance and call `resume-task`.
+    checkpoint: func(state: string);
+
+    /// Builds, boots and self-tests a new kernel image. `request` is JSON:
+    /// description, and `edits` ([{path, old_str, new_str}]) and/or `files`
+    /// ({path: content}) relative to the kernel source. Returns the verdict.
+    propose-image: func(request: string) -> result<string, string>;
+    /// The image table (version, status, parent, description, reason).
+    images: func() -> string;
+}
+
+world harness {
+    import host;
+    use types.{task-outcome};
+
+    /// Replays the journal (and installs the seeds if it is empty).
+    export init: func() -> result<_, string>;
+    /// One agent task.
+    export run-task: func(task: string) -> task-outcome;
+    /// Continues a task from a checkpoint after the previous instance
+    /// trapped; `report` explains the trap and goes to the model.
+    export resume-task: func(checkpoint: string, report: string) -> task-outcome;
+    /// One refine task.
+    export refine: func() -> task-outcome;
+    /// A non-task command: defs, knowledge, /show NAME [V], /rollback NAME V,
+    /// /state (JSON), /call NAME JSON, /propose JSON, /remember TEXT.
+    export command: func(line: string) -> result<string, string>;
+    /// The image's own mock scenarios; run by the host before a new image
+    /// may go live. Uses no host side effects.
+    export self-test: func() -> result<string, string>;
+}

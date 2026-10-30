@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["host"]
+# The guest is built for wasm32-wasip2 by host/build.rs (and by the
+# hypervisor for every kernel proposal); it is its own workspace.
+exclude = ["guest"]
