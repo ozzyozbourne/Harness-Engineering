@@ -8,7 +8,8 @@ A suite is a directory under evals/suites/ with suite.json:
 Episodes of one suite run in order, each in a fresh working directory and a fresh
 process, sharing one harness state directory. A check script runs afterwards with
 cwd = the working directory: `python3 check.py <suite_dir> <answer_file>`; exit 0
-means pass. Fixtures, setup and checks are hidden from the agent.
+means pass. Fixtures, setup and checks are hidden from the agent: each harness run is
+isolated (see ISOLATE_SH) with a private /tmp and evals/, .git and the key hidden.
 
 Every model request goes through a local logging proxy to an Anthropic-compatible
 upstream (--upstream opencode, the default, or openrouter), so every harness uses the
@@ -248,10 +249,41 @@ def run_watched(cmd, cwd, env, out_f, err_f, timeout):
     return rc
 
 
-def run_episode(h, suite_dir, ep, number, state, model, proxy_port, usage, tag, timeout, logs_dir):
+# Per-episode isolation. Without it an agent can read other episodes' scratch files in
+# the shared /tmp, the prompts, fixtures and checkers under evals/ (also in git history),
+# and the upstream key. The harness runs in its own user and mount namespace: /tmp is
+# replaced by an empty private directory that holds only this episode's work and state
+# dirs (at their usual paths), and HIDDEN_PATHS are covered by empty tmpfs mounts.
+# Mounting needs root inside the namespace, so the script drops back to the real uid
+# with a nested user namespace before it starts the harness.
+HIDDEN_PATHS = [ROOT, REPO / ".git", pathlib.Path.home() / ".config" / "cmh"]
+ISOLATE_SH = r"""
+set -e
+priv=$1 work=$2 state=$3 nhide=$4; shift 4
+mount --bind "$work" "$priv/${work##*/}"
+mount --bind "$state" "$priv/${state##*/}"
+mount --rbind "$priv" /tmp
+while [ "$nhide" -gt 0 ]; do mount -t tmpfs -o size=1m,mode=755 tmpfs "$1"; shift; nhide=$((nhide - 1)); done
+cd "$work"
+exec unshare --map-user="$UID_OUT" --map-group="$GID_OUT" "$@"
+"""
+
+
+def isolated(cmd, priv, work, state):
+    """Wrap cmd so it sees only its own work and state dirs under /tmp (see ISOLATE_SH)."""
+    for d in (work, state):  # mount points for the work and state dirs inside the private /tmp
+        (priv / d.name).mkdir()
+    priv.chmod(0o1777)
+    hide = [str(p) for p in HIDDEN_PATHS if p.is_dir()]
+    return ["unshare", "-r", "-m", "sh", "-c", ISOLATE_SH, "sh", str(priv), str(work), str(state),
+            str(len(hide)), *hide, *cmd]
+
+
+def run_episode(h, suite_dir, ep, number, state, model, proxy_port, usage, tag, timeout, logs_dir, isolate=True):
     """Run episode `number` (1-based) of a suite with harness h and check its result."""
     script_env = {**os.environ, "EVAL_EPISODE": str(number)}  # setup and check scripts only
     work = pathlib.Path(tempfile.mkdtemp(prefix="cmh-eval-work-"))
+    priv = pathlib.Path(tempfile.mkdtemp(prefix="cmh-eval-tmp-"))
     try:
         prepare_workdir(work, suite_dir, ep, script_env)
         base = f"http://127.0.0.1:{proxy_port}/t/{tag}"
@@ -262,6 +294,9 @@ def run_episode(h, suite_dir, ep, number, state, model, proxy_port, usage, tag, 
         if h.get("models_json"):  # Prime Agent: base URL override through its models.json
             (state / "models.json").write_text(json.dumps({"providers": {"anthropic": {"baseUrl": base}}}))
         cmd = expand(h["cmd"], ctx)
+        if isolate:
+            cmd = isolated(cmd, priv, work, state)
+            env.update(UID_OUT=str(os.getuid()), GID_OUT=str(os.getgid()))
         answer = logs_dir / f"{tag}.stdout.txt"
         errlog = logs_dir / f"{tag}.stderr.txt"
         t0 = time.time()
@@ -276,9 +311,11 @@ def run_episode(h, suite_dir, ep, number, state, model, proxy_port, usage, tag, 
                 "exit": rc, "seconds": round(secs, 1), "usage": usage.take(tag)}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(priv, ignore_errors=True)
 
 
-def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, logs_dir, fresh_state=False):
+def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, logs_dir, fresh_state=False,
+              isolate=True):
     state = pathlib.Path(tempfile.mkdtemp(prefix=f"cmh-eval-state-{hname}-"))
     rows = []
     try:
@@ -287,9 +324,9 @@ def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, log
                 shutil.rmtree(state, ignore_errors=True)
                 state.mkdir()
             tag = f"{hname}.{suite_dir.name}.t{trial}.e{number}"
-            r = run_episode(h, suite_dir, ep, number, state, model, port, usage, tag, timeout, logs_dir)
+            r = run_episode(h, suite_dir, ep, number, state, model, port, usage, tag, timeout, logs_dir, isolate)
             r.update({"harness": hname, "suite": suite_dir.name, "track": spec["track"], "trial": trial,
-                      "episode": number, "transfer": bool(ep.get("transfer"))})
+                      "episode": number, "transfer": bool(ep.get("transfer")), "isolated": isolate})
             rows.append(r)
             print(f"[{hname}] {suite_dir.name} t{trial} e{number}: {'PASS' if r['passed'] else 'FAIL'} "
                   f"({r['seconds']}s, {r['usage']['requests']} req)", flush=True)
@@ -408,6 +445,8 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--fresh-state", action="store_true",
                     help="control run: wipe harness state between episodes, so nothing can be learned")
+    ap.add_argument("--no-isolate", action="store_true",
+                    help="run harnesses without per-episode isolation (shared /tmp, evals/ readable)")
     ap.add_argument("--report-only", default="", help="re-summarize an existing results.jsonl")
     a = ap.parse_args()
 
@@ -447,7 +486,7 @@ def main():
             f.writelines(json.dumps(r) + "\n" for r in recorded.values())
     with cf.ThreadPoolExecutor(a.jobs) as pool, open(results_path, "a") as f:
         futs = [pool.submit(run_suite, n, harnesses[n], s, specs[s], t, a.model, port, usage, a.timeout, logs,
-                            a.fresh_state) for n, s, t in jobs]
+                            a.fresh_state, not a.no_isolate) for n, s, t in jobs]
         for fut in cf.as_completed(futs):
             for r in fut.result():
                 r["model"] = a.model
