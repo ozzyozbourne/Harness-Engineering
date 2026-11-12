@@ -1,0 +1,33 @@
+# a normal function, before anything goes wrong
+greet : Str -> Str
+greet = |name| Str.concat("Hello, ", name)
+---
+# unknown 2: a definition whose evaluation never ends
+spin : U64 -> U64
+spin = |n| spin(n + 1)
+stuck = spin(0)
+---
+# the host survived and the old code still works
+greet("Roc")
+---
+# unknown 2 again: a call that never ends
+spin(0)
+---
+greet("still alive")
+---
+# unknown 1: an agent step that asks the host for data instead of calling it
+agent_step : Str -> [ReadFile(Str), Done(Str)]
+agent_step = |input| if input == "" ReadFile("notes.txt") else Done(Str.concat("the notes say: ", input))
+---
+# drive agent_step
+---
+# the host enforces rules on what Roc may ask for
+sneaky : Str -> [ReadFile(Str), Done(Str)]
+sneaky = |input| if input == "" ReadFile("../../.git/config") else Done(input)
+---
+# drive sneaky
+---
+# hot-reload the agent step; the next drive uses the new version
+agent_step = |input| if input == "" ReadFile("notes.txt") else Done(Str.concat("v2 summary: ", Str.trim(input)))
+---
+# drive agent_step

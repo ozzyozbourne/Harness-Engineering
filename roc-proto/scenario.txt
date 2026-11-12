@@ -1,0 +1,34 @@
+# greet v1, with a fixed contract (Str -> Str)
+greet : Str -> Str
+greet = |name| Str.concat("Hello, ", name)
+---
+# a caller defined once and never redefined
+shout = |name| Str.concat(greet(name), "!")
+---
+# call through the caller
+shout("Roc")
+---
+# hot reload: greet v2
+greet = |name| Str.concat("Howdy, ", name)
+---
+# the old caller now uses the new greet (late binding)
+shout("Roc")
+---
+# bad reload: breaks the contract (returns a number)
+greet = |name| 42
+---
+# bad reload: syntax error
+greet = |name| Str.concat("Hi", name
+---
+# both rejected, so v2 is still live
+shout("Roc")
+---
+# well-typed but crashes at runtime
+greet = |name| crash "greet is broken"
+---
+shout("Roc")
+---
+# roll back by reloading the v2 source; the host is still alive
+greet = |name| Str.concat("Howdy, ", name)
+---
+shout("Roc")
