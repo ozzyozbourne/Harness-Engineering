@@ -1,0 +1,38 @@
+:root {
+  --bg: #fbfaf7; --fg: #1f2328; --muted: #59636e; --accent: #8a3ffc;
+  --code-bg: #f2f0eb; --border: #e3dfd6; --note: #eef6ff; --warn: #fff6e5;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16171a; --fg: #e6e6e6; --muted: #9aa3ad; --accent: #b98cff;
+          --code-bg: #22242a; --border: #33363d; --note: #1b2735; --warn: #33291a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 17px/1.65 Georgia, "Iowan Old Style", "Times New Roman", serif; }
+header.book, footer.nav { max-width: 860px; margin: 0 auto; padding: 1rem 1.25rem;
+       font: 14px/1.4 system-ui, sans-serif; color: var(--muted); }
+header.book a, footer.nav a { color: var(--accent); text-decoration: none; }
+footer.nav { display: flex; justify-content: space-between; border-top: 1px solid var(--border); margin-top: 3rem; }
+main { max-width: 860px; margin: 0 auto; padding: 0 1.25rem 2rem; }
+h1, h2, h3, h4 { font-family: system-ui, sans-serif; line-height: 1.25; }
+h1 { font-size: 2.1rem; margin: 1.5rem 0 .25rem; }
+h1 + .subtitle { color: var(--muted); margin-top: 0; font-style: italic; }
+h2 { font-size: 1.45rem; margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: .25rem; }
+h3 { font-size: 1.15rem; margin-top: 1.75rem; }
+a { color: var(--accent); }
+code, pre { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+code { background: var(--code-bg); padding: .1em .3em; border-radius: 4px; }
+pre { background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px; overflow-x: auto;
+      border: 1px solid var(--border); }
+pre code { background: none; padding: 0; }
+.src { display: block; font: 12px/1.4 system-ui, sans-serif; color: var(--muted); margin: -.6rem 0 1rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font: 15px/1.45 system-ui, sans-serif; }
+th, td { border: 1px solid var(--border); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+th { background: var(--code-bg); }
+.note, .warn { border-left: 4px solid var(--accent); background: var(--note); padding: .6rem 1rem;
+               border-radius: 0 6px 6px 0; margin: 1.2rem 0; }
+.warn { border-left-color: #d08a00; background: var(--warn); }
+.toc ol { padding-left: 1.4rem; } .toc li { margin: .35rem 0; }
+.toc .desc { display: block; color: var(--muted); font-size: .92em; }
+.diagram { font: 13px/1.35 ui-monospace, Menlo, monospace; white-space: pre; overflow-x: auto;
+           background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }

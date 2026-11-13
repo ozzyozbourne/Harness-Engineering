@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9. The whole harness in WebAssembly: the agent rewrites its own kernel · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 9</header>
+<main>
+<h1>9. The whole harness in WebAssembly: the agent rewrites its own kernel</h1>
+<p class="subtitle">The agent loop, the gate and the tools become one replaceable image, and a small hypervisor keeps it honest.</p>
+
+<p>Every harness so far drew the same line. Below it was the <em>kernel</em>: the agent loop, the prompt
+assembly, the gate that tests new definitions, the journal. Above it was <em>userspace</em>: the tools,
+notes and hooks the agent writes for itself. The agent could reshape userspace as much as it liked, but
+the kernel was fixed. Whoever built the harness wrote it, and it changed only when a human changed it.</p>
+
+<p>The sixth implementation, in <code>wasm/</code>, removes that limit. The whole harness, agent loop
+included, is compiled into one WebAssembly component called the <em>kernel image</em>. The agent can read
+the image's Rust source, propose changes to it, and, if the new image passes a series of checks, run on it
+from the next task on. Beneath the image sits a small native program, the <em>hypervisor</em>. It holds
+every real capability and contains no agent logic. It does not trust the image.</p>
+
+<p>This chapter explains the idea, the contract between the two halves, how the hypervisor survives a
+broken image, how a kernel change is built and judged, and what the design does not yet deliver.</p>
+
+<h2>The unikernel idea, and why WebAssembly stands in for it</h2>
+
+<p>A <strong>unikernel</strong> is a program compiled together with just enough operating system to run
+on its own inside a virtual machine. There is no general-purpose OS underneath, just one image that boots
+and does one job. A <strong>hypervisor</strong> runs such images, gives each one virtual hardware, and can
+stop, discard or restart them. If an image misbehaves, the hypervisor throws it away and boots another.</p>
+
+<p>That maps neatly onto a self-modifying agent. Treat each version of the harness as an image. A new
+version is a new image. If it is bad, you boot the previous one. The agent changes the image, and the
+hypervisor owns the outside world and decides which image runs.</p>
+
+<p>Real unikernels need hardware virtualisation (on Linux, KVM). The orbs this project ran in do not
+provide KVM. The roadmap lists "Unikernel or microVM per generation" (Unikraft or Firecracker images) as
+experiment 11 and notes it "Needs a runner with KVM; orbs do not have it." So the WASM flavor uses
+WebAssembly as the stand-in:</p>
+
+<pre><code>tools. This is the "harness as a unikernel" idea. Real unikernels need KVM,
+which orbs do not have, so a WebAssembly component plays the role of the
+unikernel image and a small Rust program plays the role of the hypervisor.</code></pre>
+<span class="src">wasm/README.md:6-8</span>
+
+<p>WebAssembly (WASM) is a portable bytecode, a bit like the instruction set of a virtual CPU. A compiler
+such as <code>rustc</code> can target it, and a <em>runtime</em> runs it. Here the runtime is Wasmtime
+50.0.1, which compiles the bytecode to native code. The property that matters is isolation. A WASM
+program can only read and write its own <em>linear memory</em>, one flat byte array whose size the host
+can cap. It has no system calls of its own. Files, the clock, the network and "ask the model" must all be
+handed to it by the host as <strong>imports</strong>: functions the host implements and the guest may call.
+The guest offers <strong>exports</strong>, functions the host calls. When something goes wrong inside the
+guest, such as an out-of-bounds access, a panic, or running past a deadline, the runtime stops it with a
+<strong>trap</strong>. A trap reaches the host as an ordinary error value, never as a crash of the host
+process.</p>
+
+<p>That gives the same three properties that make a hypervisor useful: the image can be thrown away,
+everything it can do is listed, and its failures are contained. Chapter 8 used the same runtime for a much
+smaller job. Only the Forth interpreter ran inside WASM, and the harness around it was native Rust. The
+table compares the two.</p>
+
+<table>
+<tr><th></th><th>Forth flavor (<code>forth/</code>)</th><th>WASM flavor (<code>wasm/</code>)</th></tr>
+<tr><td>Inside WASM</td><td>only the Forth VM</td><td>the whole harness: agent loop, gate, journal replay, lessons, kernel tools, Forth VM</td></tr>
+<tr><td>Kind</td><td>core module, <code>wasm32-unknown-unknown</code></td><td>component, <code>wasm32-wasip2</code></td></tr>
+<tr><td>Interface</td><td>hand-rolled ABI: integers plus a shared "mailbox" in memory</td><td>typed WIT world <code>cmh:harness@0.1.0</code></td></tr>
+<tr><td>Runaway code</td><td>Wasmtime fuel (100M instructions) plus a 5 s wall clock</td><td>Forth step budget (20M steps) inside the image; guest-time limits (20 s slice, 300 s per call) outside</td></tr>
+<tr><td>Memory cap</td><td>64 MB</td><td>512 MB</td></tr>
+<tr><td>Restore</td><td>copy the linear memory back</td><td>throw the instance away, boot a fresh one, replay the journal, resume</td></tr>
+<tr><td>What the agent may change</td><td>userspace only</td><td>userspace and the kernel image</td></tr>
+</table>
+
+<h2>The two halves</h2>
+
+<p>The flavor is two Rust crates. <code>guest/</code> is the kernel image, compiled into one
+<code>.wasm</code> component. <code>host/</code> is the hypervisor, the <code>cmh</code> binary. The
+README draws the split like this:</p>
+
+<div class="diagram"> cmh (host/: the hypervisor, native Rust + Wasmtime)
+ ├── model HTTP to ANTHROPIC_BASE_URL (only this origin), auth headers
+ ├── bash in a sandbox (state dir, kernel source, base prompt read-only)
+ ├── file writes with the protected-path rules
+ ├── journal.jsonl with a stable schema
+ ├── image builds, boot tests, trials, reverts
+ └── limits: guest time, memory cap, trap -&gt; report -&gt; fresh instance
+      │  WIT imports (guest/wit/cmh.wit)
+      ▼
+ kernel image (guest/: wasm32-wasip2 component)
+ ├── agent loop, prompts, reflection, refine
+ ├── gate for userspace definitions, lessons, verdicts
+ ├── kernel tools: bash read_file write_file list_defs show_def forth_eval
+ │   propose_def rollback_def remember recall propose_kernel list_images
+ └── Forth VM (copied from forth/vm) for userspace tools and hooks</div>
+<span class="src">wasm/README.md:32-46</span>
+
+<p>Everything in the lower box can be replaced by the agent. Everything in the upper box cannot. The guest
+is about 3,800 lines of Rust: <code>forth/vm.rs</code> 1,866, <code>kernel.rs</code> 951,
+<code>state.rs</code> 236, <code>tools.rs</code> 156, <code>sys.rs</code> 154, <code>selftest.rs</code> 136,
+plus smaller files. The hypervisor's <code>src/hv/</code> is 2,256 lines, the largest parts being
+<code>images.rs</code> (684) and <code>guest.rs</code> (529).</p>
+
+<p>Userspace still exists. Tools, notes and the two hooks (<code>compose_system</code>,
+<code>select_lessons</code>) are Forth definitions, exactly as in chapter 8, and the seed files are
+identical to the Forth flavor's. The Forth VM is now just one more part of the kernel image. That has a
+cost the chapter returns to at the end: <code>wasm/guest/src/forth/vm.rs</code> is a copy of
+<code>forth/vm/src/lib.rs</code>, and the two differ by an 824-line diff.</p>
+
+<h2>The component model and the WIT world</h2>
+
+<p>A plain WASM module only understands numbers: its imports and exports take and return integers and
+floats. Passing a string means agreeing on where in memory it lives and how long it is. The Forth flavor
+did that by hand. The <strong>component model</strong> is a layer on top of WASM that adds real types
+(strings, lists, records, optional values, results that are either a value or an error) and generates the
+glue code on both sides. A <em>component</em> is a WASM program plus a description of the typed functions
+it imports and exports. That description is written in a small interface language called
+<strong>WIT</strong> (WebAssembly Interface Types). A WIT <em>world</em> names one complete contract: these
+imports, these exports.</p>
+
+<p>If you have used an IDL such as Protocol Buffers or an OpenAPI schema, WIT plays the same role: one file,
+read by tools on both sides, from which each side gets functions in its own language. Here is the world
+the whole flavor revolves around:</p>
+
+<pre><code>world harness {
+    import host;
+    use types.{task-outcome};
+
+    /// Replays the journal (and installs the seeds if it is empty).
+    export init: func() -&gt; result&lt;_, string&gt;;
+    /// One agent task.
+    export run-task: func(task: string) -&gt; task-outcome;
+    /// Continues a task from a checkpoint after the previous instance
+    /// trapped; `report` explains the trap and goes to the model.
+    export resume-task: func(checkpoint: string, report: string) -&gt; task-outcome;
+    /// One refine task.
+    export refine: func() -&gt; task-outcome;
+    /// A non-task command: defs, knowledge, /show NAME [V], /rollback NAME V,
+    /// /state (JSON), /call NAME JSON, /propose JSON, /remember TEXT.
+    export command: func(line: string) -&gt; result&lt;string, string&gt;;
+    /// The image's own mock scenarios; run by the host before a new image
+    /// may go live. Uses no host side effects.
+    export self-test: func() -&gt; result&lt;string, string&gt;;
+}</code></pre>
+<span class="src">wasm/guest/wit/cmh.wit:76-95</span>
+
+<p>Read it as a job description for any kernel image. An image must be able to rebuild its state
+(<code>init</code>), run a task, pick a task back up after a crash (<code>resume-task</code>), run a
+refine pass, answer commands such as <code>defs</code>, and test itself. <code>result&lt;_, string&gt;</code>
+means "nothing on success, an error message on failure". <code>task-outcome</code> is a record defined at
+the top of the file with three fields: <code>success: bool</code>, <code>answer: string</code> and
+<code>error: option&lt;string&gt;</code>.</p>
+
+<p>The <code>import host;</code> line pulls in the other half, the interface listing everything the image
+may ask the hypervisor to do. There are thirteen functions, and the list is short on purpose:</p>
+
+<table>
+<tr><th>Import</th><th>What it does</th></tr>
+<tr><td><code>log</code>, <code>print</code></td><td>a trace line on stderr; text on stdout</td></tr>
+<tr><td><code>now-ms</code>, <code>now-iso</code></td><td>the clock</td></tr>
+<tr><td><code>config</code></td><td>JSON facts: state dir, work dir, kernel dir, soak, reflect, turn limit, base prompt, image version</td></tr>
+<tr><td><code>post-messages</code></td><td>one model request; the host adds model, <code>max_tokens</code> and auth</td></tr>
+<tr><td><code>bash</code></td><td>a shell command in a sandbox, with a timeout</td></tr>
+<tr><td><code>write-file</code></td><td>write a file, except in protected paths</td></tr>
+<tr><td><code>journal-append</code>, <code>journal-read</code></td><td>the journal, checked against the host's schema</td></tr>
+<tr><td><code>checkpoint</code></td><td>save the in-flight task so it can resume after a trap</td></tr>
+<tr><td><code>propose-image</code>, <code>images</code></td><td>kernel self-modification and the image table</td></tr>
+</table>
+
+<p>Reading files is not on the list. The image reads files through <strong>WASI</strong>, the standard set
+of system interfaces a host may grant to a component. The host "preopens" three directories read-only, so
+they are visible inside the image under their real paths: the work dir, the state dir and
+<code>wasm/</code> itself:</p>
+
+<pre><code>        // Read-only views with the same paths as on the host.
+        let mut dirs = vec![env.work_dir.clone(), env.state_dir.clone()];
+        if env.kernel_dir.is_dir() {
+            dirs.push(env.kernel_dir.clone());
+        }
+        for d in dirs {
+            let guest_path = d.to_string_lossy().into_owned();
+            b.preopened_dir(&amp;d, guest_path, FsPerms::ReadOnly).map_err(|e| format!("preopen {}: {e}", d.display()))?;
+        }</code></pre>
+<span class="src">wasm/host/src/hv/guest.rs:185-193</span>
+
+<p>Each side generates its bindings from the same file. In the guest, one macro call,
+<code>wit_bindgen::generate!({ world: "harness", path: "wit" });</code> (lib.rs:6), produces a
+<code>Guest</code> trait. The image implements it with thin wrappers around the kernel:</p>
+
+<pre><code>impl Guest for Image {
+    fn init() -&gt; Result&lt;(), String&gt; {
+        let k = kernel::Kernel::open(Rc::new(sys::HostSys))?;
+        KERNEL.with(|cell| *cell.borrow_mut() = Some(k));
+        Ok(())
+    }
+
+    fn run_task(task: String) -&gt; TaskOutcome {
+        outcome(with_kernel(|k| k.run_task(&amp;task)))
+    }
+
+    fn resume_task(checkpoint: String, report: String) -&gt; TaskOutcome {
+        outcome(with_kernel(|k| k.resume_task(&amp;checkpoint, &amp;report)))
+    }</code></pre>
+<span class="src">wasm/guest/src/lib.rs:43-56</span>
+
+<p><code>with_kernel</code> first calls <code>k.sync()</code>, which applies any journal events the
+hypervisor appended since the last call (image verdicts, for example). In the host, the matching macro
+<code>wasmtime::component::bindgen!</code> generates a <code>Harness</code> type with methods such as
+<code>call_init</code> and <code>call_run_task</code>, and a trait the host implements for the imports.</p>
+
+<p>The kernel talks to the world through a Rust trait, <code>Sys</code>, with two implementations.
+<code>HostSys</code> calls the real WIT imports. <code>MemSys</code> is "an in-memory world with a scripted
+model, used by the image's own self-test (no side effects)" (sys.rs:2-3). The same kernel code can
+therefore run against the hypervisor or against a fake world held entirely in memory, which the self-test
+step below depends on.</p>
+
+<div class="note"><strong>The contract belongs to the host.</strong> The header of <code>cmh.wit</code>
+says it plainly: "Owned by the host: kernel proposals cannot change this file, and an image that does not
+match it fails to boot." The agent may rewrite everything behind the exports, but not the exports
+themselves.</div>
+
+<h2>The host as hypervisor</h2>
+
+<p>The README sums up the hypervisor's stance in one line: "The host never trusts the image." It does
+four things: it hands out capabilities, it enforces limits, it turns traps into reports, and it restores
+state after a trap.</p>
+
+<h3>Capabilities</h3>
+
+<p>An image starts with nothing. Each thing it can do is one import, and the host decides what that
+import really does. <code>post-messages</code> sends only to <code>$ANTHROPIC_BASE_URL</code> (or the
+mock), and the host adds credentials, so the image never sees a key. <code>write-file</code> refuses the
+state dir, <code>wasm/</code> and <code>base-prompt.md</code>. <code>bash</code> runs inside a sandbox where
+those same paths are read-only (more on that below). Even the base prompt is enforced at this level:</p>
+
+<pre><code>        // The base prompt is immutable: whatever the image sends, it comes first.
+        if system.first() != Some(&amp;self.env.base_prompt) {
+            system.retain(|s| s != &amp;self.env.base_prompt);
+            system.insert(0, self.env.base_prompt.clone());
+            self.base_prompt_inserted = true;
+        }</code></pre>
+<span class="src">wasm/host/src/hv/guest.rs:267-272</span>
+
+<p>A kernel image could rewrite its prompt assembly to drop the base prompt. It would not matter: the
+hypervisor puts it back before the request leaves the machine, and sets a flag that makes the conformance
+check (below) fail.</p>
+
+<h3>Limits measured in guest time</h3>
+
+<p>An image could loop forever or allocate until the machine runs out of memory. Memory is the simple
+case: a Wasmtime resource limiter refuses to let linear memory grow past 512 MB. Time is harder, because
+much of a task's wall-clock time is spent outside the guest, waiting for the model, running bash, or
+building a new image. A plain wall-clock limit would kill healthy tasks that are only waiting on a slow
+model. So the hypervisor counts only <em>guest time</em>. Every import runs through one helper that books
+its duration as host time:</p>
+
+<pre><code>    /// Runs one import: its time is host time, and the guest's slice
+    /// starts again when it returns.
+    fn host&lt;R&gt;(&amp;mut self, f: impl FnOnce(&amp;mut Self) -&gt; R) -&gt; R {
+        let t = Instant::now();
+        let r = f(self);
+        self.host_time += t.elapsed();
+        self.slice_start = Instant::now();
+        r
+    }</code></pre>
+<span class="src">wasm/host/src/hv/guest.rs:211-219</span>
+
+<p>Wasmtime's <strong>epoch interruption</strong> does the checking. A background thread advances a
+global counter (the "epoch") at a fixed interval, every 10 ms (<code>TICK</code>, guest.rs:33), and the compiled
+guest code checks it at loop heads and function entries. When the deadline passes, Wasmtime calls a
+callback the host registered:</p>
+
+<pre><code>        store.epoch_deadline_callback(|mut s| {
+            let d = s.data_mut();
+            let slice = d.slice_start.elapsed();
+            let total = d.call_start.elapsed().saturating_sub(d.host_time);
+            if slice &gt; d.limits.slice {
+                let msg = format!(
+                    "the kernel ran {:.1} s without returning to the hypervisor (limit {:.0} s)",
+                    slice.as_secs_f64(),
+                    d.limits.slice.as_secs_f64()
+                );
+                d.limit_hit = Some(("guest-timeout".into(), msg));
+                return Err(wasmtime::format_err!("guest time limit"));
+            }</code></pre>
+<span class="src">wasm/host/src/hv/guest.rs:437-449</span>
+
+<p>Two limits are checked. A <em>slice</em> is a stretch of guest code without a single host call; the
+default is 20 s, and exceeding it is a <code>guest-timeout</code>. The <em>total</em> is guest time across
+one export call, 300 s by default, and exceeding it is a <code>guest-time-limit</code>. Returning
+<code>Err</code> from the callback makes Wasmtime trap the guest at that point. Unlike the Forth flavor,
+there is no <em>fuel</em> (a per-instruction counter) at the Wasmtime level. Runaway Forth code is caught
+earlier, inside the image, by the VM's own step counter of 20,000,000 Forth steps
+(<code>MAX_STEPS</code>, forth/mod.rs:13-14). The guest-time limit is the backstop for runaway Rust in the
+kernel itself.</p>
+
+<h3>Trap → report</h3>
+
+<p>When a call traps, the hypervisor works out what kind of trap it was and writes a report for the model,
+not for a developer. <code>fault_of</code> checks, in order: a time limit the callback recorded, the memory
+limiter, a panic (detected because the guest's captured stderr contains "panicked"), an allocation failure,
+a stack overflow, an out-of-bounds access, and any other trap. Then it formats one message:</p>
+
+<pre><code>    let mut report = format!("kernel trap [{kind}] in image v{} during {export}: {msg}", image);
+    if !stderr.is_empty() {
+        report.push_str(&amp;format!("\n  guest stderr:\n    {stderr}"));
+    }
+    report.push_str(&amp;format!("\n  hint: {}", hint(&amp;kind)));
+    GuestFault { kind, report }</code></pre>
+<span class="src">wasm/host/src/hv/guest.rs:413-418</span>
+
+<p>A report reads like <code>kernel trap [guest-timeout] in image v2 during run-task: the kernel ran 20.0 s
+without returning to the hypervisor (limit 20 s)</code>, followed by the last lines of guest stderr (where
+a Rust panic message ends up) and a one-line hint about what usually causes that kind of trap. The
+instance that trapped is marked <code>dead</code> and never called again (guest.rs:485-499).</p>
+
+<h3>Fresh instance → journal replay → resume</h3>
+
+<p>Recovering from a trap does not mean repairing the broken instance. The hypervisor discards it and boots
+a new one, and the new one gets its state back from the journal. That works because every lasting fact in
+this design, from definitions and verdicts to lessons and tasks, is an event in <code>journal.jsonl</code>,
+and <code>init</code> rebuilds the kernel's state by replaying those events. The fresh instance has
+"exactly the state of the last journaled event" (README:92-93).</p>
+
+<p>The task that was running when the trap happened is not lost either. Before each turn's tool calls, the
+kernel saves a checkpoint:</p>
+
+<pre><code>            turns.stop = str_field(&amp;resp, "stop_reason");
+            run.messages.push(json!({"role": "assistant", "content": content}));
+            if turns.stop != "tool_use" {
+                break;
+            }
+            // If a tool call traps the image, the hypervisor resumes from here.
+            self.sys.checkpoint(&amp;run.to_json());
+            let results = self.run_tool_calls(&amp;content, run);</code></pre>
+<span class="src">wasm/guest/src/kernel.rs:722-729</span>
+
+<p>The checkpoint holds the task id, the task, the selected lessons, the messages so far, the transcript,
+the tool-error history and the turn number. The hypervisor keeps it outside the image. After a trap, its
+recovery loop does the rest:</p>
+
+<pre><code>            trace(&amp;format!("[hv] {}", first_line(&amp;fault.report)));
+            self.images().revert(image, &amp;format!("trapped: {}", first_line(&amp;fault.report)));
+            if let Err(e) = self.boot() {
+                self.finish_unfinished(&amp;fault.report);
+                break TaskOutcome { success: false, answer: String::new(), error: Some(format!("{}\n{e}", fault.report)) };
+            }
+            let guest = self.guest.as_mut().expect("booted");
+            match checkpoint {
+                Some(cp) if resumes &lt; MAX_RESUMES =&gt; {
+                    resumes += 1;
+                    trace(&amp;format!("[hv] restored image v{} from the journal; resuming the task", guest.image));
+                    res = guest.resume_task(&amp;cp, &amp;fault.report);
+                }
+                _ =&gt; {
+                    self.finish_unfinished(&amp;fault.report);
+                    break TaskOutcome { success: false, answer: String::new(), error: Some(fault.report) };
+                }
+            }</code></pre>
+<span class="src">wasm/host/src/hv/mod.rs:198-215</span>
+
+<p>In order: log the trap, revert the image that trapped (so a bad new kernel is dropped right away), boot
+the live image afresh (its <code>init</code> replays the journal), and call <code>resume-task</code> with the
+checkpoint and the report. In the resumed instance, every tool call of the interrupted turn gets an error
+result that begins "error: the kernel image trapped during this turn's tool calls; the hypervisor restored it and
+replayed the journal. Work from tool calls in this turn may be lost." with the report appended
+(kernel.rs:659-661). The model reads that and carries on. A task may be resumed at most three times
+(<code>MAX_RESUMES = 3</code>, mod.rs:31). If there is no checkpoint, or the limit is reached, the
+hypervisor itself journals the task as failed, with <code>"by": "hypervisor"</code>.</p>
+
+<div class="diagram">  image v2 running task 7
+        │  tool call loops forever in Rust
+        ▼
+  epoch callback: slice &gt; 20 s  ──►  trap
+        │
+        ▼
+  fault_of: "kernel trap [guest-timeout] in image v2 during run-task: ..."
+        │
+        ├─ instance marked dead
+        ├─ image v2 reverted ("trapped: kernel trap ...")   live: v1
+        ├─ boot v1, init() replays journal.jsonl
+        └─ resume-task(checkpoint, report)
+                │  interrupted tool calls get the report as their error result
+                ▼
+           model continues task 7 on v1</div>
+
+<p>A test injects exactly this. <code>host_survives_guest_infinite_loop_and_memory_blowup</code> builds an
+image whose kernel has a <code>/spin</code> command (an infinite Rust loop), a <code>/blowup</code> command
+(pushing 1 MB vectors forever) and a <code>chaos_spin</code> tool. It asserts that <code>/spin</code>
+fails with <code>kernel trap [guest-timeout] in image v2 during command</code> in under 30 seconds, that "a
+fresh instance serves the next call", that <code>/blowup</code> gives <code>kernel trap [memory-limit] in
+image v2</code>, and that a task calling the spinning tool still finishes: the model's next tool result
+contains the trap report and the word "restored", v2 is reverted, v1 runs the rest, and the journal still
+records exactly one task (host/tests/images.rs:152-192).</p>
+
+<h2>The image lifecycle: propose_kernel</h2>
+
+<p>The state directory holds <code>kernel-src/</code>, a copy of the live image's Rust crate. The agent
+reads it with <code>read_file</code> or <code>bash</code>, like any other source code. A system block the
+image adds to every prompt explains the arrangement:</p>
+
+<pre><code>Besides userspace (`propose_def`), you can change the kernel itself: the
+agent loop, the prompts, the kernel tools and the gate. Its Rust source is in
+the state dir under `kernel-src/` (`src/kernel.rs` holds the agent loop and
+prompt assembly, `src/tools.rs` the tool schemas). Read it first, then call
+`propose_kernel` with exact `edits` or whole `files` under `src/` or `seed/`.</code></pre>
+<span class="src">wasm/guest/src/kernel_reference.md:10-14</span>
+
+<p>The same block ends with advice that turns out to matter for the results: "Builds take a while: keep
+changes small and only change the kernel when userspace cannot do the job."</p>
+
+<p>A proposal is JSON with a description and either exact string replacements or whole files:</p>
+
+<pre><code>{"description": "print a per-turn token summary",
+ "edits": [{"path": "src/kernel.rs", "old_str": "...", "new_str": "..."}],
+ "files": {"src/extra.rs": "..."}}</code></pre>
+<span class="src">wasm/README.md:111-113</span>
+
+<p><code>propose_kernel</code> is a kernel tool, but it does almost nothing itself. It passes the request
+to the <code>propose-image</code> import, and the hypervisor does the work. Version 1 is the image built
+into the <code>cmh</code> binary; <code>host/build.rs</code> embeds both the compiled <code>.wasm</code> and
+every guest source file, so v1's source can be written out at startup. Each proposal becomes image
+v<em>N</em> and passes through six stages. Failing any of them rejects it, and the live kernel stays as it
+was.</p>
+
+<div class="diagram">propose_kernel(request)
+   │
+   1 edit         copy parent's source to images/vN/src, apply edits
+   │                 (only src/ and seed/; each old_str exactly once)
+   2 compile      cargo build --release --locked --offline --target wasm32-wasip2
+   │                 in a sandbox: no network, repo + state dir read-only
+   3 boot         scratch instance: temp dirs, mock model, no bash, run init
+   4 self-test    the image's own self-test export (4 scenarios)
+   5 conformance  the hypervisor's own mock task + journal replay check
+   │
+   6 trial        live from the next task on
+        ├── soak (3) clean tasks ──►  kept
+        └── trap / boot failure / failed task ──►  reverted</div>
+
+<h3>1. Edit</h3>
+
+<p>The hypervisor journals <code>image_proposed</code>, copies the parent image's source into
+<code>images/vN/src</code>, and applies the edits. Each <code>old_str</code> must occur exactly once, and
+"The edits change nothing" is itself a rejection. The paths are checked first:</p>
+
+<pre><code>fn check_path(p: &amp;str) -&gt; Result&lt;PathBuf, String&gt; {
+    let path = Path::new(p);
+    let ok_components = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if p.is_empty() || !ok_components {
+        return Err(format!("`{p}`: paths are relative to kernel-src/, without `..`"));
+    }
+    if !(p.starts_with("src/") || p.starts_with("seed/")) {
+        return Err(format!(
+            "`{p}` cannot be changed: only files under src/ and seed/ (Cargo.toml, Cargo.lock and wit/ belong to the hypervisor)"
+        ));
+    }
+    Ok(path.to_path_buf())
+}</code></pre>
+<span class="src">wasm/host/src/hv/images.rs:110-122</span>
+
+<p>Fixing <code>Cargo.toml</code> and <code>Cargo.lock</code> means a proposal cannot add dependencies,
+build scripts or procedural macros, all of which run code at build time. Fixing <code>wit/</code> keeps the
+contract stable.</p>
+
+<h3>2. Compile</h3>
+
+<p>The hypervisor runs a real <code>cargo build --release --locked --offline --target wasm32-wasip2</code>
+with two jobs. The build runs in the same kind of sandbox as agent bash, but stricter: no network, the
+whole repository and the state dir read-only, and <code>~/.config</code> covered by an empty tmpfs so that
+no credentials stored there are visible. One shared target directory (<code>target/</code> under <code>$CMH_IMAGE_CACHE</code>,
+else <code>$XDG_CACHE_HOME/cmh-wasm</code>, else <code>~/.cache/cmh-wasm</code>) serves every state dir, behind a file lock. If crates are missing it
+retries once online, and it gives up after 900 s. Compiler output is trimmed to start at the first
+<code>error</code> line, so the model sees what <code>rustc</code> said rather than pages of build log.</p>
+
+<h3>3. Boot, 4. self-test, 5. conformance</h3>
+
+<p>A new image is not trusted just because it compiles. The hypervisor boots it in a <em>scratch</em>
+instance: temporary state and work dirs, an empty mock model, bash disabled, and the <code>propose-image</code> and
+<code>images</code> imports disabled. A panic in <code>init</code> is caught here. One test plants <code>panic!("boom at boot")</code> in
+<code>lib.rs</code> and checks for a rejection containing <code>kernel trap [guest-panic]</code> and the panic
+text.</p>
+
+<p>Next it calls the image's own <code>self-test</code> export, which runs four scenarios against
+<code>MemSys</code>, the in-memory world:</p>
+
+<pre><code>/// Runs every scenario; all must pass.
+pub fn run() -&gt; Result&lt;String, String&gt; {
+    let scenarios: [Scenario; 4] = [
+        ("seeds", seeds),
+        ("late-binding task", late_binding_task),
+        ("gate rejection", gate_rejection),
+        ("revert and replay", revert_and_replay),
+    ];
+    for (name, f) in scenarios {
+        f().map_err(|e| format!("self-test scenario `{name}` failed: {e}"))?;
+    }
+    Ok(format!("{} self-test scenarios passed", scenarios.len()))
+}</code></pre>
+<span class="src">wasm/guest/src/selftest.rs:124-136</span>
+
+<p>The self-test lives in the image, so an image could weaken its own test. That is why a fifth stage
+exists that the image cannot touch. <strong>Conformance</strong> is the hypervisor's own scripted mock
+task, four model responses long: call the seed tool <code>word_count</code>, propose a Forth tool
+<code>reverse</code>, call <code>reverse</code> in the same task, then answer "conformance done". The
+hypervisor then checks the base prompt came first, that the nine SPEC kernel tools plus
+<code>word_count</code> were offered, that <code>reverse</code> appeared in the next request (late binding,
+chapter 2's core promise), that the journal holds the expected events (<code>task_started</code>, a
+successful <code>task_finished</code>, <code>def_trial</code>, a clean <code>def_use</code>), and that a
+<em>second</em> instance replaying the same journal reports an identical <code>/state</code>
+(images.rs:596-683).</p>
+
+<p>Here is the code that runs stages 3 to 6 once the build has produced bytes:</p>
+
+<pre><code>        let component = match load_component(&amp;wasm, &amp;self.state_dir.join("cache")) {
+            Ok(c) =&gt; c,
+            Err(e) =&gt; return self.reject(version, "boot", &amp;e),
+        };
+        let selftest = match self.boot_and_self_test(&amp;component, version) {
+            Ok(s) =&gt; s,
+            Err((stage, e)) =&gt; return self.reject(version, stage, &amp;e),
+        };
+        let conformance = match self.conformance(&amp;component, version) {
+            Ok(s) =&gt; s,
+            Err(e) =&gt; return self.reject(version, "conformance", &amp;e),
+        };
+        if self.rec(parent).is_some_and(|r| r.status == "trial") {
+            self.revert(parent, &amp;format!("superseded by v{version} before its trial finished"));
+        }</code></pre>
+<span class="src">wasm/host/src/hv/images.rs:464-478</span>
+
+<h3>6. Trial, then kept or reverted</h3>
+
+<p>An image that passes everything becomes a <em>trial</em>. It is journaled as <code>image_trial</code>,
+<code>kernel-src/</code> is rewritten to match it, and it becomes the live kernel "from the next task on".
+The task that proposed it finishes on the old image. Each later task of the trial adds an <code>image_use</code> event.
+After <code>--soak</code> clean tasks (default 3) the image is <strong>kept</strong>. It is
+<strong>reverted</strong> if it traps, fails to boot, or a task fails during its trial. Reverting falls
+back to "the newest kept image other than v, else the built-in one" (images.rs:360-364). This is the same
+gate → trial → soak → keep/revert cycle that userspace definitions go through (chapter 2), applied to the
+whole kernel.</p>
+
+<p>The verdicts become knowledge. They enter the guest's state under the name <code>image</code> and are
+shown to the model under "## Verdicts on past userspace and kernel changes", so an agent that broke its
+kernel last week sees that it did.</p>
+
+<h3>A scripted mock run: a token summary, and a broken edit</h3>
+
+<p>To show the lifecycle end to end, I drove the release binary (<code>wasm/target/release/cmh</code>) with
+the mock provider and a three-response script, in a fresh state directory. The first response calls
+<code>propose_kernel</code> with the README's example description, "print a per-turn token summary", and
+one edit to <code>src/kernel.rs</code>. Right after each model response comes back, it adds a trace line:</p>
+
+<pre><code>self.trace(&amp;format!("[tokens] turn {}: {} in, {} out", run.turn + 1, resp["usage"]["input_tokens"], resp["usage"]["output_tokens"]));</code></pre>
+
+<p>The second response proposes a broken edit at the same spot,
+<code>let tokens: u64 = resp["usage"]["input_tokens"];</code>, which reads a JSON value into an integer
+without converting it. The third answers "proposed". This is the stderr trace, unedited:</p>
+
+<pre><code>[image] v2 proposed (from v1): print a per-turn token summary
+[image] v2 built in 8.4s (726 KB)
+[tokens] turn 1: 0 in, 0 out
+[tool] word_count {"text":"one two three"} -&gt; 3
+[tokens] turn 2: 0 in, 0 out
+[gate] scratch vm: reverse v1 compiled, 1 test(s) passed
+[tool] propose_def reverse -&gt; trial v1
+[tokens] turn 3: 0 in, 0 out
+[tool] reverse {"text":"stressed"} -&gt; desserts
+[tokens] turn 4: 0 in, 0 out
+[assistant] conformance done
+[task] 1 succeeded
+[image] v2 trial
+[tool] propose_kernel print a per-turn token summary -&gt; trial image v2
+[image] v3 proposed (from v2): count input tokens
+[image] v3 rejected at compile: error[E0308]: mismatched types
+[tool] propose_kernel count input tokens -&gt; rejected
+[assistant] proposed
+[task] 1 failed</code></pre>
+<span class="src">the writer's scripted mock run, 2026-11-13: wasm/target/release/cmh --provider mock --script FILE, stderr with reflection off; with it on, the run ends with one more line, "[reflect] failed: mock script exhausted after 3 responses"</span>
+
+<p>Lines 3 to 12 are the conformance task running inside the scratch instance of v2. The new
+<code>[tokens]</code> lines already appear there, interleaved with the hypervisor's scripted
+<code>word_count</code>, <code>propose_def reverse</code> and <code>reverse</code> calls. The scratch task's
+"[task] 1 succeeded" belongs to the scratch journal, not the real one. The token counts are zero because the
+mock reports zero usage. With a warm build cache, the build took 8.4 s. The model received this verdict as
+the tool result:</p>
+
+<pre><code>trial image v2: built in 8.4 s (726 KB), booted in a scratch instance, 4 self-test scenarios passed, conformance passed (mock task, late binding, journal, replay). It is the live kernel from the next task on and is kept after 3 clean tasks; a trap, a boot failure or a failed task reverts it to v1.</code></pre>
+
+<p>For the broken edit, it received the compiler's own words:</p>
+
+<pre><code>error: rejected at compile:
+error[E0308]: mismatched types
+   --&gt; src/kernel.rs:712:31
+    |
+712 |             let tokens: u64 = resp["usage"]["input_tokens"];
+    |                         ---   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `Value`
+    |                         |
+    |                         expected due to this
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `cmh-guest` (lib) due to 1 previous error
+The live kernel is unchanged (image v2).</code></pre>
+
+<p>Note the last line: v3's parent was v2, the trial, and v2 stayed live. The real task ended "failed".
+That is the ordinary SPEC rule, not an image verdict: a task succeeds only if neither of its last two tool
+calls failed (kernel.rs:676-678), and the last call was the rejected proposal. A second run with a one-line
+"hello" script booted the new kernel and printed its new trace line:</p>
+
+<pre><code>[hv] booted kernel image v2
+[tokens] turn 1: 0 in, 0 out
+[assistant] hello
+[task] 2 succeeded
+[image] v2 trial: 1/3 clean tasks</code></pre>
+
+<p>And <code>cmh images</code> showed the history:</p>
+
+<pre><code> v1   builtin                    parent -     726 KB build      -  the kernel built into the hypervisor
+*v2   trial (1/3 clean tasks)    parent v1    726 KB build   8.4s  print a per-turn token summary
+ v3   rejected                   parent v2         - build      -  count input tokens  [compile: error[E0308]: mismatched types]</code></pre>
+
+<p>Two more clean tasks would have kept v2. The journal of this run holds the image events in order:
+<code>image_proposed</code> (v2), <code>image_trial</code> (v2, with <code>build_ms</code> 8412 and
+<code>size</code> 743872), <code>image_proposed</code> (v3), <code>image_rejected</code> (v3, with
+<code>stage</code> "compile", the compiler output, and the verdict <code>image v3 ("count input tokens")
+rejected at compile: error[E0308]: mismatched types</code>), and <code>image_use</code> (v2, ok).</p>
+
+<div class="warn">This run used the mock provider. No model chose to write this edit; I scripted it to
+show what the machinery does with a proposal. The binary was built on 2026-10-30, minutes before the
+commit that added the flavor, and I did not rebuild it. The test suite, which builds from the current
+source, covers the same paths.</div>
+
+<p>A real model has been through the same path, but only while the flavor was being built. The
+build agent's report records live runs with DeepSeek V4.1 Flash (their logs are not in git). The model
+wrote its own per-turn token-summary change as v2, which built in 4.7 s (728 KB), went on trial and was
+kept after two clean tasks. A deliberately broken v3 was rejected at compile with
+<code>error[E0308]: mismatched types</code>. In another run the model probed with <code>forth_eval</code>
+and then built a <code>reverse_words</code> userspace tool.</p>
+
+<h2>The journal: a schema the host owns</h2>
+
+<p>The journal is the one thing that must outlive every image. Image v5 has to be able to read events
+written by v2, and v1 (the fallback of last resort) has to read events written by v5. If the image owned
+the journal format, a single bad proposal could make history unreadable to every other image. So the
+hypervisor owns the schema. Images may write only the SPEC event types, with their required fields, or
+free-form <code>ext_*</code> events. A separate list of image lifecycle events belongs to the hypervisor
+alone:</p>
+
+<pre><code>/// Event types only the hypervisor writes (kernel image lifecycle).
+const HOST_EVENTS: &amp;[(&amp;str, &amp;[(&amp;str, Ty)])] = &amp;[
+    ("image_proposed", &amp;[("version", Ty::Int), ("parent", Ty::Int), ("description", Ty::Str)]),
+    ("image_rejected", &amp;[("version", Ty::Int), ("stage", Ty::Str), ("error", Ty::Str), ("verdict", Ty::Str)]),
+    ("image_trial", &amp;[("version", Ty::Int), ("parent", Ty::Int), ("description", Ty::Str)]),
+    ("image_use", &amp;[("version", Ty::Int), ("ok", Ty::Bool)]),
+    ("image_kept", &amp;[("version", Ty::Int), ("verdict", Ty::Str)]),
+    ("image_reverted", &amp;[("version", Ty::Int), ("restored", Ty::Int), ("reason", Ty::Str), ("verdict", Ty::Str)]),
+];</code></pre>
+<span class="src">wasm/host/src/hv/journal.rs:35-43</span>
+
+<p>The guest list (journal.rs:20-33) has eleven types, from <code>def_proposed</code> to
+<code>task_finished</code>, each with its required fields: <code>def_use</code> needs <code>name</code> (a
+string), <code>version</code> (an integer) and <code>ok</code> (a boolean), and so on. Every
+<code>journal-append</code> from the image passes through this check:</p>
+
+<pre><code>/// Checks an event from a kernel image against the stable schema.
+pub fn check_guest_event(ev: &amp;Value) -&gt; Result&lt;(), String&gt; {
+    let obj = ev.as_object().ok_or("journal schema: an event must be a JSON object")?;
+    let kind = obj.get("type").and_then(Value::as_str).ok_or("journal schema: an event needs a string `type`")?;
+    if kind.starts_with("ext_") {
+        return Ok(());
+    }
+    if HOST_EVENTS.iter().any(|(k, _)| *k == kind) {
+        return Err(format!("journal schema: `{kind}` events are written only by the hypervisor"));
+    }
+    let Some((_, fields)) = GUEST_EVENTS.iter().find(|(k, _)| *k == kind) else {
+        let known: Vec&lt;&amp;str&gt; = GUEST_EVENTS.iter().map(|(k, _)| *k).collect();
+        return Err(format!("journal schema: unknown event type `{kind}` (known: {}, or ext_* for new kinds)", known.join(", ")));
+    };
+    check_fields(kind, obj, fields)
+}</code></pre>
+<span class="src">wasm/host/src/hv/journal.rs:73-88</span>
+
+<p>After the check, the hypervisor stamps two fields the image cannot forge: <code>ts</code>, and
+<code>image</code>, the version that wrote the event. The largest event an image may append is 1 MB. On the
+reading side, the guest's replay ignores types it does not know. Together those rules mean any image, old
+or new, can replay the same journal: a new image can invent <code>ext_*</code> events without breaking old
+ones, and no image can fake a kept verdict for itself. The test
+<code>journal_schema_and_protected_paths_hold</code> checks both halves: a guest-written
+<code>image_kept</code> is refused "only by the hypervisor", a <code>def_use</code> missing its fields is
+refused, and an <code>ext_note</code> passes (spec.rs:362-366).</p>
+
+<h2>Sandboxed bash via unshare</h2>
+
+<p>The image's <code>bash</code> tool is a real shell on the real machine, because the agent needs one to
+do real work. That is the one big hole in a WASM wall: bash could just overwrite the journal, the
+hypervisor's source, or the base prompt. The hypervisor closes it with Linux namespaces. The
+<code>unshare</code> command starts a process in new namespaces: <code>-r</code> creates a user namespace
+where the caller appears as root (so it may mount things without real root privileges), <code>-m</code>
+gives it a private mount table, and <code>-n</code> an empty network namespace. Inside, a tiny script bind-
+mounts each protected path read-only over itself:</p>
+
+<pre><code>/// Mounts each path in `$CMH_RO` read-only and each in `$CMH_TMPFS` as an
+/// empty tmpfs, then runs `$CMH_CMD`.
+const SANDBOX_SCRIPT: &amp;str = r#"IFS='
+'
+for p in $CMH_RO; do [ -e "$p" ] &amp;&amp; mount --bind -o ro "$p" "$p"; done
+for p in $CMH_TMPFS; do [ -d "$p" ] &amp;&amp; mount -t tmpfs -o size=1m tmpfs "$p"; done
+c=$CMH_CMD
+unset CMH_RO CMH_TMPFS CMH_CMD IFS
+exec bash -c "$c""#;</code></pre>
+<span class="src">wasm/host/src/hv/sandbox.rs:26-34</span>
+
+<pre><code>pub fn sandboxed(cmd: &amp;str, read_only: &amp;[PathBuf], tmpfs: &amp;[PathBuf], net: bool) -&gt; Command {
+    if !sandbox_available() {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(cmd);
+        return c;
+    }
+    let mut c = Command::new("unshare");
+    c.args(["-r", "-m", "--propagation", "private"]);
+    if !net {
+        c.arg("-n");
+    }
+    c.args(["--", "bash", "-c", SANDBOX_SCRIPT])
+        .env("CMH_RO", join_paths(read_only))
+        .env("CMH_TMPFS", join_paths(tmpfs))
+        .env("CMH_CMD", cmd);
+    c</code></pre>
+<span class="src">wasm/host/src/hv/sandbox.rs:60-75</span>
+
+<p>For agent bash, the read-only paths are the state dir, <code>wasm/</code> and <code>base-prompt.md</code>
+(mod.rs:104), and network stays on. For image builds, the read-only paths are the whole repository plus the
+state dir, <code>~/.config</code> is an empty tmpfs, and network is off. Bash output is capped at 20 KB, the
+timeout is clamped to 1-3600 s, and on timeout the whole process group is killed. The
+<code>write-file</code> import enforces the same protected paths in plain Rust ("refused: ... is inside
+protected path ..."). The schema test above also checks the sandbox: <code>echo bad &gt;&gt;
+STATE/journal.jsonl</code> from the bash tool must fail with <code>Read-only file system</code>, whenever
+the sandbox is available.</p>
+
+<p>That "whenever" matters. Look at the top of <code>sandboxed</code>: if <code>unshare</code> does not
+work on this machine, the command runs without any sandbox. The hypervisor prints one warning on
+stderr, "user namespaces unavailable; bash and image builds run without the read-only sandbox"
+(sandbox.rs:48), and carries on. In the orbs used for this book, <code>unshare -r -m</code> works, so the
+sandbox was active.</p>
+
+<h2>What the agent can and cannot change</h2>
+
+<table>
+<tr><th>Through</th><th>Can change</th></tr>
+<tr><td><code>propose_def</code></td><td>userspace: Forth tools, notes, the <code>compose_system</code> and <code>select_lessons</code> hooks</td></tr>
+<tr><td><code>propose_kernel</code></td><td>any file under <code>src/</code> or <code>seed/</code>: the agent loop, prompt assembly, reflection prompt, gate rules, soak counting, kernel tool schemas and behavior, the Forth VM, the seeds, the self-test, the kernel reference text</td></tr>
+<tr><th>Cannot change</th><th>Why</th></tr>
+<tr><td><code>Cargo.toml</code>, <code>Cargo.lock</code></td><td>no new dependencies or build-time code</td></tr>
+<tr><td><code>wit/cmh.wit</code></td><td>the contract</td></tr>
+<tr><td>the hypervisor, <code>base-prompt.md</code></td><td>read-only to bash and write_file; the base prompt is re-inserted first anyway</td></tr>
+<tr><td>the journal schema, the limits, conformance</td><td>live in the hypervisor</td></tr>
+</table>
+
+<p>Because the kernel tools are image code, a kernel proposal can add new kernel tools. The built-in image
+has twelve: the nine SPEC tools plus <code>forth_eval</code>, <code>propose_kernel</code> and
+<code>list_images</code> (tools.rs:8-21). Conformance only requires the nine plus <code>word_count</code>,
+so a future image could even drop <code>propose_kernel</code>.</p>
+
+<h2>Tests</h2>
+
+<p><code>cd wasm &amp;&amp; cargo test</code> runs offline with the mock provider. On 2026-11-13 it reported 27
+tests, all passing: 17 in <code>host/tests/spec.rs</code>, 7 in <code>host/tests/images.rs</code> and 3
+provider unit tests. The image tests run real cargo builds, so they are slow: <code>images.rs</code> took
+105 s and <code>spec.rs</code> 91 s.</p>
+
+<p><code>spec.rs</code> covers the eight required SPEC tests (<code>t1</code>-<code>t8</code>), checks
+that the seeds and the built-in image pass their own tests, covers the Forth VM's failure modes (an
+infinite loop stopped by the step budget, a bad address refused and the snapshot restored, a structured
+stack-underflow report, lazy loading in a fresh process, the <code>forth_eval</code> scratchpad), and adds
+the journal-and-protected-paths test. <code>images.rs</code> covers the lifecycle:</p>
+
+<table>
+<tr><th>Test</th><th>What it proves</th></tr>
+<tr><td><code>good_image_is_used_next_task_kept_after_soak_and_booted_by_a_second_process</code></td><td>a marker edit to the kernel prompt is live on the next task, kept after the soak, and a new process boots it</td></tr>
+<tr><td><code>image_that_fails_to_compile_is_rejected_with_the_compiler_error</code></td><td>the <code>E0308</code> rejection; bad edits, <code>Cargo.toml</code> and <code>..</code> paths never reach the compiler</td></tr>
+<tr><td><code>image_that_traps_at_boot_is_rejected</code></td><td><code>rejected at boot</code> with <code>kernel trap [guest-panic]</code></td></tr>
+<tr><td><code>image_that_fails_its_self_test_is_rejected</code></td><td>an edit filtering tools by <code>"toolz"</code> makes userspace tools vanish and fails <code>late-binding task</code></td></tr>
+<tr><td><code>trial_image_is_reverted_after_a_failed_task_and_not_used_next_run</code></td><td>a failed trial task reverts, and the next process does not use the image</td></tr>
+<tr><td><code>host_survives_guest_infinite_loop_and_memory_blowup</code></td><td>the trap, report, restore and resume path</td></tr>
+<tr><td><code>propose_kernel_tool_end_to_end_and_second_process_boots_the_trial</code></td><td>the tool through the real binary, and a second process booting the trial</td></tr>
+</table>
+
+<p>The self-test case deserves a second look. Changing one string literal from <code>"tool"</code> to
+<code>"toolz"</code> compiles fine and boots fine. Only a behavioral check catches that the agent can no
+longer see its own tools. That is the reason both self-test and conformance exist.</p>
+
+<h2>Limitations</h2>
+
+<p>The machinery works in tests. Whether it is useful is a different question, and so far the evidence
+is thin.</p>
+
+<div class="warn"><strong>No recorded eval episode used <code>propose_kernel</code>.</strong> Across the 48 local
+WASM eval episodes (16 + 32, logs in <code>evals/results/{iso-pilot,matrix-memory}/logs/wasm.*</code>), a grep
+finds 0 <code>propose_kernel</code> calls, 0 <code>[image]</code> lines and 0 kernel traps, against 218
+<code>forth_eval</code> and 13 <code>propose_def</code> calls. Those logs are gitignored and not part
+of any committed results file. Kernel self-modification has so far been exercised only by tests, by
+scripted runs like the one above and by the build-time live runs.</div>
+
+<p>Those same local runs give the only eval numbers for this flavor. In the isolated 16-episode pilot with DeepSeek
+V4.1 Flash it scored 88%, 14/16 (Forth 100%, Prime Agent 94%; <code>evals/results/iso-pilot/summary.md</code>).
+In the 32-episode isolated matrix it scored 78%, 25/32, the same as Forth, and both were below the 80% bar
+(<code>evals/results/matrix-memory/summary.md</code>). Each was a single trial, the files are gitignored, and
+the roadmap does not cite them. Treat them as indications, not firm results. Chapter 11 covers both runs.</p>
+
+<p>The rest of the list comes from reading the code:</p>
+
+<ul>
+<li><strong>It is a stand-in.</strong> Real unikernels or microVMs need KVM. A WASM component gives the
+same discard-and-reboot shape, but it shares a process with the hypervisor, not a hardware boundary.</li>
+<li><strong>The sandbox can silently be absent.</strong> Without unprivileged user namespaces, bash and
+image builds run unsandboxed after one warning. The notes infer a worse consequence: bash could then also
+write the cached native code in <code>STATE/cache/*.cwasm</code>, which <code>load_component</code> loads
+with <code>unsafe</code> on the assumption that bash cannot write the state dir (guest.rs:95-97). With the
+sandbox off, that is a path to running injected code in the host process.</li>
+<li><strong>Agent bash keeps the network</strong> and has no CPU or memory limits beyond its timeout. The
+image can also <em>read</em> the whole state dir, journal included, through the preopens.</li>
+<li><strong>A trap reverts even a kept image.</strong> The README describes reverting on a trap "during the
+trial", but <code>Hypervisor::task</code> calls <code>revert</code> on every trap, and
+<code>Images::revert</code> skips only v1 and images that are not live (images.rs:372-375). No test
+covers this.</li>
+<li><strong>Builds are slow and serialized.</strong> The scripted run above took 8.4 s with a warm cache. A cold
+build takes minutes, and one lock serializes builds across every state dir.</li>
+<li><strong>No new dependencies.</strong> With <code>Cargo.lock</code> fixed, the kernel can only reshape
+its own Rust using <code>serde_json</code> and <code>wit-bindgen</code>.</li>
+<li><strong>Kept means "did not fail".</strong> Conformance checks SPEC behavior, not quality. As with
+userspace, an image is kept after three tasks that did not fail, not because it helped.</li>
+<li><strong>Checkpoints only before tool calls.</strong> A trap during prompt composition or the model
+call resumes from the previous turn's checkpoint, and work done since then is lost.</li>
+<li><strong>Two copies of the Forth VM.</strong> The guest's copy and <code>forth/vm</code> differ by an
+824-line diff, so a fix in one must be made in the other.</li>
+<li><strong>Cosmetic:</strong> journal lines are written with sorted keys, so <code>type</code> is not the
+first field.</li>
+</ul>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Putting the whole harness in a WASM component makes the kernel replaceable: the agent loop, prompts,
+gate and tools become one image the agent can rebuild, while a small hypervisor with no agent logic holds
+every real capability.</li>
+<li>The WIT world is the fixed contract: six exports any image must provide, thirteen imports it may use,
+and file reads through read-only WASI preopens. The host owns it, so proposals cannot change it.</li>
+<li>Limits count guest time, not wall time (a 20 s slice and 300 s per call, plus 512 MB of memory), so
+slow models do not trip them but runaway kernel code does.</li>
+<li>Recovery means discarding the instance, not repairing it: trap → report → revert → fresh instance →
+journal replay → <code>resume-task</code> from a checkpoint, with the report delivered to the model as the
+tool result.</li>
+<li><code>propose_kernel</code> runs a full pipeline (edit, sandboxed offline build, scratch boot,
+self-test, host-owned conformance, trial, kept or reverted), and every stage returns plain feedback such as
+<code>rustc</code>'s own error.</li>
+<li>The journal outlives every image because its schema belongs to the host: guests write SPEC or
+<code>ext_*</code> events, only the host writes <code>image_*</code>, and every event is stamped with its
+writer.</li>
+<li>The honest result: the machinery is tested (27 passing tests), but no recorded eval episode has used
+it. Whether agents will rewrite their own kernels when it helps is still an open question.</li>
+</ul>
+</main>
+<footer class="nav"><a href="08-forth.html">← Forth in WebAssembly: a language built for the agent</a><a href="index.html">Contents</a><a href="10-roc.html">Roc on Zig: pure code and requests as data →</a></footer>
+</body></html>

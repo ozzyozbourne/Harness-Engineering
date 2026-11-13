@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12. Other self-modifying harnesses we studied · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 12</header>
+<main>
+<h1>12. Other self-modifying harnesses we studied</h1>
+<p class="subtitle">Twelve open-source projects, what each lets an agent change about itself, and how mainstream coding agents keep a growing tool list manageable</p>
+
+<p>cmh did not start from a blank page. Before we wrote <code>SPEC.md</code> we cloned a dozen
+public repositories that let an agent change the program it runs in. We also cloned seven
+mainstream coding agents to see how they cope when a model has more tools than fit
+comfortably in its context. This chapter tours the first group, lists what cmh took from
+them and could still take, then explains <em>code mode</em> and <em>tool search</em>, two
+ideas that matter once an agent keeps writing its own tools.</p>
+
+<div class="note">
+<strong>How this survey was done.</strong> The repositories were cloned on 2026-10-29
+and read as untrusted data; nothing was built or run. The small ones were read closely, the
+large ones (golem, deepseek-harness, fx, fold, exo) surveyed from READMEs, docs and
+targeted searches. Where a claim below is our reading
+of a design rather than something the code or docs state, we say so.
+</div>
+
+<h2>A map of the twelve</h2>
+
+<p>Most of these projects are written in a Lisp, for the reasons chapter 1 gave: programs
+are ordinary data, and a running system can be extended without restarting. The Lisp
+projects also know each other. autolith's README lists samizdat, sm-harness,
+fractal-engine, oh-my-lisp, jiti and lisptc among its "Friends of Autolith", and
+samizdat's <code>mutation.clj</code> adopts "autolith's journaled mutation state machine".</p>
+
+<p>A useful way to sort them is by <em>what is mutable</em>:</p>
+
+<div class="diagram">what the agent may change                         projects
+───────────────────────────────────────────────  ───────────────────────────────
+1. the harness's own code, live, in-process      cl-sm-harness, autolith, oml
+2. the agent loop and its policies, as data      samizdat
+3. an application or userspace next to a         jiti, lisptc, fractal-engine,
+   fixed kernel                                  deepseek-harness
+4. its own source, then rebuild and restart      exo (self-improving example)
+5. nothing (useful as contrasts)                 golem, fold, fx</div>
+
+<p>cmh sits in group 3: a fixed kernel calls, by name, a userspace of tools, notes and
+hooks that the agent grows. Only the WASM flavor (chapter 9) reaches into group 1, by
+letting the agent propose a new kernel image.</p>
+
+<h2>The projects one by one</h2>
+
+<h3>autolith: the most complete self-modifier</h3>
+
+<p><a href="https://github.com/lambda-symbolics/autolith">autolith</a> is "a live,
+self-modifying Common Lisp terminal agent". It runs inside a live SBCL image. An
+<em>image</em> is the whole running heap of functions and data, which can be saved and
+restarted later. The agent can redefine its own functions while it runs.</p>
+
+<p>Its self-modification works in two tiers: explore, then commit. <code>self.eval</code>
+and <code>self.redefine</code> install a change live and journal it with an undo action, and
+<code>self.exercise</code> records evidence that it works. <code>self.commit</code> then
+<em>replays the changes in a clean process</em> to check that key functions survived,
+commits them to a private git history, and makes that the startup state.</p>
+
+<pre><code>(defun self-install-definition
+    (configuration source &amp;key (package (find-package '#:autolith)))
+  "Compile and install one exploratory SOURCE definition in PACKAGE."
+  (with-live-mutation
+    (let ((definition   (self-read-form source
+                                        :read-eval nil
+                                        :package   package))
+          (package-name (package-name package)))
+      (unless (definition-form-p definition)
+        (error 'source-mutation-error
+               :message   "self.redefine accepts one complete supported definition."
+               :tool-name "self.redefine"
+               :pathname  nil))</code></pre>
+<span class="src">autolith/src/self/tools.lisp:720-732</span>
+
+<p>Notice <code>:read-eval nil</code>. The Lisp reader can normally run code while it is
+<em>parsing</em> text, and this option turns that off, so the source stays plain data until
+autolith decides to install it.</p>
+
+<p>autolith has more safety nets. At startup, a replayed change whose original source has
+since moved is skipped and reported, so an old patch never hides newer code.
+<em>Generations</em> are full image checkpoints, made by forking the process and saving
+it. And if the active image is broken, the launcher boots a separately built
+<em>recovery image</em>, a pristine copy of the agent that can repair the broken one from
+outside.</p>
+
+<h3>samizdat: the agent loop as data</h3>
+
+<p><a href="https://github.com/yogthos/samizdat">samizdat</a> is "a self-hosting agentic
+harness for Clojure development". It runs on Jolt, a Clojure implementation hosted on
+Chez Scheme. It is cmh's most direct ancestor (see "What cmh borrowed" below).</p>
+
+<p>samizdat has three rings. The kernel (journal, event bus, store, secrets) cannot be
+changed by the agent. The <em>executor</em> is the agent loop, written as an EDN manifest.
+EDN is Clojure's data notation, much like JSON with more types. The loop is a graph of
+<em>cells</em> (steps) and <em>edges</em> (what runs next). The outer ring holds
+capabilities such as the REPL, the language server and the shell.</p>
+
+<p>Because the loop is data, the agent can edit it, so the manifest also carries
+<em>invariants</em> that the kernel checks:</p>
+
+<pre><code> :edges {:route  {:continue  :start
+                  :done      :distil
+                  :abandoned :distil
+                  :exhausted :distil}
+         :distil :revisit
+         :revisit :finish
+         :finish :end}
+
+ :invariants
+ [{:type :must-precede :cell :distil :before :finish :enforced true
+   :protects "A task that ended wrote down what it learned about the project
+              before the branch closed. Asking the model to remember things
+              produced nothing across 46 turns of live runs; a step in the
+              graph runs whether or not it feels like it, and putting it before
+              :finish is what stops a future edit routing an ending around it."}]}</code></pre>
+<span class="src">samizdat/resources/manifests/loop.edn:25-39</span>
+
+<p>Every ending, including giving up, routes through <code>:distil</code>, the reflection
+step, and the invariant stops any loop edit from skipping it.</p>
+
+<p>samizdat's gate, in <code>mutation.clj</code>, is the longest in the set: checkpoint,
+reload, validate, soak (a dry run with a 10-second timeout), live probes of each changed
+definition, a test battery, then commit or rollback. A rollback restores the registry and
+the file, and journals the bad edit as a negative constraint. A separate held-out gate
+(<code>heldout.clj</code>) replays a frozen battery against the current and the candidate
+userspace, each in its own child process. It is <em>non-compensatory</em>: a candidate
+fails if any target that passed before now fails, however much it improves elsewhere. It
+deliberately <em>accepts ties</em>, so neutral edits get through.</p>
+
+<h3>jiti: caller-owned acceptance</h3>
+
+<p><a href="https://github.com/ghuntley/jiti">jiti</a> ("grow a running Lisp application by
+talking to it") is a Common Lisp kernel of about 2.1k lines. Rather than editing files,
+chat develops a live <em>application</em>, a catalogue of functions plus managed
+state, while the kernel stays fixed. Tools like <code>develop_form</code> (add, redefine or
+remove a function) and <code>execute_form</code> share one evaluator and one transaction
+engine.</p>
+
+<p>Its key idea is that the agent does not decide whether its own work is acceptable. The
+caller supplies <em>goals</em> (has the capability been achieved?) and <em>safety
+invariants</em> (is this state acceptable?). Every attempt starts from a checkpoint:</p>
+
+<pre><code>               (let ((results (check-predicates (session-invariants s))))
+                 (emit s :invariants :results results)
+                 (unless (all-pass-p results) (throw 'abort-attempt :unsafe)))
+               (handler-case (setf changed (not (equalp before (capture-managed-state w))))
+                 (error () (throw 'abort-attempt :state-capture-failed)))
+               (setf (getf (session-outcome s) :changed) changed)
+               (when preview (throw 'abort-attempt :preview))
+               (when (and changed (session-store s))
+                 (handler-case (publish-revision s)
+                   (publication-error (c)
+                     (if (publication-uncertain-p c) (error c)
+                         (throw 'abort-attempt :publication-failed)))))
+               :accepted))))</code></pre>
+<span class="src">jiti/src/kernel.lisp:305-317</span>
+
+<p>A failed invariant aborts the attempt, and the world is restored from the checkpoint
+(line 323). Otherwise a changed world is published as a durable revision. As the README
+puts it, "Model-generated implementation or a completion message cannot replace the
+acceptance contract."</p>
+
+<p>jiti also uses Common Lisp <em>restarts</em>: a failing call pauses instead of
+unwinding and survives across prompts in a persistent worker thread, so the model can fix
+the function and resume <em>inside the original failing call</em>.</p>
+
+<h3>cl-sm-harness: reload yourself, then prove it</h3>
+
+<p><a href="https://github.com/browep/cl-sm-harness">cl-sm-harness</a> is "a self-improving
+agent harness for Claude Code, written in Common Lisp". It drives the <code>claude</code>
+CLI as a subprocess and gives it the harness's own tools through an in-process MCP server.
+The agent edits the harness's <code>.lisp</code> files with <code>write_file</code>, then
+calls <code>reload_harness</code>, which reloads the whole system into the running process:</p>
+
+<pre><code>          (asdf/session:call-with-asdf-session
+           (lambda () (asdf:load-system *reload-harness-system* :force force))
+           :override t :override-cache t))</code></pre>
+<span class="src">cl-sm-harness/harness/sm-harness/src/tool-catalog.lisp:872-874</span>
+
+<p>This works because tool handlers are stored as <em>symbols</em> (names), not function
+objects, so the next call finds the new definition: the same late binding cmh uses
+(chapter 2). After a successful reload the harness sends an automatic follow-up turn
+telling the model to "call it now to verify it works", at most 3 in a row.</p>
+
+<div class="warn">cl-sm-harness has no automatic rollback. Its own reload error message
+warns that an incompatible struct or class redefinition can leave the image "permanently
+unable to reload that type again ... until the container is restarted". Recovery is git
+plus a container restart (our inference).</div>
+
+<h3>oh-my-lisp: every step is a var</h3>
+
+<p><a href="https://github.com/sm-th/oh-my-lisp">oh-my-lisp</a> (oml) is "a minimal coding
+agent in Clojure (babashka) that you change while it runs", a teaching project of about
+1.5k lines. Every loop step (<code>system-prompt</code>, <code>call-model</code>,
+<code>execute-tool</code> and so on) is a public function called through its
+<em>var</em>, Clojure's named, mutable slot, so replacing what the var holds changes the
+next call. The catch is that the <em>user</em> does the modifying, with <code>defn</code> or
+Emacs-style <code>advise!</code> (which wraps a function in place) from an init file,
+<code>/eval</code> or a REPL. The model has only <code>read</code>, <code>write</code>,
+<code>edit</code> and <code>bash</code>, and there is no safety layer.</p>
+
+<h3>fractal-engine: a sandboxed REPL with immutable history</h3>
+
+<p><a href="https://github.com/DeadMeme5441/fractal-engine">fractal-engine</a> is "a
+recursive language-model compute engine": a model drives a persistent Clojure REPL and can
+spawn child sessions. The engine is fixed, but two ideas matter. First, model code runs in
+SCI (the Small Clojure Interpreter) under a <em>capability profile</em> that denies
+everything by default. The strictest, <code>locked-down</code>, denies file reads and
+writes, shell and network, and grants five core namespaces
+(<code>src/fractal/engine/capability.clj</code>). The gated I/O functions are injected into
+<code>clojure.core</code> itself, so switching namespace with <code>in-ns</code> cannot
+escape them. Second, every turn publishes an immutable <em>head</em> (a saved state); an
+aborted turn leaves a "wreckage" head that can be inspected or forked but is never resumed
+from.</p>
+
+<h3>The rest, briefly</h3>
+
+<p><a href="https://github.com/1hachem/lisptc">lisptc</a> hosts its own Lisp dialect in
+TypeScript. The model has <em>no tools</em>: its whole reply goes to a persistent Lisp REPL,
+so functions it defines stay live and its vocabulary grows. The image can be snapshotted
+as JSON, and memories can carry a replayable form and an event trigger. There is no gate on
+a definition (our inference).</p>
+
+<p><a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a> is built on
+Cordis, where "everything is a plugin" and plugins hot-reload. In <em>Creator mode</em> the
+agent writes and installs a plugin bundle, and its tools appear in the running session. A
+failed install restores <code>package.json</code> and the lockfile. Its SAFETY.md says it has not
+had a security audit and must not be treated as secure.</p>
+
+<p><a href="https://github.com/exoharness/exo">exo</a> is an agent runtime in Rust and
+TypeScript. Its <code>examples/self-improving-agent</code> mounts exo's own source in the
+agent's sandbox and gives it <code>rebuild_and_restart_exo</code>, which builds and
+restarts the host. The sandbox can be rewound, but we found no rollback of code.</p>
+
+<p>Three projects do not self-modify at all. <a href="https://github.com/golemcloud/golem">golem</a>
+runs WebAssembly components as durable workers, and it can update a running worker to a new
+version by replaying its operation log and failing on divergence.
+<a href="https://github.com/humanlayer/fold">fold</a> records model and prompt changes as
+"epochs" in an event log. <a href="https://github.com/vercel-labs/fx">fx</a> is a Zig binary
+whose tool registry is fixed at compile time, which shows what a truly minimal kernel looks like.</p>
+
+<h2>Side by side</h2>
+
+<table>
+<tr><th>Project</th><th>Language</th><th>What the agent changes</th><th>How it goes live</th><th>Safety and rollback</th></tr>
+<tr><td>autolith</td><td>Common Lisp (SBCL)</td><td>its own definitions and state</td><td><code>self.redefine</code> in the live image; <code>self.commit</code> persists</td><td>journal with undo, clean-process replay probe, private git history, generations, pristine recovery image</td></tr>
+<tr><td>samizdat</td><td>Clojure on Jolt (Chez)</td><td>loop manifest, cells, policies</td><td>edit, then reload the registry</td><td>checkpoint → validate → soak → probes → battery → commit or rollback; held-out battery; loop invariants</td></tr>
+<tr><td>jiti</td><td>Common Lisp (SBCL)</td><td>an application, not the kernel</td><td><code>develop_form</code> in one persistent worker</td><td>checkpoint per attempt, caller-owned goals and invariants, revisions</td></tr>
+<tr><td>cl-sm-harness</td><td>Common Lisp (SBCL)</td><td>its own source files</td><td><code>reload_harness</code> (ASDF reload), symbols looked up per call</td><td>git only; follow-up cap of 3; refuses to kill its own process</td></tr>
+<tr><td>oh-my-lisp</td><td>Clojure (babashka)</td><td>any loop step (by the user)</td><td><code>defn</code>, <code>advise!</code>, <code>/eval</code>, nREPL</td><td>none beyond <code>unadvise!</code></td></tr>
+<tr><td>fractal-engine</td><td>Clojure (SCI)</td><td>session vars only</td><td>REPL in a persistent session</td><td>deny-by-default capabilities; immutable and wreckage heads</td></tr>
+<tr><td>lisptc</td><td>TypeScript hosting a Lisp</td><td>its REPL image and memories</td><td>model output is evaluated as Lisp</td><td>image snapshot; revise window for memories</td></tr>
+<tr><td>deepseek-harness</td><td>TypeScript (Cordis)</td><td>plugin bundles</td><td>install plus hot reload</td><td>restore manifest and lockfile on failed install; approval for builds</td></tr>
+<tr><td>exo (example)</td><td>Rust + TypeScript</td><td>its own source</td><td>rebuild and restart</td><td>sandbox snapshot and rewind; no code rollback seen</td></tr>
+<tr><td>golem</td><td>Rust (+WASM)</td><td>nothing (platform)</td><td>versioned component update</td><td>workers keep the old version until updated</td></tr>
+<tr><td>fold</td><td>TypeScript (Effect)</td><td>nothing</td><td>n/a</td><td>event-log resume, epochs</td></tr>
+<tr><td>fx</td><td>Zig</td><td>nothing</td><td>compile-time registries</td><td>n/a</td></tr>
+</table>
+
+<p>Three ideas recur: late binding through names, so a redefinition reaches the running
+loop; journaling every attempt but keeping only what survived; and recovering a broken self
+from a pristine image, a snapshot or a rewound sandbox. By our rough ranking, samizdat and autolith have the
+strongest safety, and oml and lisptc the weakest.</p>
+
+<h2>What cmh borrowed, and what it could still borrow</h2>
+
+<h3>Already borrowed</h3>
+
+<p><code>SPEC.md</code> names samizdat, Prime Agent (chapter 3), autolith and oh-my-lisp as
+sources. Links marked "inferred" are our reading, not stated in the spec.</p>
+
+<table>
+<tr><th>cmh feature</th><th>Source</th><th>Difference</th></tr>
+<tr><td>Three rings: fixed kernel, versioned userspace, durable knowledge</td><td>samizdat</td><td>cmh's third ring is knowledge, not capabilities</td></tr>
+<tr><td><code>propose_def</code> gate: validate, trial, soak, keep or revert</td><td>samizdat <code>mutation.clj</code></td><td>cmh soaks over real uses; samizdat soaks with a dry run, then probes and a battery</td></tr>
+<tr><td>Verdicts kept as knowledge and shown to the model</td><td>samizdat (bad edits journaled as negative constraints)</td><td></td></tr>
+<tr><td>Userspace resolved by name on every call</td><td>autolith, oh-my-lisp (cl-sm-harness does the same, uncited)</td><td></td></tr>
+<tr><td>Append-only <code>journal.jsonl</code>, state rebuilt by replay</td><td>samizdat's journal and resume-by-replay; autolith's mutation journal</td><td></td></tr>
+<tr><td>Immutable base prompt that hooks cannot remove</td><td>Prime Agent</td><td></td></tr>
+<tr><td>WASM kernel images with trial and keep; Forth and WASM image rollback; Roc's fork-per-call wall</td><td>autolith generations, recovery image and isolated workers; lisptc snapshots; golem-style versions (all inferred)</td><td><code>propose_kernel</code> is cmh's closest match to <code>self.commit</code></td></tr>
+</table>
+
+<h3>Could still borrow</h3>
+
+<p>Most items below fill a gap that <code>ROADMAP.md</code> already names.</p>
+
+<ol>
+<li><strong>The agent loop as data, with invariants</strong> (ROADMAP §4, experiment 6).
+Today the agent cannot change its own loop. samizdat's manifest shows how: loop steps as hooks, with
+kernel-checked ordering rules such as "reflect before finish".</li>
+<li><strong>A non-compensatory held-out battery</strong> (ROADMAP "fitness-based
+keeping"). cmh's <code>--provider mock --script</code> could replay recorded tasks against
+the current and candidate userspace, as samizdat's <code>heldout.clj</code> does.</li>
+<li><strong>Caller-owned acceptance checks</strong> (ROADMAP: "Task success is
+self-reported"). jiti-style goals would let a task carry an external verifier.</li>
+<li><strong>A pristine recovery mode</strong> (ROADMAP §1): boot the seed kernel with an
+empty userspace to diagnose a journal that replays into a broken state, as autolith's
+recovery image does.</li>
+<li><strong>Reflection on every ending.</strong> ROADMAP suggests reflecting only on
+failure or novelty. samizdat argues for reflecting on every ending, abandoned runs most of
+all. That disagreement is worth an A/B test.</li>
+<li><strong>Capability profiles</strong> (ROADMAP §1, sandboxed bash). fractal-engine's
+deny-by-default profile, and its point that gating must survive <code>in-ns</code>, apply
+directly to the Clojure flavor, where SCI could replace raw <code>load-string</code>.</li>
+<li><strong>A verification nudge after a change</strong>, like cl-sm-harness's follow-up
+turn. cmh's soak counts uses but never asks for them, and a nudge could shorten trials.</li>
+</ol>
+
+<p>Smaller ideas would also fit: autolith's stale-override detection, lisptc's triggered
+memories as input to cmh's scored lessons (ROADMAP §6), and golem's update modes for
+cmh-wasm kernel images whose state format changes.</p>
+
+<h2>Code mode and tool search</h2>
+
+<p>A harness normally sends the model every tool's name, description and input schema on
+<em>every</em> request. cmh does exactly this:
+<code>SPEC.md</code> says "Userspace tools are added to the tool list on every model
+request, rebuilt from the live registry each time."</p>
+
+<p>That is fine with nine kernel tools and a few userspace ones. Now imagine an agent that
+has kept two hundred small tools. All their schemas sit in the context on every turn, though
+a task needs three. Chaining is slow too: with ten tool calls, every result flows back
+through the model before the next call. Mainstream coding agents have converged on two
+answers.</p>
+
+<h3>Tool search: deferred tools</h3>
+
+<p><em>Tool search</em> keeps most definitions out of the context. A <em>deferred</em> tool
+is not described up front. The model gets one always-present search tool instead, and when
+it searches, the harness loads the matching tools' schemas so it can call them.</p>
+
+<p>Anthropic shipped this as the <em>Tool Search Tool</em> in November 2025, with tools
+marked <code>defer_loading: true</code> and regex and BM25 search variants. BM25 is a
+classic keyword-ranking formula from search engines. Anthropic reported that tool search raised Opus 4 from 49% to 74% and Opus 4.5 from
+79.5% to 88.1% on its MCP evaluations, and recommends it from about 10 tools
+(<a href="https://www.anthropic.com/engineering/advanced-tool-use">"Introducing advanced tool use"</a>). Deferred tools
+also stay out of the cached prompt prefix, so the provider's prompt cache survives.</p>
+
+<p>Hermes Agent's docs show the shape most clearly. When tool search is on, the deferred
+tools are replaced by three bridge tools:</p>
+
+<pre><code>tool_search(queries, limit?)   search the deferred-tool catalog (one or more queries)
+tool_describe(names)           load the full schemas for one or more tools
+tool_call(calls)               invoke deferred tools; `calls` is an array of {name, arguments}</code></pre>
+<span class="src">hermes-agent/website/docs/user-guide/features/tool-search.md:36-38</span>
+
+<h3>Code mode: one tool that runs a program</h3>
+
+<p><em>Code mode</em> attacks chaining. The model gets one tool that runs code, the other
+tools appear as functions in an API, and the model's short program runs in a sandbox.
+Intermediate results stay inside the program, and only what it prints or returns reaches
+the model. Cloudflare introduced the idea in 2025. Anthropic's
+<a href="https://www.anthropic.com/engineering/code-execution-with-mcp">"Code execution with MCP"</a>
+(November 2025) cites Cloudflare's similar findings, with an example that cut 150,000 tokens
+to 2,000 (98.7%).
+Combined, the two give the arrangement below: tools are deferred, found by search, and
+called from inside a code-execution tool.</p>
+
+<div class="diagram">  model context                         harness
+  ┌──────────────────────────┐          ┌──────────────────────────────────┐
+  │ always loaded:           │          │ catalog (hundreds of tools,      │
+  │   tool_search            │──query──▶│ BM25 over names + descriptions)  │
+  │   code_exec              │◀─schemas─│                                  │
+  │   a few core tools       │          └──────────────────────────────────┘
+  │                          │          ┌──────────────────────────────────┐
+  │ model writes:            │          │ sandbox (V8, QuickJS-in-WASM,    │
+  │   const a = await t1(x)  │──code───▶│ interpreter, or subprocess)      │
+  │   const b = await t2(a)  │          │   t1 ─▶ host ─▶ result           │
+  │   text(summary(b))       │◀─output──│   t2 ─▶ host ─▶ result           │
+  └──────────────────────────┘          └──────────────────────────────────┘
+  only the search hits and the final output enter the context</div>
+
+<p>The sandbox has no powers of its own beyond the functions the host injects. Pi's
+package says it in one sentence:</p>
+
+<pre><code>Runs model-written JavaScript in a QuickJS VM (compiled to WebAssembly) where the only capability is calling injected tools. Nested tool calls never enter the LLM context; only the script's output and return value do.</code></pre>
+<span class="src">pi/packages/codemode/README.md:3</span>
+
+<h3>Who uses what</h3>
+
+<p>We searched local clones of seven mainstream harnesses, taken on 2026-10-29. "Not found"
+means our search did not find it, not that it cannot exist.</p>
+
+<table>
+<tr><th>Harness</th><th>Code mode</th><th>Tool search / deferred tools</th></tr>
+<tr><td>OpenCode</td><td><strong>Yes.</strong> <code>packages/codemode</code>, a pure interpreter for a JavaScript-like language; its docs say "Code Mode is the default" for MCP servers</td><td><strong>Inside code mode.</strong> A built-in <code>search(...)</code> returns matching tool paths with their signatures (a weighted word and substring score, not BM25)</td></tr>
+<tr><td>Codex</td><td><strong>Yes.</strong> <code>code-mode</code> crates; the runtime embeds V8 with its sandbox enabled</td><td><strong>Yes.</strong> <code>tool_search.rs</code>, BM25 via the <code>bm25</code> crate</td></tr>
+<tr><td>Pi</td><td><strong>Yes.</strong> <code>pi-codemode</code>, QuickJS compiled to WASM; worker-thread, Cloudflare Durable Object and inline sandboxes</td><td><strong>Yes.</strong> <code>tool_search</code> extension, BM25-ranked, registered inactive until enabled</td></tr>
+<tr><td>Hermes Agent</td><td><strong>Equivalent.</strong> "Programmatic Tool Calling": the model writes a Python script that calls Hermes tools over RPC; only stdout returns</td><td><strong>Yes.</strong> Opt-in; MCP and plugin tools behind three bridge tools, core tools stay loaded</td></tr>
+<tr><td>MiMo Code</td><td><strong>Yes.</strong> An <code>exec</code> tool runs JavaScript against a <code>tools</code> global in QuickJS compiled to WASM; on by default for GPT-family models</td><td><strong>Yes.</strong> <code>mcp_tool_search</code>, BM25-ranked; its spec says it "follows Claude Code's deferred tools + Tool Search"</td></tr>
+<tr><td>Deep Agents</td><td><strong>Opt-in.</strong> The <code>langchain-quickjs</code> partner package adds a QuickJS JavaScript REPL tool; when enabled, agent tools are callable as <code>await tools.&lt;name&gt;(...)</code></td><td><strong>Yes</strong>, provider-native, via LangChain's <code>ProviderToolSearchMiddleware</code></td></tr>
+<tr><td>Grok Build</td><td>Not found</td><td><strong>Yes.</strong> <code>search_tool</code>, "discover MCP tools via BM25 keyword search"</td></tr>
+</table>
+
+<p>Prime Agent (chapter 3), not one of the seven, does both its own way: its only tool is a
+persistent Python REPL, and inside it <code>mcp.search_tools</code> finds MCP tools by an
+unranked, case-insensitive substring test on name and description.</p>
+
+<p>Some patterns stand out. BM25 is the usual search backend (Codex, Pi, Hermes, MiMo, Grok
+Build, Anthropic's server tool). Code-mode sandboxes vary: V8 in Codex, QuickJS compiled to WebAssembly in Pi
+and MiMo, natively embedded QuickJS in Deep Agents' partner package, a custom interpreter in
+OpenCode, a Python subprocess in Hermes. Hermes and MiMo keep core tools loaded and defer
+mainly MCP and plugin tools. MiMo's spec shows the
+care the details need: its <code>auto</code> mode defers only once MCP definitions exceed
+10% of the context window, and the catalog arrives in <code>&lt;system-reminder&gt;</code>
+deltas so the tool definitions stay byte-stable for the prefix cache.</p>
+
+<h3>Why this matters for an agent that writes its own tools</h3>
+
+<p>The cmh flavors grow their tool lists, and ROADMAP notes that the agent "cannot
+change ... how tools are chosen". Today the answer is "all of them, every time". That is the
+long tail tool search was built for, with three twists.</p>
+
+<ul>
+<li><strong>The tools are numerous and narrow.</strong> A self-made tool often serves one
+chore, such as one file format or one project's tests, so most are irrelevant to any given
+task.</li>
+<li><strong>The list changes during a run.</strong> Each accepted <code>propose_def</code>
+can add or change a tool mid-conversation. If that rewrites the tool list at the top of the
+request, it also breaks the prompt cache. MiMo's stable search tool plus catalog deltas fits
+a self-editing agent well.</li>
+<li><strong>The agent writes the descriptions.</strong> With tool search, the description is
+how a tool gets found, so a gate could check it: a trial could fail if the tool does not
+come up when searched for its own task.</li>
+</ul>
+
+<p>Code mode matters for another reason: it changes what a good tool looks like. If the
+model can write a short program that calls <code>parse_log</code>, filters the result and
+passes it to <code>summarize_failures</code>, then small tools that compose are worth more
+than big all-in-one ones. The userspace becomes a library rather than a menu. That is
+Voyager's idea of skills as code that compose (chapter 1), applied to tools.</p>
+
+<p>Code mode is also a sandboxing decision, the one this book keeps making. Pi's guest
+code can only call injected functions, just as in the Forth and WASM flavors (chapters 8
+and 9) and Roc's platform (chapter 10): the guest computes, and the host decides which
+effects exist. A cmh flavor with deferred tools and code execution would need few new
+parts: the registry is already a catalog with names, descriptions and scores, and several
+flavors have a sandboxed evaluator.</p>
+
+<div class="note">No cmh flavor implements tool search or code mode today. This is a
+direction suggested by the survey, not a measured result; ROADMAP's tool-reuse suite
+(experiment 1) would be the place to measure it.</div>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>autolith and samizdat are the most complete self-modifiers: both journal every
+attempt, gate changes and can recover. cmh's gate and three rings come mostly from
+samizdat.</li>
+<li>Late binding through names is the shared trick. Holding a function object instead of a
+name freezes the old code.</li>
+<li>The strongest designs take judgment away from the model: samizdat's non-compensatory
+held-out battery and mandatory reflection step, jiti's caller-owned invariants.</li>
+<li>cmh's clearest next borrowings, such as loop as data and a held-out replay battery,
+mostly fill gaps ROADMAP already lists.</li>
+<li>Tool search (deferred tools found by search, usually BM25) and code mode (one tool that
+runs a sandboxed program calling the others) are now common: Codex, Pi, Hermes, MiMo and
+(opt-in) Deep Agents have both, and OpenCode has a search function inside its code mode.</li>
+<li>An agent that keeps writing tools will hit the long tail these mechanisms solve. Code
+mode also rewards small composable tools and uses the same "only injected capabilities"
+wall as the WASM-based flavors.</li>
+</ul>
+</main>
+<footer class="nav"><a href="11-evals.html">← Measuring it: the eval suite and the results</a><a href="index.html">Contents</a><a href="13-lessons.html">What we learned and what comes next →</a></footer>
+</body></html>

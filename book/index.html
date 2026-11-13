@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness Engineering: building agents that rewrite themselves</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Contents</header>
+<main>
+<h1>Harness Engineering</h1>
+<p class="subtitle">Building agents that rewrite themselves: one design, seven flavors, and what the evals said</p>
+
+<p>A coding agent is a language model plus a <em>harness</em>: the program around the model
+that sends it a prompt, gives it tools such as <code>bash</code> and <code>read_file</code>,
+runs the tools it asks for, and feeds the results back. Most harnesses are fixed. The people
+who wrote them decide which tools exist and how the prompt is built, and the agent works
+inside that frame.</p>
+
+<p>This book is about harnesses where the agent can change the frame. The project behind it is
+called <strong>cmh</strong>, short for "continual, self-modifying harness". Its roadmap
+states the goal in one sentence:</p>
+
+<blockquote><p>"a substrate the agent can program itself on, which never crashes from the
+agent's code, answers every mistake with precise feedback, enforces clear rules, and keeps
+only the changes that make the agent better."</p></blockquote>
+<span class="src">ROADMAP.md:8-11</span>
+
+<p>In practice that means the agent can write new tools for itself, add notes to its own
+prompt, and replace the small functions that assemble that prompt, all while it is working
+on a task. It cannot simply overwrite itself, though. Every change goes through a gate:
+it is tested in a scratch copy first, then goes live as a <em>trial</em>, and is kept only
+if its next few uses succeed. A change that fails is reverted, and the reason is written
+down so the agent does not try the same bad idea again. Lessons the agent learns are scored
+by whether the tasks that used them succeeded, and they carry over to the next run.</p>
+
+<div class="diagram">  agent proposes a change
+          |
+          v
+  +----------------+   fails    +-----------+
+  |   validate     |----------->| rejected  |  live version unchanged,
+  | (scratch copy, |            +-----------+  model sees the error
+  |  tests run)    |
+  +----------------+
+          | passes
+          v
+  +----------------+  any error  +-----------+
+  | trial: live,   |------------>| reverted  |  previous version back,
+  | next 3 uses    |             +-----------+  verdict recorded
+  | are watched    |
+  +----------------+
+          | 3 clean uses
+          v
+      +--------+
+      |  kept  |  verdict recorded
+      +--------+</div>
+
+<p>The design is written down once, in <code>SPEC.md</code>, and then built again and again in
+different languages. Each build is called a <em>flavor</em>. The repository has seven flavors
+and one prototype: Clojure, Racket, Rust, Lean 4, a small Forth running inside WebAssembly, a
+version where the entire harness runs inside WebAssembly and can rewrite its own kernel, and
+Roc on a Zig host. All of them share the same command line, so one eval runner can drive
+every one of them, and all of them except Roc have recorded eval results against a published
+self-improving harness, Prime Agent from Prime Intellect.</p>
+
+<p>Why build the same thing seven times? Because the hard parts of a self-modifying harness
+are not in the agent loop. They are in questions the language answers for you, or does not:
+can new code be loaded into a running program? Can a bad definition crash the host? Can an
+infinite loop be stopped? Can the error that comes back say precisely what went wrong? Each
+language gives a different answer, and comparing them is the most direct way to see which
+answers matter.</p>
+
+<div class="note"><p><strong>The short version of the results.</strong> Every flavor in
+the committed results files (Clojure, Racket, Rust, Lean, Forth) met the project's pass bar
+(80% of Prime Agent's score). In a later isolated, one-trial run on the reuse suites, Prime
+Agent and Racket scored 32/32, while Lean (24/32), Forth (25/32) and WASM (25/32) fell below
+the bar. Two of Forth's failures were caused by the orb pausing, and excusing them lifts Forth
+over the bar; Lean and WASM stay below it, because their paused episodes passed.
+The ROADMAP's reading is that most of the
+score came from the shared design (lessons, reflection after each task, the gate), not from
+the agents rewriting themselves: across about 60 episodes per flavor, agents proposed only 5
+to 78 changes, and almost every task could be solved with <code>bash</code> alone.
+Chapter 11 goes through the numbers, including how noisy they are.</p></div>
+
+<h2>Who this book is for</h2>
+
+<p>You are a programmer who knows at least one mainstream language, say Python, JavaScript,
+Java or Go. You have probably used a coding agent, and you may have wondered how one could be
+made to improve itself without breaking. You do not need to know Lisp, Lean, Forth,
+WebAssembly, Roc or Zig. Each idea from those worlds is explained in plain words the first
+time it comes up: what <code>eval</code> is, what "late binding" means, what a sandbox
+evaluator does, what a theorem prover checks, what WebAssembly "fuel" is, why a pure
+language cannot read a file by itself.</p>
+
+<p>You also do not need to have followed the project. The book reconstructs it from the
+repository: the spec, the code, the eval results and the git history. Every code excerpt is
+copied from the repository and labelled with its file and line numbers, so you can check it.
+Every number (test counts, line counts, eval scores) comes from the code or from the
+committed results.</p>
+
+<h2>How to read it</h2>
+
+<ul>
+<li><strong>Read chapters 1 and 2 first.</strong> Chapter 1 explains the goal and why the
+choice of language matters. Chapter 2 explains the shared design in <code>SPEC.md</code>:
+the kernel, userspace and knowledge rings, the gate, lessons, the journal. Every later
+chapter assumes it.</li>
+<li><strong>Chapter 3 is the yardstick.</strong> Prime Agent is the harness every flavor was
+compared with. It takes a different route (one persistent Python REPL as the model's main
+tool) and is worth knowing before the flavors.</li>
+<li><strong>Chapters 4 to 10 can be read in any order.</strong> Each covers one flavor: how
+agent code is loaded, what wall keeps it from hurting the harness, how the gate works in that
+language, what its tests check, and where it falls short. They are roughly in the order they
+were built, and the safety wall ranges from no sandbox at all (Clojure) to the whole harness
+inside WebAssembly (chapter 9).</li>
+<li><strong>Chapter 11 is the evidence.</strong> If you only care whether this works, read
+it after chapter 2.</li>
+<li><strong>Chapters 12 and 13 step back.</strong> Chapter 12 looks at other self-modifying
+harnesses and at "code mode" and tool search in other agents. Chapter 13 compares the
+flavors side by side and lists what is still open.</li>
+</ul>
+
+<p>Code blocks are short excerpts, not complete files. Boxes like the one above are asides;
+amber boxes are caveats you should not skip.</p>
+
+<div class="warn"><p><strong>The documents drift.</strong> <code>SPEC.md</code> says "four
+implementations" and the top-level README says "five", because both were written before the
+later flavors existed and were never renumbered. The repository has seven flavors plus a
+prototype. Where a document and the code disagree, this book follows the code.</p></div>
+
+<h2>Contents</h2>
+
+<nav class="toc">
+<ol start="0">
+<li><a href="index.html">Cover and contents</a>
+<span class="desc">This page: what the book is, how to read it, and a table of every harness.</span></li>
+<li><a href="01-the-idea.html">The idea: a substrate an agent can program itself on</a>
+<span class="desc">The goal, back pressure, rules the agent cannot break, why the language matters, and the research the design borrows from (Gödel Machine, Reflexion, Voyager, ADAS, DGM, SICA and others).</span></li>
+<li><a href="02-shared-design.html">The shared design: SPEC.md</a>
+<span class="desc">Kernel, userspace and knowledge; tools, notes and hooks; the validate, trial and soak gate; verdicts, scored lessons and reflection; the journal and replay; the CLI and the eight required tests.</span></li>
+<li><a href="03-prime-agent.html">The reference: Prime Agent</a>
+<span class="desc">The published self-improving harness every flavor was measured against: a persistent Python REPL as the model's main tool, and a "continual harness" of prompt notes, memories and skills.</span></li>
+<li><a href="04-clojure.html">Clojure: eval into namespaces</a>
+<span class="desc">The simplest flavor: agent code is evaluated into a fresh namespace and looked up by name on every call. Fast and direct, with no sandbox at all.</span></li>
+<li><a href="05-racket.html">Racket: sandboxed evaluators</a>
+<span class="desc">The same idea behind a real wall: each definition lives in its own sandbox evaluator with time and memory limits, and only plain data crosses back.</span></li>
+<li><a href="06-rust.html">Rust: a compiled library per definition</a>
+<span class="desc">Every version is built by cargo into a shared library and hot-loaded, so the compiler is part of the gate, but native code runs inside the host process.</span></li>
+<li><a href="07-lean.html">Lean 4: proofs at the gate</a>
+<span class="desc">Definitions are elaborated inside the running harness, and any theorems in them must type-check before the change can go live.</span></li>
+<li><a href="08-forth.html">Forth in WebAssembly: a language built for the agent</a>
+<span class="desc">A small late-bound Forth inside Wasmtime with fuel, a memory cap and snapshot rollback; structured error reports; and the forth_eval scratchpad that cut rejected proposals to zero.</span></li>
+<li><a href="09-wasm.html">The whole harness in WebAssembly: the agent rewrites its own kernel</a>
+<span class="desc">The agent loop, gate and journal run as a sandboxed component under a thin host, and propose_kernel lets the agent replace the kernel itself behind the same gate.</span></li>
+<li><a href="10-roc.html">Roc on Zig: pure code and requests as data</a>
+<span class="desc">A pure, typed language where tools cannot do I/O; they return requests the host checks. Every call runs in a forked compiler session. Includes the roc-proto prototype.</span></li>
+<li><a href="11-evals.html">Measuring it: the eval suite and the results</a>
+<span class="desc">The coding, learning and reuse suites, the logging proxy, per-episode isolation, and what the runs against Prime Agent did and did not show.</span></li>
+<li><a href="12-other-harnesses.html">Other self-modifying harnesses we studied</a>
+<span class="desc">A survey of other projects that let agents change themselves, and how code mode and tool search work in OpenCode, Codex, Pi, Hermes, MiMo, Deep Agents and Grok Build.</span></li>
+<li><a href="13-lessons.html">What we learned and what comes next</a>
+<span class="desc">The flavors side by side, which language suits what, the project's timeline, the roadmap's open gaps and experiments, and the questions still unanswered.</span></li>
+</ol>
+</nav>
+
+<h2>Every harness at a glance</h2>
+
+<p>The table below is the map for chapters 3 to 10. "How agent code is loaded" is the
+mechanism that turns text the model wrote into something the running harness can call.
+"Safety wall" is what stands between that code and the harness: what happens if it loops
+forever, eats memory or crashes. "Tracked lines" counts every file under the directory in
+git (code, seeds, tests, READMEs, build files), excluding lockfiles, with the number of files
+in brackets.</p>
+
+<table>
+<thead><tr><th>Harness</th><th>Directory</th><th>Language / runtime</th><th>How agent code is loaded</th><th>Safety wall</th><th>Tracked lines (files)</th></tr></thead>
+<tbody>
+<tr><td>Prime Agent (reference)</td><td>not in this repo; installed as <code>~/.local/bin/prime-agent</code> (<code>prime</code> in <code>evals/harnesses.json</code>)</td><td>Rust host (ported from TypeScript) with a Python REPL kernel</td><td>the model runs Python in one persistent REPL; prompt notes, memories, skills and subagent specs are stored as durable state the agent refines</td><td>none by design: its README says the worker and kernel processes "are <strong>not</strong> a security sandbox"</td><td>about 617k lines of Rust including tests (not counting a vendored crossterm), plus about 13k lines of Python source and 19k of Python tests</td></tr>
+<tr><td>Clojure</td><td><code>clojure/</code></td><td>Clojure on JDK 27</td><td><code>load-string</code> into a scratch namespace for validation; the live version goes into its own namespace, and its var is looked up by name on every call</td><td>a timeout around each call (10 s to load and test, 30 s per call); no sandbox, and a runaway thread keeps running</td><td>1,427 (17)</td></tr>
+<tr><td>Racket</td><td><code>racket/</code></td><td>Racket 9 CS</td><td><code>eval</code> in a <code>racket/sandbox</code> evaluator, one cached per name (replaced when another version goes live), with a fresh evaluator for validation</td><td>sandbox limits of 10 s and 128 MB per evaluation, no file writes or network; only plain data crosses back, and result types are checked</td><td>1,676 (19)</td></tr>
+<tr><td>Rust</td><td><code>rust/</code></td><td>Rust</td><td>each version is generated as a crate, built by <code>cargo</code> into a shared library (cdylib) and loaded with <code>libloading</code>; JSON crosses a C ABI</td><td>the compiler at the gate; <code>catch_unwind</code> for panics and a worker thread with a timeout; but it is native code in the host process, so a segfault or abort kills the harness</td><td>2,355 (17)</td></tr>
+<tr><td>Lean 4</td><td><code>lean/</code></td><td>Lean 4 v4.35.0</td><td>source is wrapped in its own namespace, elaborated in-process, and the entry point is fetched with <code>evalConst</code>; any theorems must check</td><td>the type checker and proofs; banned tokens such as <code>sorry</code>, <code>axiom</code>, <code>unsafe</code> and <code>import</code>; <code>maxHeartbeats</code> 200000 and a 30 s limit; <code>panic!</code> is not caught</td><td>1,630 (18)</td></tr>
+<tr><td>Forth in WASM</td><td><code>forth/</code></td><td>the project's own late-bound Forth VM, written in Rust and compiled to WebAssembly, run by a Rust host in Wasmtime</td><td>Forth source is validated in a brand-new VM instance, then compiled into the live VM's dictionary; <code>forth_eval</code> is a scratchpad that runs code without proposing it</td><td>WebAssembly memory isolation; 100 million instructions of fuel per entry, a 5 s backstop and a 64 MB memory cap; traps become structured reports; memory snapshots roll back failures</td><td>5,059 (24)</td></tr>
+<tr><td>WASM, whole harness</td><td><code>wasm/</code></td><td>Rust guest compiled as a <code>wasm32-wasip2</code> component under a thin Rust/Wasmtime host</td><td>userspace runs in the guest's Forth VM, as in <code>forth/</code>; the kernel itself can be replaced with <code>propose_kernel</code>, which builds a new image, boots it in a scratch instance, self-tests and soaks it</td><td>the host trusts nothing: 20 s per stretch of guest code and 300 s per call, a 512 MB cap, and a crashed guest is replaced by a fresh instance that replays the journal; <code>bash</code> runs in a mount namespace with the state, <code>wasm/</code> and base prompt read-only</td><td>7,395 (37)</td></tr>
+<tr><td>Roc on Zig</td><td><code>roc/</code></td><td>pure Roc; a Zig host with the Roc compiler and interpreter built in (Roc pinned to <code>a5c6d8b</code>)</td><td>each call compiles the called definition plus the live definitions it references into a fresh program; <code>roc_eval</code> is a scratchpad</td><td>the parent process never runs agent code: every call, gate check and snippet runs in a <code>fork()</code> of a warm compiler, killed at a 10 s deadline; tools cannot do I/O, only return requests (<code>ReadFile</code>, <code>WriteFile</code>, <code>Bash</code> and others) the host checks</td><td>4,185 (19)</td></tr>
+<tr><td>Roc prototype</td><td><code>roc-proto/</code></td><td>Zig host inside a roc-lang/roc checkout, using its REPL session</td><td>definitions that type-check become live in one session; rejected ones leave the previous version in place</td><td>Roc's <code>crash</code> is caught; an optional fork per statement with <code>--timeout-ms</code>; effectful calls rejected, so I/O is requests as data</td><td>471 (6)</td></tr>
+</tbody>
+</table>
+
+<p>For comparison, the eval suite in <code>evals/</code> (a Python runner, a logging proxy,
+suites and checkers) is 2,396 lines in 76 files. Every cmh flavor runs from the same command
+line, <code>cmh [--state DIR] … run "TASK"</code>, and is wired into the evals through one
+entry in <code>evals/harnesses.json</code>.</p>
+
+<div class="note"><p>Line counts were taken with <code>git ls-files &lt;dir&gt; | xargs wc -l</code>
+at commit <code>7c715d6</code>, leaving out <code>Cargo.lock</code> and
+<code>lake-manifest.json</code>. They measure how much each flavor needed in total, not how
+much of it is kernel logic: the Forth and WASM numbers include a whole Forth VM, and the Roc
+number includes the host's glue to an embedded compiler.</p></div>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>cmh is one design, written down in <code>SPEC.md</code>, for a coding agent that rewrites
+its own tools, prompt notes and prompt-building hooks while it runs, and keeps a change only
+after it passes validation, a trial and a soak.</li>
+<li>The design was built as seven flavors plus a prototype, so that the language's answers
+to loading, isolation and error reporting could be compared directly.</li>
+<li>The safety wall ranges from none (Clojure) to the whole harness inside WebAssembly, where
+the agent can even replace its own kernel behind the same gate.</li>
+<li>The flavors kept up with Prime Agent in the committed runs, but by the ROADMAP's reading most of the gain came
+from lessons, reflection and the gate rather than from self-modification, and the results are
+noisy. Chapter 11 shows the numbers and their limits.</li>
+</ul>
+</main>
+<footer class="nav"><span></span><a href="index.html">Contents</a><a href="01-the-idea.html">The idea →</a></footer>
+</body></html>

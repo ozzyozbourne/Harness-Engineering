@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1. The idea: a substrate an agent can program itself on · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 1</header>
+<main>
+<h1>1. The idea: a substrate an agent can program itself on</h1>
+<p class="subtitle">What we were trying to build, why the choice of language matters, and where the idea comes from.</p>
+
+<h2>A coding agent that can change itself</h2>
+
+<p>A coding agent is a loop. A program sends a task to a language model, the model
+answers with text or with a request to call a tool (run a shell command, read a file,
+write a file), the program runs the tool and sends the result back, and this repeats
+until the model says it is done. The program around the model is called the
+<em>harness</em>. The harness decides which tools exist, what the system prompt says,
+what happens when a tool fails, and what is remembered between tasks.</p>
+
+<p>In most agents the harness is fixed. If the model keeps doing the same chore by
+hand, it will do it by hand again tomorrow, because nothing it learns can become a new
+tool.</p>
+
+<p>This book is about harnesses that the agent itself can extend while it runs. The
+project calls them <strong>cmh</strong>, short for "continual, self-modifying
+harness". The README puts the whole design in two sentences:</p>
+
+<blockquote>Each agent rewrites its own userspace (tools, prompt notes, and the hooks
+that assemble its prompt) while it runs. Each change passes a validate, trial, and
+soak gate before it is kept, and the harness carries lessons and verdicts across
+runs.</blockquote>
+<p><span class="src">README.md:7-10</span></p>
+
+<p>The same design was built seven times, in very different languages (plus a
+prototype), so the language could be compared while everything else stayed the same.</p>
+
+<h2>The goal in one sentence</h2>
+
+<p>The project's roadmap states the goal like this:</p>
+
+<blockquote>a substrate the agent can program itself on, which never crashes from the
+agent's code, answers every mistake with precise feedback, enforces clear rules, and
+keeps only the changes that make the agent better.</blockquote>
+<p><span class="src">ROADMAP.md:8-11</span></p>
+
+<p>A <em>substrate</em> is the ground the agent's code stands on: the runtime that
+loads it, runs it, checks it, and survives it. The sentence holds four properties,
+our yardsticks for every harness:</p>
+
+<table>
+<tr><th>Property</th><th>What it means in practice</th></tr>
+<tr><td><strong>Never crashes from agent code</strong></td><td>Agent-written code runs behind a wall: a sandbox, a WebAssembly instance, a forked child process, or a type checker. A bad definition may fail; the harness must not.</td></tr>
+<tr><td><strong>Precise feedback</strong></td><td>Every failure comes back to the model as data it can act on: what failed, which definition and version, on what input, why, and what to try next.</td></tr>
+<tr><td><strong>Clear rules</strong></td><td>Some things are not the agent's to change: the kernel, the base prompt, the journal. There is exactly one door for changing the rest.</td></tr>
+<tr><td><strong>Keep only what helps</strong></td><td>A change is tried, watched, and then kept or reverted. Verdicts and scored lessons carry over to later runs.</td></tr>
+</table>
+
+<p>The last property is not yet met. Today "helps" means "did not error during its
+first three uses"; in the roadmap's words, "changes are kept for not crashing, not for
+helping" (<span class="src">ROADMAP.md:76</span>).</p>
+
+<h2>Three rings: kernel, userspace, knowledge</h2>
+
+<p>Every harness in the book splits itself into three parts. The words are borrowed
+from operating systems, where the <em>kernel</em> is the protected core and
+<em>userspace</em> is where ordinary programs run.</p>
+
+<div class="diagram"><pre>
+ +-----------------------------------------------------------+
+ | KERNEL  (host code, immutable to the agent)               |
+ |   model client, agent loop, journal, gate, evaluator,     |
+ |   kernel tools: bash read_file write_file propose_def ... |
+ |                                                           |
+ |   +---------------------------------------------------+   |
+ |   | USERSPACE  (mutable, versioned, agent-written)    |   |
+ |   |   tools  (e.g. word_count)                        |   |
+ |   |   notes  (text appended to the system prompt)     |   |
+ |   |   hooks  (compose_system, select_lessons)         |   |
+ |   +---------------------------------------------------+   |
+ |                                                           |
+ |   KNOWLEDGE  (durable, scored by outcome)                 |
+ |     lessons, verdicts                                     |
+ +-----------------------------------------------------------+
+</pre></div>
+
+<p>The kernel is written by humans in the host language and the agent cannot write to
+it ("The agent can read it but no kernel tool writes it", <span class="src">SPEC.md:15-17</span>;
+the WASM harness in Chapter 9 is the deliberate exception).
+Userspace is named, versioned definitions in the harness's <em>eval language</em>,
+the language it can load and run at runtime. Knowledge is plain text: lessons, and
+verdicts on which changes were kept or reverted and why.</p>
+
+<p>The smallest userspace definition is the example tool every harness starts with,
+a word counter. In Clojure, a Lisp:</p>
+
+<pre>;; Tool: (run input) -&gt; string, input is a keyword-keyed map.
+(defn run [input]
+  (str (count (re-seq #"\S+" (str (:text input))))))</pre>
+<p><span class="src">clojure/seed/word_count.clj:1-3</span></p>
+
+
+<p>The contract is the same in every language: a tool takes one JSON object and
+returns a string. What differs is how the harness turns source text into something it
+can call, and what it can promise when the call goes wrong.</p>
+
+<h2>One door in: the gate</h2>
+
+<p>The agent changes userspace through a single kernel tool, <code>propose_def</code>.
+The spec calls it "the only way userspace changes" (<span class="src">SPEC.md:61</span>).
+A proposal carries the source, a description and some tests, and it goes through four
+steps:</p>
+
+<div class="diagram"><pre>
+ propose_def(name, source, tests)
+        |
+        v
+  [1 VALIDATE]  in a scratch environment, never the live one:
+        |       does it load? right shape? do its tests pass?
+        |-- no --&gt; rejected; live version unchanged; error text to the model
+        v
+  [2 TRIAL]     goes live at once; previous version kept on the side
+        |
+        v
+  [3 SOAK]      the next 3 real uses are watched
+        |-- any error --&gt; reverted to previous version; verdict recorded
+        v
+  [4 KEEP]      status becomes "kept"; verdict recorded
+</pre></div>
+
+<p>The soak is the unusual step. An agent "can write a test that agrees with a wrong
+implementation" (<span class="src">ROADMAP.md:62-63</span>), so passing its own tests
+is not enough: the version must also survive real uses. Chapter 2 covers the gate in detail.</p>
+
+<h2>Late binding: why a change takes effect on the next call</h2>
+
+<p><em>Binding</em> is the moment a name in a program gets attached to the thing it
+refers to. In a compiled program, a call to <code>word_count</code> is usually fixed
+when the program is built. With <em>late binding</em>, the name is looked up again
+every time it is used. The spec requires it:</p>
+
+<blockquote>The kernel resolves every userspace definition <strong>by name at call
+time</strong> (late binding), so a newly installed version takes effect on the very
+next call without a restart.</blockquote>
+<p><span class="src">SPEC.md:19-21</span></p>
+
+<p>The kernel never holds on to a function; it
+asks the registry "what is live for this name?" each time, so installing or reverting
+a version just changes the answer.</p>
+
+<h2>Back pressure</h2>
+
+<p>In plumbing and in networking, <em>back pressure</em> is resistance that pushes back
+against a flow: a full queue tells the sender to slow down. The project uses the word
+for the way the harness pushes back on the agent's mistakes. A rejected proposal, a
+failing test, a timeout, a trap: each one is a signal, and the quality of that signal
+decides whether the next attempt is better.</p>
+
+<p>Weak back pressure is one of the main gaps the roadmap lists for the first
+harnesses: "feedback says 'it failed', rarely 'why' and 'what next'", and at the time
+only the Forth harness returned structured errors (<span class="src">ROADMAP.md:56-59</span>).</p>
+
+<p>Back pressure matters more for an agent than a person: the text that comes back
+from a failure is all the model learns. The roadmap reports that giving the Forth harness a scratchpad (a tool that runs code and shows
+the result without proposing it) "cut that flavor's rejected proposals from 69 to 0
+and its tokens from 7.8M to 3.7M" (<span class="src">ROADMAP.md:119-120</span>). The token
+figures match the two committed Forth results files (7,805,356 and 3,666,810); the
+rejection counts appear only in the roadmap, since raw logs are not kept in git.</p>
+
+<h2>The chess analogy</h2>
+
+
+
+<p>Think of a game of chess. The <strong>rules</strong> are the kernel: the same for
+every game, not written by the players, and no move can change them.</p>
+
+<p>The <strong>player's repertoire</strong> is userspace. A player tries a new
+opening, sees whether it holds up over a few games, and keeps or drops it: trial and
+soak. Their notebook of lessons is knowledge.</p>
+
+<p>The <strong>board and the referee</strong> are the wall and the back pressure. An
+illegal move is not a disaster: the referee says "illegal, your king is in check", the
+board stays as it was, and the player tries again. The game never crashes because of a
+bad move.</p>
+
+<div class="warn"><p>The analogy also names the main weakness of the first five
+harnesses. The kernel tool <code>write_file</code> refuses to touch the kernel or the
+journal, but the <code>bash</code> tool can edit anything, "including the kernel
+source, the journal and the eval checker's inputs. In chess terms, the agent can flip
+the board" (<span class="src">ROADMAP.md:37-40</span>). The WASM harness (Chapter 9) closes
+this hole by running <code>bash</code> where the state dir, the kernel source and the base
+prompt are read-only. Roc (Chapter 10) keeps agent code from doing I/O directly, but its
+README admits that its <code>Bash</code> request "can break every rule, as in the other
+flavors".</p></div>
+
+<h2>The immutable base prompt</h2>
+
+<p>The rules are also written down for the model in a short base prompt, the same in
+every harness, which the agent cannot edit. After describing the gate, it says
+(Chapter 2 shows it in full):</p>
+
+<pre>Make a userspace change when a capability would clearly help this or future
+tasks, such as a tool for something you keep doing by hand. Keep changes small
+and give every tool or hook real tests. Record durable, reusable insights with
+`remember`; do not record task-specific trivia.
+
+The kernel, this base prompt, and the journal are not yours to change.</pre>
+<p><span class="src">base-prompt.md:12-17</span></p>
+
+<p>The agent <em>can</em> rewrite the hook <code>compose_system</code>, which builds
+part of the system prompt, but it cannot delete the rules: the kernel always puts the base prompt in front of whatever the hook
+returns, "so a hook cannot remove it" (<span class="src">SPEC.md:46-48</span>).</p>
+
+<h2>Why the language matters</h2>
+
+<p>Why build the same design seven times? Because loading new code at runtime,
+stopping it when it loops forever, and keeping a crash from spreading are things a
+language and its runtime either help with or fight. Four ideas decide how much help
+you get.</p>
+
+<h3>Homoiconicity: code that is data</h3>
+
+<p>A language is <em>homoiconic</em> when its programs are written in the same form as
+one of its ordinary data structures. In Lisp, the code <code>(+ 1 2)</code> is also a
+list of three items. A program can build that list, inspect it, change it, and run it.
+The term comes from the TRAC language paper, which said that "because TRAC procedures
+and text have the same representation inside and outside the processor, the term
+homoiconic is applicable". A harness can then treat a new tool as a value it
+reads, stores and loads, not a file that needs a separate build.</p>
+
+<h3>eval: a compiler you can call at runtime</h3>
+
+<p><code>eval</code> is a function that takes code and runs it inside the running
+program. McCarthy's 1960 Lisp paper defined a universal <code>eval</code> written in
+Lisp itself, which is where the idea starts. Clojure's reference describes
+<code>(eval form)</code> as evaluating "the form <em>data structure</em> (not text!)".
+Rust has no <code>eval</code>, so the Rust harness runs <code>cargo</code> for every
+proposal and loads the result as a shared library (Chapter 6): "the Rust compiler is
+part of the gate" (<span class="src">SPEC.md:29</span>), but it is slower and less
+safe.</p>
+
+<p>Some languages make late binding the default. Forth looks words up in a
+<em>dictionary</em> that grows as you define new words. Forth's original manual puts
+it plainly: "The dictionary is a linked list of variable-length entries", and "FORTH
+provides the mechanism for searching the dictionary, executing words, and defining new
+words". Emacs works the same way; Stallman's paper even describes a human version of the
+soak: users try small changes and share them, and "if an idea becomes popular, it can
+be incorporated into the core system".</p>
+
+<h3>Sandboxes</h3>
+
+<p>A <em>sandbox</em> is a restricted place to run code: it can only touch what it is
+given, and it can be stopped from outside. This is the wall in "never crashes from the
+agent's code". Racket ships one, <code>racket/sandbox</code>, with a security guard for files and
+network plus time and memory limits, and the Racket harness uses it (Chapter 5).
+Clojure has none built in, so its harness can only time out a call while the thread
+keeps running:</p>
+
+<table>
+<tr><th></th><th>Clojure</th><th>Rust</th><th>Racket</th><th>Lean</th><th>Forth (WASM)</th></tr>
+<tr><td>Agent code can crash the harness</td><td>yes (no sandbox)</td><td>yes (in-process native code)</td><td>no (sandbox)</td><td>partly (<code>panic!</code> not caught)</td><td>no (WASM wall)</td></tr>
+<tr><td>Runaway loop is actually stopped</td><td>no (thread keeps running)</td><td>no (thread abandoned)</td><td>yes (sandbox limit)</td><td>no (thread keeps spinning)</td><td>yes (fuel)</td></tr>
+</table>
+<p><span class="src">ROADMAP.md:15-21</span></p>
+
+<p>The same design gets a real wall in only two of the five languages, and in both
+cases the wall comes from the runtime, not from the harness code.</p>
+
+<h3>From unikernels to WebAssembly</h3>
+
+<p>The strongest wall would put each generation of the agent in its own tiny virtual
+machine. A <em>unikernel</em> is exactly that: an application
+compiled together with only the operating-system parts it needs, into one
+single-purpose machine image. MirageOS showed this for OCaml applications, and
+Unikraft reported images of about 1 MB that boot in about a millisecond on top of the
+virtual machine monitor's own start-up. The roadmap
+lists a unikernel per generation as an experiment, but it needs hardware
+virtualization (KVM), which the project's machines lack.</p>
+
+<p>WebAssembly (WASM) is the practical stand-in. It is a portable, low-level bytecode
+designed so that "even untrusted modules can be safely executed in the same address
+space as other code". A WASM module can only touch its own block of
+memory and the functions the host hands it. The Wasmtime runtime adds two ways to stop
+runaway code: <em>fuel</em>, a counter that is spent as instructions run and traps at
+zero (deterministic, so the same program always stops at the same point), and
+<em>epochs</em>, a cheaper wall-clock deadline. Our argument (not a cited claim): a WASM
+component gets much of a unikernel's appeal (one artifact, a small explicit list of
+capabilities, fast start) inside an ordinary process, at the cost of isolation
+enforced in software rather than hardware.</p>
+
+<p>The Forth harness (Chapter 8) runs a small Forth built for the agent inside
+Wasmtime. The WASM harness (Chapter 9) moves the whole kernel into a WebAssembly
+component and lets the agent propose changes to the kernel itself.</p>
+
+<div class="note"><p>Two other harnesses explore different walls. Lean 4 (Chapter 7)
+is a programming language and a proof checker in one, so a tool can carry a
+<code>theorem</code> about itself and the type checker is part of the gate. Roc
+(Chapter 10) is a pure language: its code cannot do I/O at all, so tools return
+<em>requests</em> (read this file, run this command) as plain data, and the Zig host
+decides whether to carry them out.</p></div>
+
+<h2>Where the idea comes from</h2>
+
+<p>None of the parts are new. Here is the research line the design sits in.</p>
+
+<h3>Proof-gated self-rewriting</h3>
+<ul>
+<li>Jürgen Schmidhuber, "Goedel Machines: Self-Referential Universal Problem Solvers
+Making Provably Optimal Self-Improvements", 2003, <a href="https://arxiv.org/abs/cs/0309048">arXiv:cs/0309048</a>.
+A machine that may rewrite any part of itself, but only after finding a formal proof
+that the rewrite improves its utility. cmh swaps the proof for "passes tests, then survives a
+soak".</li>
+</ul>
+
+<h3>Benchmark-gated evolution of the agent</h3>
+<ul>
+<li>Eric Zelikman, Eliana Lorch, Lester Mackey, Adam Tauman Kalai, "Self-Taught
+Optimizer (STOP): Recursively Self-Improving Code Generation", 2023,
+<a href="https://arxiv.org/abs/2310.02304">arXiv:2310.02304</a>. A scaffold that
+calls the model is run on its own source code and improves itself. The paper also
+measures how often the generated code bypasses a sandbox.</li>
+<li>Shengran Hu, Cong Lu, Jeff Clune, "Automated Design of Agentic Systems" (ADAS),
+2024, <a href="https://arxiv.org/abs/2408.08435">arXiv:2408.08435</a>. A meta agent programs new agents in code.</li>
+<li>Jenny Zhang, Shengran Hu, Cong Lu, Robert Lange, Jeff Clune, "Darwin Gödel
+Machine: Open-Ended Evolution of Self-Improving Agents" (DGM), 2025,
+<a href="https://arxiv.org/abs/2505.22954">arXiv:2505.22954</a>. A coding agent edits
+its own code; children are checked on benchmarks (SWE-bench 20.0% to 50.0%). Its
+point that proving changes beneficial is impractical is cmh's reason for an empirical
+gate.</li>
+<li>Wenyi Wang, Piotr Piękos, Li Nanbo, Firas Laakom, Yimeng Chen, Mateusz Ostaszewski,
+Mingchen Zhuge, Jürgen Schmidhuber, "Huxley-Gödel Machine: Human-Level Coding Agent
+Development by an Approximation of the Optimal Self-Improving Machine", 2025,
+<a href="https://arxiv.org/abs/2510.21614">arXiv:2510.21614</a>. Today's score poorly predicts how good descendants will be:
+an argument for a soak over instant promotion.</li>
+<li>Maxime Robeyns, Martin Szummer, Laurence Aitchison, "A Self-Improving Coding Agent"
+(SICA), 2025, <a href="https://arxiv.org/abs/2504.15228">arXiv:2504.15228</a>. Edits its own agent system (17% to 53% on a SWE-bench
+Verified subset).</li>
+</ul>
+
+<h3>Live self-edits and online harness evolution</h3>
+<ul>
+<li>Xunjian Yin, Xinyi Wang, Liangming Pan, Li Lin, Xiaojun Wan, William Yang Wang,
+"Gödel Agent: A Self-Referential Agent Framework for Recursively Self-Improvement",
+2024 (ACL 2025), <a href="https://arxiv.org/abs/2410.04444">arXiv:2410.04444</a>. Monkey-patches its own running
+code, with no test gate or soak.</li>
+<li>Chunqiu Steven Xia, Zhe Wang, Yan Yang, Yuxiang Wei, Lingming Zhang, "Live-SWE-agent:
+Can Software Engineering Agents Self-Evolve on the Fly?", 2025,
+<a href="https://arxiv.org/abs/2511.13646">arXiv:2511.13646</a>. Evolves a bash-only scaffold while
+solving tasks: closest to cmh's online setting.</li>
+<li>Jiahang Lin, Shichun Liu, Chengjun Pan, Lizhi Lin, Shihan Dou, Zhiheng Xi, Xuanjing
+Huang, Hang Yan, Zhenhua Han, Tao Gui, Yu-Gang Jiang, "Agentic Harness Engineering:
+Observability-Driven Automatic Evolution of Coding-Agent Harnesses", 2026,
+<a href="https://arxiv.org/abs/2604.25850">arXiv:2604.25850</a>. Revertible edits,
+each with a prediction checked in the next round: close to gate plus soak.</li>
+<li>Hangfan Zhang, Shao Zhang, Kangcong Li, Chen Zhang, Yang Chen, Yiqun Zhang, Lei Bai,
+Shuyue Hu, "Self-Harness: Harnesses That Improve Themselves", 2026,
+<a href="https://arxiv.org/abs/2606.09498">arXiv:2606.09498</a>. Accepts a
+harness edit only after regression testing. Whether it has anything like a soak is
+unverified (we read only the abstract).</li>
+</ul>
+
+<h3>Memory as prose, memory as code</h3>
+<ul>
+<li>Noah Shinn, Federico Cassano, Edward Berman, Ashwin Gopinath, Karthik Narasimhan,
+Shunyu Yao, "Reflexion: Language Agents with Verbal Reinforcement Learning", 2023,
+<a href="https://arxiv.org/abs/2303.11366">arXiv:2303.11366</a>. Written
+reflections on failures, like cmh's per-task lessons.</li>
+<li>Aman Madaan, Niket Tandon, Prakhar Gupta, et al. (16 authors, last Peter Clark),
+"Self-Refine: Iterative Refinement with Self-Feedback", 2023,
+<a href="https://arxiv.org/abs/2303.17651">arXiv:2303.17651</a>. Critique and refine
+with no external check.</li>
+<li>Andrew Zhao, Daniel Huang, Quentin Xu, Matthieu Lin, Yong-Jin Liu, Gao Huang,
+"ExpeL: LLM Agents Are Experiential Learners", 2023 (AAAI 2024),
+<a href="https://arxiv.org/abs/2308.10144">arXiv:2308.10144</a>. Insights carried
+across tasks.</li>
+<li>Qizheng Zhang, Changran Hu, Shubhangi Upasani, et al. (last Kunle Olukotun),
+"Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models"
+(ACE), 2025, <a href="https://arxiv.org/abs/2510.04618">arXiv:2510.04618</a>. Prompts as
+evolving playbooks.</li>
+<li>Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi
+Fan, Anima Anandkumar, "Voyager: An Open-Ended Embodied Agent with Large Language
+Models", 2023, <a href="https://arxiv.org/abs/2305.16291">arXiv:2305.16291</a>. A
+library of code skills, each added after verification: the closest ancestor of cmh's
+tools.</li>
+<li>Jiahao Qiu, Xuan Qi, Tongcheng Zhang, et al. (18 authors, last Mengdi Wang),
+"Alita: Generalist Agent Enabling Scalable Agentic Reasoning with Minimal Predefinition
+and Maximal Self-Evolution", 2025, <a href="https://arxiv.org/abs/2505.20286">arXiv:2505.20286</a>.
+Starts with few tools and builds its own MCP servers as it goes.</li>
+</ul>
+
+<h3>Languages and runtimes</h3>
+<ul>
+<li>John McCarthy, "Recursive Functions of Symbolic Expressions and Their Computation
+by Machine, Part I", <em>Communications of the ACM</em>, 1960,
+<a href="https://doi.org/10.1145/367177.367199">doi:10.1145/367177.367199</a>.</li>
+<li>C. N. Mooers, L. P. Deutsch, "TRAC, a text handling language", ACM '65, 1965,
+<a href="https://doi.org/10.1145/800197.806048">doi:10.1145/800197.806048</a> (the
+"homoiconic" quote above is taken from a transcription of this paper).</li>
+<li>Richard M. Stallman, "EMACS: The Extensible, Customizable Self-Documenting Display
+Editor", 1981, <a href="https://doi.org/10.1145/800209.806466">doi:10.1145/800209.806466</a>.</li>
+<li>Elizabeth D. Rather, Donald R. Colburn, Charles H. Moore, "The Evolution of Forth",
+HOPL-II, 1993, <a href="https://doi.org/10.1145/155360.155369">doi:10.1145/155360.155369</a>;
+the dictionary quotes are from E. D. Rather and C. H. Moore's NRAO manual
+"FORTH: An Application-oriented Language, Programmer's Guide"
+(<a href="https://library.nrao.edu/public/memos/comp/CDIR_11.pdf">CDIR 11</a>, year
+unverified).</li>
+<li>"<a href="https://docs.racket-lang.org/reference/Sandboxed_Evaluation.html">Sandboxed
+Evaluation</a>", Racket Reference.</li>
+<li>Anil Madhavapeddy, Richard Mortier, Charalampos Rotsos, David Scott, Balraj Singh,
+Thomas Gazagnaire, Steven Smith, Steven Hand, Jon Crowcroft, "Unikernels: Library
+Operating Systems for the Cloud", ASPLOS 2013,
+<a href="https://mort.io/publications/pdf/asplos13-unikernels.pdf">PDF</a>.</li>
+<li>Simon Kuenzer et al. (15 authors, last Felipe Huici), "Unikraft: Fast, Specialized
+Unikernels the Easy Way", EuroSys 2021,
+<a href="https://doi.org/10.1145/3447786.3456248">doi:10.1145/3447786.3456248</a>.</li>
+<li>Andreas Haas, Andreas Rossberg, Derek L. Schuff, Ben L. Titzer, Michael Holman, Dan
+Gohman, Luke Wagner, Alon Zakai, JF Bastien, "Bringing the Web up to Speed with
+WebAssembly", PLDI 2017,
+<a href="https://github.com/WebAssembly/spec/blob/master/papers/pldi2017.pdf">PDF</a>.</li>
+<li>"<a href="https://docs.wasmtime.dev/examples-interrupting-wasm.html">Interrupting
+Execution</a>", Wasmtime documentation (fuel and epochs).</li>
+</ul>
+
+<h3>Where cmh sits</h3>
+
+<p>Self-rewriting moved from proof-gated to benchmark-gated offline evolution, and
+recently to online evolution during real work; memory moved from prose to code:</p>
+
+<div class="diagram"><pre>
+                 gate:   proof        benchmark        tests + use
+                         -----        ---------        -----------
+ when it changes
+   offline               Gödel        STOP ADAS
+                         Machine      DGM HGM SICA
+   online (while                      Live-SWE-agent   AHE, Self-Harness
+   working)                                            cmh (+ soak)
+
+ what is remembered:  prose (Reflexion, ExpeL, ACE)  ...  code (Voyager, Alita, cmh)
+</pre></div>
+
+<p>cmh sits in the online, code-memory, test-gated corner; its own addition is the
+soak. It also borrows from harnesses studied before the spec was written: samizdat
+(immutable kernel, a validate/soak/rollback gate, verdicts turned into durable
+knowledge), Prime Agent (versioned prompt notes, lessons and skills over an immutable
+base prompt), and autolith and oh-my-lisp (late-bound live redefinition)
+(<span class="src">SPEC.md:7-11</span>). Prime Agent is also the baseline every
+harness in this book is measured against (Chapter 3).</p>
+
+<h2>What we found, in advance</h2>
+
+<p>In the first committed eval runs, every cmh harness
+scored at or near the Prime Agent baseline. On
+DeepSeek V4.1 Flash, Clojure, Rust and Racket each scored 102% of Prime, Lean 98% and
+Forth 114% (in a run where Prime itself fell to 88%); on GLM 5.3 Flash, Clojure scored 116%, Rust 113%, Racket 118% and Lean
+116% (<span class="src">ROADMAP.md:17-18</span>). On the later tool-reuse suites,
+Prime solved 32 of 32 episodes and only Racket matched it; Lean, Forth and WASM fell
+below the pass bar (Chapter 11). The roadmap is also blunt about
+where those points come from:</p>
+
+<blockquote>Most of the score comes from the shared design (lessons, reflection, the
+gate), not from self-modification: across about 60 episodes per flavor the agents
+proposed only 5 to 78 changes. The evals do not yet reward self-modification.</blockquote>
+<p><span class="src">ROADMAP.md:23-26</span></p>
+
+<div class="warn"><p>The early evals had only two trials per suite, so differences of
+a few points are noise, and almost every task is solvable with <code>bash</code>
+alone. Later suites were built to reward reuse (Chapter
+11), but whether self-modification makes the agent better is still mostly open.</p></div>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>The goal: a substrate that never crashes from agent code, gives precise feedback,
+enforces clear rules, and keeps only changes that help.</li>
+<li>Three rings: an immutable kernel, a versioned userspace (tools, notes, hooks), and
+durable knowledge (lessons, verdicts).</li>
+<li>Changes enter only through <code>propose_def</code> and pass validate, trial and
+soak; late binding makes each one live on the next call.</li>
+<li>Back pressure, precise feedback on failure, is how the agent learns; in the first
+harnesses <code>bash</code> still lets it "flip the board".</li>
+<li>Language decides how much of the wall comes for free. WebAssembly is the practical
+stand-in for a unikernel per generation.</li>
+<li>cmh sits in the online, test-gated, code-memory corner of the research; its own
+addition is the soak. So far most of its score comes from the shared design, not
+self-modification.</li>
+</ul>
+</main>
+<footer class="nav"><a href="index.html">← Contents</a><a href="index.html">Contents</a><a href="02-shared-design.html">The shared design: SPEC.md →</a></footer>
+</body></html>

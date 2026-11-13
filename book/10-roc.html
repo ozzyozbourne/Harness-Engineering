@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10. Roc on Zig: pure code and requests as data · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 10</header>
+<main>
+<h1>10. Roc on Zig: pure code and requests as data</h1>
+<p class="subtitle">A language with no <code>eval</code> and no I/O becomes a live userspace: a Zig host compiles every call on its own, runs it in a child process it can kill, and does the I/O the code asks for.</p>
+
+<p>Every flavor so far picked a language that already likes being changed while it runs. This chapter goes the other way on purpose. Roc is a pure, statically typed, ahead-of-time compiled language. It has no <code>eval</code>, and Roc code cannot read a file. The question was whether the shared design from <a href="02-shared-design.html">Chapter 2</a> still works when the language does nothing to help.</p>
+
+<p>It does, by embedding the compiler in the host, rebuilding a small program for every call, and turning every side effect into a value the host inspects before acting. The work came in two commits 74 minutes apart: a 471-line prototype in <code>roc-proto/</code> late on 2026-11-12, then the full flavor in <code>roc/</code> just after midnight (UTC) on 2026-11-13. The flavor has 19 files and 4,185 lines, 3,146 of them in ten Zig files.</p>
+
+<h2>Two primers</h2>
+
+<h3>Roc in a few paragraphs</h3>
+<p>Roc is a functional language in the ML family. Values are immutable (a local can be declared mutable with <code>var</code>), most functions are pure, and the compiler infers and checks types before anything runs. A Roc program has two halves. The <strong>app</strong> is the Roc code you write. The <strong>platform</strong> is a host program, usually written in Zig, Rust or C, plus a Roc API that says what the app may ask it to do. Only the platform touches the outside world. In a normal Roc program, functions that have effects end in <code>!</code>, and they are provided by the platform (they are "hosted"). This split is general Roc background, not from this repository.</p>
+<p>The Roc used here is the new compiler, a rewrite in Zig. The project pins one commit, roc-lang/roc <code>a5c6d8b</code>, because the language is still moving. Its syntax differs from older Roc that a model may remember from training, and the cheat sheet the host sends to the model opens by saying so:</p>
+<pre><code># Roc reference (this compiler: roc-lang/roc a5c6d8b)
+
+Your userspace is written in current Roc. It differs from older Roc you may
+remember: there is no `when`/`is` (use `match`) and no `\x -&gt;` (use `|x|`).
+Calls use parentheses and commas, `f(a, b)`, and `Num.to_str` is gone (use
+`x.to_str()`). Every example below is checked against the compiler. Try any
+snippet with `roc_eval` before you propose it.</code></pre>
+<span class="src">roc/host/roc_reference.md:1-7</span>
+<p>Here is what a complete userspace tool looks like. It is the seed tool that every fresh state starts with:</p>
+<pre><code># Seed tool: counts whitespace-separated words in `text`.
+# Tools are called as NAME(input_json, results) and return a Str or a request.
+WordCountInput : { text : Str }
+
+word_count : Str, List(Str) -&gt; Str
+word_count = |input, _results| {
+    parsed : Try(WordCountInput, _)
+    parsed = Json.parse(input)
+    match parsed {
+        Ok(args) =&gt; {
+            spaced = args.text.replace_each("\n", " ").replace_each("\t", " ").replace_each("\r", " ")
+            Str.split_on(spaced, " ").keep_if(|w| !Str.is_empty(w)).len().to_str()
+        }
+        Err(_) =&gt; "error: expected {\"text\": string}"
+    }
+}</code></pre>
+<span class="src">roc/seed/word_count.roc:1-16</span>
+<p><code>WordCountInput</code> is a record type, and the line under it is a type annotation: two arguments, a string result. <code>|input, _results| { ... }</code> is a lambda whose block ends with its value. <code>Try</code> is Roc's result type (<code>Ok</code> or <code>Err</code>), and <code>match</code> picks a branch by pattern.</p>
+
+<h3>Zig in a few paragraphs</h3>
+<p>Zig is a systems language in the same space as C: explicit allocators, error unions (<code>!T</code> is "a T or an error", and <code>try</code> passes the error up), and <code>comptime</code> code that runs at compile time. It calls C directly, so the host can use <code>std.c.fork()</code> and <code>std.c.kill()</code> with no wrapper. Its build script is itself Zig, <code>build.zig</code>.</p>
+<p>The Roc compiler is written in Zig, so a Zig host can import its modules as source and link them into one binary, with no C API to wrap. The flavor needs Zig 0.17.1.</p>
+
+<h2>The framing: nvim and Lua, but Roc has no eval</h2>
+<p>The prototype's README states the goal in one line: a host that "lets Roc definitions be replaced while it runs, the way nvim reloads Lua" (roc-proto/README.md:3-5). Neovim is a small C core with a Lua scripting layer that users reload while the editor runs, the same shape as the kernel/userspace split from Chapter 2. Zig plays the C core and Roc plays Lua.</p>
+<p>The analogy breaks in one place. Lua has <code>load</code>, which turns a string into a function. Roc has nothing like it: all Roc code is parsed, type-checked and lowered before it runs, so the language cannot change itself.</p>
+<p>A host can, though. The one part of the Roc compiler that takes source text while it runs and returns a value is the REPL core, <code>src/cli/ReplSession.zig</code> in the Roc checkout. The host links it in as a library: Roc never gets an <code>eval</code>, but the host has a compiler it can call.</p>
+<div class="diagram">  nvim + Lua                       cmh (Roc flavor)
+  ----------                       ----------------
+  C core (editor)                  Zig host (kernel: loop, gate, journal)
+    |                                |
+    | load(string) -&gt; function       | embedded Roc compiler (ReplSession)
+    v                                v
+  Lua plugins (userspace)          Roc tools and hooks (userspace)
+    can call vim.api.* directly      cannot call anything: they return
+                                     requests, and the host performs them</div>
+<p>A REPL session keeps its definitions as source text. To evaluate an expression it pastes them together with a <code>main</code> wrapping the expression, compiles the module, and computes the value <em>at compile time</em>. A redefinition replaces the old snippet, after a snapshot; if the re-check fails, the snapshot is restored. That gives hot reload with rollback. Because everything is recompiled from source, an older caller sees the newest version of what it calls: late binding.</p>
+
+<h2>The prototype: hot reload in 296 lines</h2>
+<p><code>roc-proto/host.zig</code> (296 lines) reads a scenario file of steps separated by <code>---</code>. Each step is a Roc statement: a definition or an expression. The host passes it to the session and prints what happened. Here is the middle of the main scenario:</p>
+<pre><code># hot reload: greet v2
+greet = |name| Str.concat("Howdy, ", name)
+---
+# the old caller now uses the new greet (late binding)
+shout("Roc")
+---
+# bad reload: breaks the contract (returns a number)
+greet = |name| 42
+---
+# bad reload: syntax error
+greet = |name| Str.concat("Hi", name
+---
+# both rejected, so v2 is still live
+shout("Roc")</code></pre>
+<span class="src">roc-proto/scenario.txt:11-24</span>
+<p>Earlier steps defined <code>greet</code> v1 (with the type <code>Str -&gt; Str</code>) and a caller, <code>shout = |name| Str.concat(greet(name), "!")</code>, which is never defined again. After the reload, <code>shout</code> uses v2. The bad reloads are a type error (<code>greet</code> must return a <code>Str</code>, not <code>42</code>) and a parse error. The session rejects both, restores its snapshot, and v2 stays live. The host counts versions on its own and prints a line like <code>[host] `greet` v2 is live</code> when a definition is accepted (roc-proto/host.zig:138-142).</p>
+<p>The scenario also shows where the prototype stops. A reload of <code>greet = |name| crash "greet is broken"</code> type-checks, so it is <em>accepted</em>, and the crash shows up only on the next call: checking types alone cannot catch code that is well typed and wrong. The scenario ends by reloading the v2 source by hand as a rollback (scenario.txt:26-34).</p>
+
+<h3>The two unknowns</h3>
+<p>Hot reload was the easy part. Two harder questions decided whether a full harness was possible, and a second scenario, <code>work/unknowns.txt</code>, tests them.</p>
+<p><strong>Unknown 2: can the host survive a hang?</strong> Roc code is pure, but pure code can still loop forever. The REPL evaluates at compile time, so a definition whose value never finishes hangs the <em>compiler</em>, inside the host:</p>
+<pre><code># unknown 2: a definition whose evaluation never ends
+spin : U64 -&gt; U64
+spin = |n| spin(n + 1)
+stuck = spin(0)</code></pre>
+<span class="src">roc-proto/work/unknowns.txt:5-8</span>
+<p>The fix is a process boundary. With <code>--timeout-ms N</code>, the prototype runs each statement in a <code>fork()</code>ed child, a copy of the host process that shares its memory copy-on-write. The parent waits on a pipe, and kills the child when the deadline passes:</p>
+<pre><code>        if (timed_out) {
+            _ = std.c.kill(pid, .KILL);
+            _ = std.c.waitpid(pid, null, 0);
+            return .{ .killed = try std.fmt.allocPrint(self.arena, "no result after {d} ms; child killed", .{limit}) };
+        }</code></pre>
+<span class="src">roc-proto/host.zig:115-119</span>
+<p>The scenario then calls <code>greet("Roc")</code> and <code>greet("still alive")</code> to show that the host and its old definitions survived. The child's session is a copy, so a definition accepted in the child is lost when the child exits. Roc is pure, so the prototype just <em>replays</em> the statement in the parent's session to commit it (host.zig:127-129). That costs "about 0.09 s per statement" (roc-proto/README.md:32-35).</p>
+<p><strong>Unknown 1: how does Roc code ask for I/O?</strong> A harness tool must read files, but letting Roc call a host function fails for a basic reason: the REPL computes values at compile time, and the compiler refuses to run effects at compile time. Every effectful call is rejected with the diagnostic "Effectful Compile Time Expression". The prototype's README notes that even the REPL's own built-in <code>Repl.emit!</code> is refused (roc-proto/README.md:39-41).</p>
+<p>So the prototype turns the call around, which its README calls "the Elm pattern", after the Elm language: the Roc function <em>returns a value describing</em> the I/O it wants, and the host performs it and calls the function again with the result:</p>
+<pre><code># unknown 1: an agent step that asks the host for data instead of calling it
+agent_step : Str -&gt; [ReadFile(Str), Done(Str)]
+agent_step = |input| if input == "" ReadFile("notes.txt") else Done(Str.concat("the notes say: ", input))
+---
+# drive agent_step
+---
+# the host enforces rules on what Roc may ask for
+sneaky : Str -&gt; [ReadFile(Str), Done(Str)]
+sneaky = |input| if input == "" ReadFile("../../.git/config") else Done(input)
+---
+# drive sneaky</code></pre>
+<span class="src">roc-proto/work/unknowns.txt:18-28</span>
+<p><code>[ReadFile(Str), Done(Str)]</code> is a <em>tag union</em>: a value that is either <code>ReadFile</code> carrying a string or <code>Done</code> carrying a string. A <code># drive FN</code> step runs the loop for up to five rounds. The rules sit in the host, where the model cannot change them:</p>
+<pre><code>            if (!std.mem.eql(u8, request.tag, "ReadFile")) {
+                input = try std.fmt.allocPrint(self.arena, "error: unknown request {s}", .{request.tag});
+            } else if (std.mem.indexOf(u8, request.arg, "..") != null or std.fs.path.isAbsolute(request.arg)) {
+                input = "error: path refused (must stay in the work dir)"; // the rules
+            } else {
+                input = dir.readFileAlloc(self.io, request.arg, self.arena, .limited(1 &lt;&lt; 16)) catch |err|
+                    try std.fmt.allocPrint(self.arena, "error: {s}", .{@errorName(err)});
+                std.debug.print("[host] performed ReadFile({s}): {d} bytes\n", .{ request.arg, input.len });
+            }</code></pre>
+<span class="src">roc-proto/host.zig:172-180</span>
+<p>The <code>sneaky</code> request for <code>../../.git/config</code> is refused, and the scenario ends by hot-reloading <code>agent_step</code> to show that the next drive uses the new version. With both unknowns answered, the prototype's README lists three known gaps (roc-proto/README.md:46-53). A well-typed crashing definition is accepted. Calls with constant arguments are evaluated at compile time, so their crashes come back as compile errors. And "the REPL evaluates through the compiler on every call, so call cost grows with the program." The full flavor answers each one.</p>
+
+<h2>Requests as data in the full flavor</h2>
+<p>The final contract makes the prototype's idea general. A tool takes two arguments: its input as JSON text, and a list of the results of every request it has made so far in this call, oldest first. It returns either a plain <code>Str</code> (done) or a request. The cheat sheet shows a complete example, and like every example in that file it is checked against the compiler:</p>
+<pre><code>LineCountInput : { path : Str }
+
+line_count : Str, List(Str) -&gt; [Done(Str), Fail(Str), ReadFile(Str)]
+line_count = |input, results| {
+    parsed : Try(LineCountInput, _)
+    parsed = Json.parse(input)
+    match parsed {
+        Err(_) =&gt; Fail("expected {\"path\": string}")
+        Ok(args) =&gt; match results {
+            [] =&gt; ReadFile(args.path)
+            [content, ..] =&gt;
+                if content.starts_with("ERROR: ") Fail(content)
+                else Done(Str.split_on(content, "\n").keep_if(|l| !Str.is_empty(l)).len().to_str())
+        }
+    }
+}
+
+line_count("{\"path\": \"a.txt\"}", [])  # =&gt; ReadFile("a.txt")
+line_count("{\"path\": \"a.txt\"}", ["x\ny\n"])  # =&gt; Done("2")</code></pre>
+<span class="src">roc/host/roc_reference.md:206-224</span>
+<p>The full request set is <code>Done(Str)</code>, <code>Fail(Str)</code>, <code>ReadFile(Str)</code>, <code>ReadBytes(Str)</code>, <code>ListDir(Str)</code>, <code>WriteFile(Str, Str)</code> and <code>Bash(Str)</code> (roc/host/userspace.zig:413-421). The host builds the call as Roc source, <code>Json.to_str(NAME("&lt;input&gt;", [&lt;results&gt;]))</code>, evaluates it, and decodes the JSON. A plain string means done. <code>{"ReadFile":"a.txt"}</code> means a read. The loop that drives it is short:</p>
+<pre><code>        switch (req) {
+            .done =&gt; |text| return .{ .done = text },
+            .fail =&gt; |msg| {
+                last_requests = shown.items;
+                return .{ .failed = .{ .fail = msg } };
+            },
+            else =&gt; {},
+        }
+        const result = performer.perform(req);
+        shown.append(u.A, u.fmt("{s} -&gt; {s}", .{ req.show(), u.clip(u.firstLine(result, 100), 100) })) catch @panic("oom");
+        if (performer.mode == .live) u.trace("[request] {s} {s} -&gt; {s}", .{ name, req.show(), u.firstLine(result, 80) });
+        results.append(u.A, result) catch @panic("oom");
+    }
+    last_requests = shown.items;
+    return .{ .failed = .{ .contract = u.fmt("`{s}` made more than {d} requests in one call; return Done(...) sooner", .{ name, MAX_ROUNDS }) } };</code></pre>
+<span class="src">roc/host/userspace.zig:597-611</span>
+<div class="diagram">  host                                         Roc tool (pure)
+  ----                                         ---------------
+  results = []
+  eval NAME(input, [])            ---------&gt;   returns ReadFile("a.txt")
+  check rules, read a.txt
+  results = ["x\ny\n"]
+  eval NAME(input, ["x\ny\n"])    ---------&gt;   returns Done("2")
+  return "2" to the model
+                         (at most 24 rounds per call)</div>
+<p>There is no continuation. Each round runs the tool again from the start with one more result, so the tool must work out from <code>results</code> where it is. That is simple for one read and fiddly for a tool that reads, then writes, then should stop. The cap of 24 requests per call (<code>MAX_ROUNDS</code>, userspace.zig:17) catches tools that never stop. The eval below hit it several times.</p>
+
+<h3>The rules, and refusals as data</h3>
+<p>The host checks each request first (userspace.zig:477-523). Paths must resolve inside the work dir, with symlinks canonicalized. <code>WriteFile</code> refuses the state dir, the whole <code>roc/</code> directory and <code>base-prompt.md</code>. <code>ReadFile</code> takes up to 256 KB of UTF-8; <code>ReadBytes</code> up to 128 KB, returned as decimal text like <code>"81,76,..."</code>. <code>Bash</code> has a 30 s timeout and a 20 KB output cap.</p>
+<p>A refused request is not an exception. The refusal comes back as the next result, which the tool can handle:</p>
+<pre><code>    fn refusal(self: *Performer, p: []const u8, e: anyerror) []const u8 {
+        return switch (e) {
+            error.OutsideWorkDir =&gt; u.fmt("ERROR: refused: {s} resolves to {s}, outside the work dir {s}; use a path relative to the work dir", .{ p, tools.resolve(self.work_dir, p), self.work_dir }),
+            else =&gt; u.fmt("ERROR: refused: empty path", .{}),
+        };
+    }</code></pre>
+<span class="src">roc/host/userspace.zig:533-538</span>
+<p>Requests as data have one more benefit: tools can be tested without doing any I/O. A gate test can script the results with <code>"responses": [...]</code> and check the requests made with <code>"expect_requests": [...]</code>.</p>
+
+<div class="note"><strong>Is there really no way in?</strong> The Roc runtime has a hook for host functions (<code>HostedCallDependency</code> in the checkout's <code>src/eval/inspected_run.zig</code>), but it sits on the path that runs an explicit entry point, not the REPL's compile-time path, and nothing else uses it. The WebAssembly Roc REPL documents the same limit.</div>
+
+<h2>The wall: a forked child you can kill</h2>
+<p>The prototype forked only when asked. The flavor forks every time. The module that holds the compiler opens with its whole policy:</p>
+<pre><code>//! The Roc wall: the embedded compiler, and a killable child process for
+//! every piece of agent code that runs.
+//!
+//! The parent keeps one pristine `ReplSession` (Builtin module published once,
+//! no stored definitions). It never evaluates agent code itself. Every call,
+//! test run, proposal check and scratchpad snippet runs in a forked child that
+//! inherits the warm session copy-on-write, builds exactly the program it
+//! needs, writes a report to a pipe and exits. The parent kills the child at
+//! the deadline. A hang, a crash, a stack overflow or an abort only ever ends
+//! the child.</code></pre>
+<span class="src">roc/host/rocrt.zig:1-10</span>
+<p>At startup the host publishes Roc's Builtin module once, which takes about 0.1 s (roc/README.md:25-26). The fork itself is the usual pattern:</p>
+<pre><code>pub fn isolate(io: std.Io, arena: Allocator, timeout_ms: u32, ctx: anytype, comptime job: fn (@TypeOf(ctx), Pipe) void) !Child {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&amp;fds) != 0) return error.PipeFailed;
+    const pid = std.c.fork();
+    if (pid &lt; 0) return error.ForkFailed;
+    if (pid == 0) {
+        _ = std.c.close(fds[0]);
+        const pipe = Pipe{ .fd = fds[1] };
+        job(ctx, pipe);
+        pipe.write(&amp;.{done_mark});
+        std.c._exit(0);
+    }</code></pre>
+<span class="src">roc/host/rocrt.zig:186-197</span>
+<p>The child writes JSON lines to the pipe, plus two marker bytes: <code>0x1e</code> restarts the deadline, so each test in a gate run and each request round gets its own time budget, and <code>0x04</code> marks a normal finish. The deadline is 10 s per phase by default, and <code>CMH_ROC_TIMEOUT_MS</code> changes it. If the deadline passes, the parent sends <code>SIGKILL</code>. If the child exits without the done mark, the parent reports how it died and gives a hint: SIGSEGV is "often a stack overflow from deep recursion", SIGABRT "often a failed assertion or panic in the compiler".</p>
+<p>Why not recover in-process? The compiler has a setjmp/longjmp crash boundary that can even catch a stack overflow, but by our reading it cannot stop an infinite loop, a compiler panic or running out of memory. A process covers all of them. Roc's own eval test runner also runs each case in a forked child.</p>
+<p>The offline suite checks the wall directly. A tool that loops on one input is proposed with a test that passes, then called with the input that loops:</p>
+<pre><code>    t0 = time.time()
+    e.run(script, "run", "hang", env={"CMH_ROC_TIMEOUT_MS": "3000"})
+    took = time.time() - t0
+    r = [b["content"] for b in e.tool_results()]
+    check(r[0].startswith("trial v1"), r[0])
+    check("roc error [timeout] in spin_input v1" in r[1] and "child was killed" in r[1], r[1])
+    check("definition removed" in r[1], r[1])
+    check(r[2] == "2", r[2])</code></pre>
+<span class="src">roc/tests/run_tests.py:338-345</span>
+<p>The trial is killed and removed, and the next call still answers <code>2</code>.</p>
+
+<h2>The latency problem, and per-call dependencies</h2>
+<p>The prototype's third gap was cost. A REPL session compiles everything it holds on every step, so every call would slow down as the agent learned more. The flavor adds a <code>cmh bench</code> command to measure this on the Debug build, using realistic definitions: three functions, a record type and a request union each, about 15 lines (roc/host/bench.zig:14-32).</p>
+<table>
+<tr><th>stored defs</th><th>add def</th><th>session call</th><th>closure call</th><th>closure + fork</th></tr>
+<tr><td>1</td><td>131 ms</td><td>349 ms</td><td>278 ms</td><td>316 ms</td></tr>
+<tr><td>10</td><td>344 ms</td><td>350 ms</td><td>269 ms</td><td>314 ms</td></tr>
+<tr><td>50</td><td>1539 ms</td><td>740 ms</td><td>275 ms</td><td>326 ms</td></tr>
+<tr><td>100</td><td>4236 ms</td><td>1451 ms</td><td>382 ms</td><td>411 ms</td></tr>
+</table>
+<span class="src">roc/README.md:52-57</span>
+<p>The "session call" column is the prototype's model, one session holding all N definitions. Its call cost grows with N, and the cost of adding a definition grows faster. The "closure call" column is the fix: it compiles only the called definition and the definitions it uses, and its cost stays flat. The README explains the rise at 100 as a larger registry scan and more memory. Forking adds about 40 ms.</p>
+<p>The fix is a small graph walk. To call <code>NAME</code>, the kernel scans its source for identifiers, finds which live definition owns each one, adds that definition's source, and scans that in turn:</p>
+<pre><code>        var queue: std.ArrayList([]const u8) = .empty;
+        queue.append(u.A, source) catch @panic("oom");
+        while (queue.pop()) |src| {
+            for (identifiers(src)) |ident| {
+                const name = ownerOf(state, ident) orelse continue;
+                if (seen.contains(name)) continue;
+                seen.put(name, {}) catch @panic("oom");
+                if (override) |o| if (u.eql(o.name, name)) {
+                    out.append(u.A, o) catch @panic("oom");
+                    queue.append(u.A, o.source) catch @panic("oom");
+                    continue;
+                };
+                const v = state.live(name) orelse continue;
+                if (u.eql(v.kind, "note")) continue;
+                out.append(u.A, .{ .name = name, .version = v.version, .source = v.source }) catch @panic("oom");
+                queue.append(u.A, v.source) catch @panic("oom");
+            }
+        }
+        return out.items;</code></pre>
+<span class="src">roc/host/userspace.zig:54-72</span>
+<p>The program for a call is those dependency sources followed by the definition's own source, compiled with <code>main = || (...)</code> wrapped around the call expression (roc/host/rocrt.zig:44-45). The program is rebuilt from the registry every time, so late binding still comes for free. Test 1 in the suite shows an existing <code>shout_words</code> picking up <code>word_count</code> v3 without being redefined. The <code>override</code> argument serves the gate: it puts a candidate in place of the live version, so the gate can check that every live definition that calls <code>NAME</code> still compiles against the new version.</p>
+<p>There is also a memo. Roc is pure, so the same program and expression always give the same value:</p>
+<pre><code>    /// Evaluates `expr` (a Str expression) over `prog` in a killable child.
+    pub fn evalIsolated(self: *Roc, prog: []const u8, expr: []const u8) rocrt.Outcome {
+        const key = u.fmt("{s}\x00{s}", .{ prog, expr });
+        if (self.memo.get(key)) |v| return .{ .value = v };</code></pre>
+<span class="src">roc/host/userspace.zig:85-88</span>
+<p>The key is the whole program text, dependencies included, so a new version of any dependency changes the key and the memo cannot go stale. Only successes are cached, per process.</p>
+
+<h2>The naming rule</h2>
+<p>A lexical scan only works if names cannot collide. If two definitions both defined a helper called <code>parse</code>, pasting their sources into one module would fail, and the scan could not tell whose <code>parse</code> a caller meant. So each definition owns a namespace, and the gate enforces it:</p>
+<pre><code>/// Whether top-level name `ident` belongs to definition `name`: the name
+/// itself, `name_...`, or a type `NamePascal` / `NamePascalMore`.
+pub fn owns(name: []const u8, ident: []const u8) bool {
+    if (u.eql(ident, name)) return true;
+    if (std.mem.startsWith(u8, ident, name) and ident.len &gt; name.len and ident[name.len] == '_') return true;
+    const p = pascal(name);
+    return std.mem.startsWith(u8, ident, p) and (ident.len == p.len or std.ascii.isUpper(ident[p.len]));
+}</code></pre>
+<span class="src">roc/host/userspace.zig:283-290</span>
+<p>For <code>word_count</code>, allowed top-level names are <code>word_count</code>, <code>word_count_anything</code> and types like <code>WordCountInput</code>. Any other name is rejected with "every top-level name in `NAME` must be `NAME`, start with `NAME_`, or (types) start with `Name`, so definitions cannot collide" (userspace.zig:716-718). When the scan meets an identifier, it picks the longest owner that matches, so <code>qlog_stats_read_uv</code> belongs to <code>qlog_stats</code> and not to a <code>qlog</code>. Every top-level statement must be a definition, and <code>import</code> is refused because the builtins are always in scope.</p>
+<p>The scan is still lexical: a local variable that shares a definition's name pulls that definition into the program, which the README notes costs only compile time.</p>
+
+<h2>The gate</h2>
+<p><code>propose_def</code> follows the lifecycle from Chapter 2. Roc details sit at each step:</p>
+<ol>
+<li><strong>Shape checks</strong> in the kernel: a lowercase name of at most 48 characters that is not a kernel tool, a fixed kind (tool, note or hook), only the two SPEC hooks, an object <code>input_schema</code> for tools, and at least one test for tools and hooks. Tests sent as a JSON <em>string</em> are accepted, because "Models sometimes send the tests array as a JSON string" (kernel.zig:162-169).</li>
+<li><strong>One gate child</strong> does the rest, each phase on its own deadline: allowed names, the program compiles, the source defines <code>NAME</code>, each test passes (tools go through the request loop in test mode), and every live caller of <code>NAME</code> still compiles against the candidate ("existing callers would break").</li>
+<li><strong>Trial</strong>: the candidate goes live at once.</li>
+<li><strong>Soak</strong>: any error in the next <code>--soak</code> uses (default 3), including a crash, timeout, <code>Fail</code> or dead child, reverts to the last kept version or removes the definition. Clean uses make it <strong>kept</strong>.</li>
+<li><strong>Verdicts</strong> for every keep or revert are put in the system prompt. A hook that fails falls back to the kernel's built-in default for that call.</li>
+</ol>
+<p>Error reports have one fixed shape, the same as in the Forth flavor:</p>
+<pre><code>roc error [type-error] in word_count v2 (tool), line 2: Type Mismatch
+&lt;compiler report with the code snippet&gt;
+input: {...}
+requests so far:
+  ReadFile("a.txt") -&gt; ...
+hint: ...</code></pre>
+<span class="src">roc/README.md:119-124</span>
+<p>The kinds are <code>parse-error</code>, <code>type-error</code>, <code>crash</code>, <code>timeout</code>, <code>child-died</code>, <code>contract</code>, <code>wrong-output</code>, <code>fail</code> and <code>internal</code>. The line number comes from matching the compiler's code snippet against the definition's own source, or against a dependency's (<code>in DEP vN line L</code>). This answers the prototype's second gap: a <code>crash</code> in a call with constant arguments arrives as a compiler report, and the host recognizes it by the report's title (crash, overflow or panic).</p>
+<p>The system prompt has three blocks: the immutable base prompt, the Roc cheat sheet, and the output of the <code>compose_system</code> hook plus the verdicts.</p>
+
+<h2>roc_eval and the verified cheat sheet</h2>
+<p>A model writing a pre-release dialect will get the syntax wrong, and the gate is a slow, journaled place to find a missing bracket. So the flavor adds a tenth kernel tool to the SPEC's nine, <code>roc_eval</code>, a scratchpad. It takes optional <code>source</code> (definitions) and an <code>expr</code>, runs them in a throwaway child with the live definitions they reference, and returns <code>value: &lt;Str.inspect&gt;</code> or the gate's report. Nothing is journaled. Its test in the suite checks all four outcomes:</p>
+<pre><code>    check(r[0] == "value: 42", r[0])
+    check(r[1] == 'value: "2"', r[1])
+    check("[type-error]" in r[2], r[2])
+    check("[parse-error]" in r[3], r[3])
+    check(not any(j["type"].startswith("def_") and j.get("name") == "roc_eval" for j in e.journal()), "scratchpad journaled")</code></pre>
+<span class="src">roc/tests/run_tests.py:383-387</span>
+<p>The second aid is <code>roc/host/roc_reference.md</code>, a 260-line cheat sheet sent as the second system block. A wrong cheat sheet does more harm than none, and the README says it was "checked against <code>test/snapshots</code> in the Roc checkout and against the compiler. <code>cmh check-reference</code> runs every <code># =&gt;</code> example and compiles every definition block, and all 68 pass" (roc/README.md:136-139). In each Roc block, the checker treats a line with <code># =&gt;</code> as an expression and its expected output, and every other line as a definition:</p>
+<pre><code>        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "# =&gt; ")) |at| {
+                try examples.append(u.A, .{ .expr = std.mem.trim(u8, line[0..at], " "), .want = std.mem.trim(u8, line[at + 5 ..], " ") });
+            } else {
+                try defs.appendSlice(u.A, line);
+                try defs.append(u.A, '\n');
+            }
+        }</code></pre>
+<span class="src">roc/host/main.zig:212-219</span>
+<p>The rules it teaches are the ones models get wrong:</p>
+<pre><code>- A lambda is `|a, b| body`; a block `{ ... }` ends with its value.
+- A mutable local is declared with `var` and its name must start with `$`.
+- Boolean operators are `and`, `or` and `!`. There is no `&amp;&amp;` or `||`.
+- `if` always needs `else`. When an `if` branch is a block that only mutates,
+  write `else { {} }`.
+- `match` arms are `pattern =&gt; value` with one arm per line (or arms
+  separated by commas on one line).
+- Every function has to be pure. There is no I/O and no `!` effects. Tools
+  ask the host for I/O with requests (below).</code></pre>
+<span class="src">roc/host/roc_reference.md:123-131</span>
+<p>Another trap: an unsuffixed number is a <code>Dec</code> (decimal), so <code>1 + 2  # =&gt; 3.0</code> (roc_reference.md:12).</p>
+
+<h2>Building it</h2>
+<p>The Roc checkout is not vendored. <code>roc/build.sh</code> (30 lines) moves a roc-lang/roc clone to the pinned commit. Then <code>patch-build.py</code> adds a <code>cmh</code> step to Roc's <code>build.zig</code>, wired like the existing <code>repl.wasm</code> step. It imports <code>ReplSession.zig</code> with the compiler modules and embeds the base prompt and the three seeds. The patch sits between <code>// cmh-begin</code> and <code>// cmh-end</code> markers, so running it again replaces it cleanly. The result is one binary, about 714 MB in Debug, that holds a Roc compiler and the agent kernel.</p>
+<pre><code>python3 -I "$HERE/patch-build.py" "$ROC" "$HERE"
+"$ZIG" build cmh -j"$JOBS" -Doptimize="$OPT"
+mkdir -p "$HERE/bin"
+ln -sfn "$ROC/zig-out/bin/cmh" "$HERE/bin/cmh"</code></pre>
+<span class="src">roc/build.sh:26-29</span>
+<p>The first build in a fresh checkout takes about 7 minutes, with a peak RSS of 1.6 GB at <code>-j2</code>. An incremental rebuild after a host change takes about 30 s.</p>
+<div class="warn"><strong>It ships as a Debug build.</strong> A ReleaseFast build was OOM-killed at about 6 GB in a 7.8 GB orb, because the LLVM step needs more memory than the machine had (roc/build.sh:6-8, roc/README.md:162-163). So every number in this chapter is from Debug: the README estimates about 0.3 s per call round, 1 to 10 s per gate run and about 7 s for the seed <code>select_lessons</code> in the gate. Measured gates varied more: 3.9 s and 10.4 s in the smoke runs below, but 17.7 s (5 tests) and 51.6 s (4 tests) in the eval, which the per-test deadline allows. A release build should be much faster, but it was not measured.</div>
+
+<h2>Tests</h2>
+<p><code>python3 -I roc/tests/run_tests.py</code> (433 lines) drives the real binary with the mock provider, so no network is needed. It has 14 tests: the 8 the SPEC requires (late binding, gate rejection, soak revert, soak keep, persistence, hook redefinition, lesson scoring, an end-to-end run) and 6 for Roc:</p>
+<table>
+<tr><th>test</th><th>what it proves</th></tr>
+<tr><td><code>test_hang_killed</code></td><td>a looping trial is killed at a 3 s deadline, removed, and the next call works</td></tr>
+<tr><td><code>test_refused_request</code></td><td><code>../secret.txt</code> is refused and never read; <code>/etc/passwd</code> ends in <code>[fail]</code>; a read inside the work dir works</td></tr>
+<tr><td><code>test_scratchpad</code></td><td><code>roc_eval</code> returns values, type errors and parse errors, and journals nothing</td></tr>
+<tr><td><code>test_seeds</code></td><td>the three seeds pass their own gate tests (<code>cmh check-seeds</code>)</td></tr>
+<tr><td><code>test_reference_examples</code></td><td>every cheat-sheet example passes (<code>cmh check-reference</code>)</td></tr>
+<tr><td><code>test_usage_errors</code></td><td>bad CLI usage exits with status 2</td></tr>
+</table>
+<p>The flavor's commit message records "14 tests pass". The CLI matches the other flavors, plus developer commands <code>check-seeds</code>, <code>check-reference</code> and <code>bench</code>.</p>
+
+<h3>Live smoke runs</h3>
+<p>While building the flavor, the build agent ran three live smoke runs on deepseek-v4.1-flash through the eval proxy. They are not logged in git; the record is the agent's report in its Amp thread:</p>
+<ul>
+<li><strong>Run 1</strong> (37 s, exit 0): <code>roc_eval</code> probed <code>[97.U8, 101, 105].contains(101)</code>, then <code>vowel_count</code> v1 passed the gate with 4 tests in 3911 ms and returned 7 for "Programming in Roc is Fun".</li>
+<li><strong>Run 2</strong>, a second process (15 s, exit 0): <code>vowel_count</code> returned 9 for "Self modifying harnesses learn", lessons #1 and #3 were selected and each scored +1, and <code>vowel_count</code> stood at 2/3 trial uses.</li>
+<li><strong>Run 3</strong> (about 2 min, exit 0): <code>ini_keys</code> was rejected twice, first because test 4 failed with <code>Fail("ERROR: refused: no such file")</code>, then for a type mismatch at line 11. The third proposal passed 5 tests in 10438 ms, issued <code>ReadFile("config.ini")</code> and returned <code>alpha,beta,gamma</code>. The model had tripped on <code>&amp;&amp;</code>, so "use <code>and</code>/<code>or</code>" was added to the cheat sheet.</li>
+</ul>
+
+<h2>The partial eval: QLOG, episode by episode</h2>
+<p>The Roc flavor ran part of one eval suite, <code>r1-qlog</code> on the "reuse" track (<a href="11-evals.html">Chapter 11</a> describes the suite). There are 8 episodes, and all of them share one state. Episode 1 gives the full spec of QLOG, an invented binary log format: LEB128 variable-length integers, zigzag encoding, a header and string table, Fletcher-16 checksums per record, and tags <code>0xA5</code>, <code>0xB6</code> and <code>0xC7</code>. It ends by telling the agent: "We will hand you QLOG files again ... Make sure you can handle QLOG files later without it." Episodes 2 to 8 only say "same QLOG format as before". The idea is to reward an agent that builds a reusable tool in episode 1. The per-episode timeout is 900 s. The model is not recorded in the result files.</p>
+<p>The entire result log is six lines:</p>
+<pre><code>[roc] r1-qlog t1 e1: FAIL (793.0s, 41 req)
+[roc] r1-qlog t1 e2: PASS (883.1s, 41 req)
+[roc] r1-qlog t1 e3: PASS (629.8s, 36 req)
+[roc] r1-qlog t1 e4: FAIL (901.9s, 12 req)
+[roc] r1-qlog t1 e5: FAIL (1567.3s, 9 req)
+[roc] r1-qlog t1 e6: PASS (1792.0s, 19 req)</code></pre>
+<span class="src">evals/results/roc-memory.log:1-6</span>
+<p>That is 3 passes out of 6 finished episodes. Episode 7 was running when the eval was stopped by hand, and episode 8 never started. PASS or FAIL is the suite's checker reading <code>answer.txt</code>, which is separate from whether <code>cmh</code> thought its own task succeeded.</p>
+<table>
+<tr><th>ep</th><th>roc_eval calls (errors)</th><th>propose_def (rejected)</th><th>userspace tool calls</th><th>outcome</th></tr>
+<tr><td>e1</td><td>44 (19)</td><td>0</td><td>0</td><td>FAIL, 40-turn limit</td></tr>
+<tr><td>e2</td><td>6 (3)</td><td>2 (1), <code>qlog_bytes_totals</code> trial v1</td><td>0</td><td>PASS (answer via Python)</td></tr>
+<tr><td>e3</td><td>10 (5)</td><td>4 (3), <code>qlog_level_times</code> trial v1</td><td>1 (2 requests)</td><td>PASS, the only <code>cmh</code> task success</td></tr>
+<tr><td>e4</td><td>0</td><td>0</td><td>0</td><td>FAIL, log stops early</td></tr>
+<tr><td>e5</td><td>0</td><td>0</td><td>0</td><td>FAIL, log stops early</td></tr>
+<tr><td>e6</td><td>1 (0)</td><td>2 (2)</td><td>4 × <code>qlog_level_times</code></td><td>PASS (answer via Python); tool kept</td></tr>
+<tr><td>e7</td><td>6 (2)</td><td>3 (3)</td><td>0</td><td>unfinished</td></tr>
+</table>
+
+<h3>Episode 1: the syntax wall</h3>
+<p>The agent first wrote a Python prototype for ground truth ("1766 valid + 32 corrupt" records), then made 44 <code>roc_eval</code> probes building parser helpers. Nineteen failed, and the errors read like the cheat sheet's warnings: missing match arrows, <code>if ... then</code> ("`then` isn't used in this Roc version"), <code>&amp;&amp;</code> instead of <code>and</code>, assignments in match arms without blocks, a missing Dict method, type mismatches. Some were JSON escaping: the model's <code>\"</code> escapes were consumed by JSON, leaving a broken Roc string. It hit the 40-turn limit while still bisecting a parse error and never proposed anything. Reflection saved three lessons, including "QLOG appears in many future tasks: keep a reusable parser...".</p>
+
+<h3>Episode 2: answer first, tool second</h3>
+<p><code>recall</code> found the episode 1 lesson. The agent solved the task (bytes per service) with about eleven Python scripts, and only then built a Roc tool, checking it in <code>roc_eval</code> until it returned <code>Done("api 500 ...")</code>. The first proposal was rejected because one test exercised the refusal path, and a test ending in <code>Fail(...)</code> always fails the gate, a limitation the README admits. The second passed: "qlog_bytes_totals v1 compiled, 4 test(s) passed in 51617 ms". It was never used again, so it stayed on trial.</p>
+
+<h3>Episode 3: the full path works once</h3>
+<p>The task was the earliest and latest ERROR time. After <code>show_def</code> on the earlier tool and some Python, three proposals were rejected: one made "more than 24 requests in one call; return Done(...) sooner", and two had tests ending in <code>Fail</code>. The fourth passed 5 tests in 17,719 ms and went live as <code>qlog_level_times</code> v1. On the real file the trace shows this chapter's design exactly: <code>[request] ReadBytes("night.qlog")</code>, then <code>[request] WriteFile("answer.txt", &lt;50 bytes&gt;)</code>, and a correct answer.</p>
+
+<h3>Episodes 4 and 5: lost to the infrastructure</h3>
+<p>Episode 4 read <code>qlog_bytes_totals</code>, wrote a Python reference, and drafted a <code>qlog_field_max.roc</code>. Then the log stops at 02:04:03. The orb was paused from 02:04:15 (see the caveat below), and the eval proxy recorded a 502, "The read operation timed out", tagged to this episode. We read it as the in-flight model request failing across the pause, then the episode being killed at its timeout. Episode 5 started a "distinct values of a field" tool and stopped after 9 requests.</p>
+<div class="warn"><strong>The orb-pause caveat.</strong> Episode 5's wall time is 1,567 s and episode 6's is 1,792 s, both well past the 900 s timeout. The orb (the cloud sandbox running the eval) was paused during episodes 4 to 6: the memory log <code>evals/results/memwatch.log</code> has gaps from 02:04:15 to 02:13:51, 02:18:51 to 02:43:56 and 02:49:56 to 03:13:54 (<a href="11-evals.html">Chapter 11</a>). Paused time counts against an episode's wall clock, and the watchdog only checks again after the orb resumes. Episodes 4 and 5 say nothing about the Roc flavor; treat the wall times of 4 to 6 as noise and the run as one partial sample, not a score.</div>
+
+<h3>Episode 6: the reuse moment</h3>
+<p>The task was the busiest UTC minute. The agent ran <code>show_def qlog_level_times</code> and called that tool four times, one <code>ReadBytes</code> each. The second call, with episode 3's use, made three clean uses, and the log shows <code>[gate] qlog_level_times v1 kept</code> (journaled at 02:45:02): cross-episode reuse completing the lifecycle on real work. But the tool answers "earliest and latest time", not "busiest minute", so the passing answer still came from Python. A new <code>qlog_minute_peak</code> was rejected twice (a <code>Fail</code> test, then the 24-request limit).</p>
+
+<h3>Episode 7: unfinished</h3>
+<p>The agent wrote a Python reference, read <code>qlog_level_times</code> so the new tool could reuse its proven parsing, and wrote <code>qlog_message_top.roc</code>. All three proposals were rejected. First, the tool hit the 24-request cap because "after writing the answer file, the tool kept re-writing (the write result extends `results`)", the cost of having no continuation. Second, an <code>expect_requests</code> check failed because a write renders as <code>WriteFile("answer.txt", &lt;8 bytes&gt;)</code>, not its contents. Third, another <code>Fail</code> test. The eval was stopped there.</p>
+
+<h3>What the run shows</h3>
+<p>At the end, userspace held <code>qlog_level_times</code> v1 (kept), <code>qlog_bytes_totals</code> v1 (unused trial) and 12 lessons. Our reading of the logs, not a measurement:</p>
+<ul>
+<li><strong>Unfamiliar syntax was the main cost.</strong> Episode 1 spent its whole budget in the scratchpad, and in every episode Python came before the Roc tool.</li>
+<li><strong>The scratchpad worked.</strong> Most syntax errors were caught in <code>roc_eval</code>; gate rejections were about contracts and test design.</li>
+<li><strong>Two kernel frictions recurred.</strong> <code>Fail</code> tests rejected proposals five times, and tools that did not notice "I already wrote the file" hit the 24-request cap three times.</li>
+<li><strong>Reuse happened, narrowly.</strong> One tool was reused and kept, but tools answered one question each instead of parsing QLOG in general.</li>
+</ul>
+
+<h2>Limitations</h2>
+<p>Beyond the Debug build and the two gate frictions above, the README lists a few more. Paths are checked and then opened, so a symlink swapped in between is not caught, and <code>Bash</code> can break every rule, as in the other flavors. Hooks get only the SPEC arguments. Two more follow from the design rather than the README: a call with N requests costs N + 1 child runs, and the compiler is pre-release, so the pin, the cheat sheet and <code>check-reference</code> must move together. Finally, SPEC.md still says "One design, four implementations" and has no Roc row, while the Roc README calls itself "the seventh implementation".</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>A language with no <code>eval</code> can still have a live, self-modifying userspace if the host embeds the compiler: the Zig host compiles a fresh program for every call.</li>
+<li>Pure code plus requests as data move every side effect into the kernel. Tools return <code>ReadFile(...)</code> or <code>WriteFile(...)</code> as values, the host checks and performs them, a refusal is just the next input, and tests can script the I/O.</li>
+<li>A forked child per call is the one wall that covers hangs, crashes, stack overflows and compiler panics, and it is cheap because the warm compiler is shared copy-on-write.</li>
+<li>Measure before you design. One growing session took 4.2 s to add a definition at 100 stored definitions. Compiling only each call's dependency closure stays at about 0.3-0.4 s, and a strict naming rule makes the simple lexical dependency scan safe.</li>
+<li>For a dialect the model does not know, a scratchpad and a cheat sheet checked against the compiler (68 examples) matter as much as the gate.</li>
+<li>The one partial eval (3 of 6 finished QLOG episodes passed) shows the full loop: a tool proposed, used through requests, reused in a later episode and kept. It is a small, noisy sample, slowed by unfamiliar syntax and two kernel frictions and disrupted by orb pauses.</li>
+</ul>
+</main>
+<footer class="nav"><a href="09-wasm.html">← The whole harness in WebAssembly: the agent rewrites its own kernel</a><a href="index.html">Contents</a><a href="11-evals.html">Measuring it: the eval suite and the results →</a></footer>
+</body></html>

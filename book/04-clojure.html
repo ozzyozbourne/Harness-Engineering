@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4. Clojure: eval into namespaces · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 4</header>
+<main>
+<h1>4. Clojure: eval into namespaces</h1>
+<p class="subtitle">The agent's code and the harness are written in the same language, and new code goes live as soon as it is evaluated</p>
+
+<p>The first flavor of cmh, the "continual, self-modifying harness" from <code>SPEC.md</code>, is written in Clojure. That makes it a good place to start. The question every flavor has to answer is how text written by a model becomes a function the harness can call. In Clojure the answer is short: the language can already do this at runtime. The harness creates a fresh namespace, evaluates the agent's source inside it, and looks up a function by name. It needs no compiler step, no files on disk, no restart and no plugin system.</p>
+
+<p>The kernel is 1,070 lines of Clojure in nine files under <code>clojure/src/cmh/kernel/</code>, with 214 lines of tests. (All 17 tracked files of the flavor, including tests, seeds, launcher and README, come to 1,427 lines.) It runs on the JVM, and its only runtime dependencies are Clojure 1.12.6 and <code>data.json</code> 2.5.2. This chapter explains the language briefly, then follows the code from the bottom up: how code is loaded, how state is kept, the gate, the loop, the tools, knowledge, hooks, seeds, the provider and the CLI. It ends with what Clojure makes easy and the one big thing it makes hard: keeping the agent's code from hurting the harness.</p>
+
+<h2>A tiny Clojure primer</h2>
+
+<p>Clojure is a Lisp that runs on the Java Virtual Machine. If you know Java, Python or JavaScript, a few ideas are enough to read every excerpt in this chapter.</p>
+
+<p><strong>Everything is an expression in parentheses.</strong> A function call puts the function first, inside the parentheses: <code>(count xs)</code> instead of <code>count(xs)</code>, and <code>(+ 1 2)</code> instead of <code>1 + 2</code>. Commas are optional and count as whitespace.</p>
+
+<p><strong>Data literals.</strong> <code>[1 2 3]</code> is a vector (an array-like list). <code>{:name "bash" :kind "tool"}</code> is a map (a dictionary). Words that start with a colon, like <code>:name</code>, are <em>keywords</em>: small interned names used as map keys. A keyword is also a function that looks itself up in a map, so <code>(:name m)</code> means <code>m["name"]</code>. <code>#{"a" "b"}</code> is a set, and a set used as a function tests membership.</p>
+
+<p><strong>Defining things.</strong> <code>(defn run [input] ...)</code> defines a function named <code>run</code> with one parameter. <code>(def x 3)</code> defines a value. <code>(let [a 1 b 2] ...)</code> binds local names. <code>#(...)</code> is a short anonymous function whose argument is <code>%</code>.</p>
+
+<p><strong>Data is immutable.</strong> <code>(assoc m :k v)</code> returns a <em>new</em> map with one key changed and leaves <code>m</code> alone. To have something that changes over time, Clojure uses an <em>atom</em>: a box holding one immutable value. <code>@a</code> reads the box, and <code>(swap! a f)</code> replaces its contents with <code>(f old)</code>. By convention, functions with side effects end in <code>!</code>.</p>
+
+<p><strong>Threading macros.</strong> <code>(-&gt; x (f a) (g b))</code> means <code>(g (f x a) b)</code>. It is a pipeline that passes the value along as the first argument. <code>-&gt;&gt;</code> passes it as the last argument instead.</p>
+
+<p><strong>Namespaces and vars.</strong> This idea carries the whole chapter. Clojure code lives in <em>namespaces</em>, which are like Java packages or Python modules. Unlike those, a namespace is an ordinary object in the running program: you can create one with <code>create-ns</code>, fill it, look inside it with <code>ns-interns</code>, and delete it with <code>remove-ns</code>. Each <code>defn</code> creates a <em>var</em>, a named, mutable slot in the current namespace that holds the function. Finally, <code>load-string</code> reads a string of Clojure source and evaluates it, just as the REPL (the interactive prompt) does. Clojure compiles each form to JVM bytecode on the fly.</p>
+
+<div class="note">Lisps are <em>homoiconic</em>: programs are written as the language's own data structures (lists, vectors, maps). Chapter 1 explains why that matters for self-modification. In practice it means Clojure ships the parts an agent harness needs, a reader and <code>eval</code>, as ordinary library functions in <code>clojure.core</code>.</div>
+
+<p>Here is a complete userspace tool, the seed <code>word_count</code>. It is three lines long:</p>
+
+<pre><code>;; Tool: (run input) -&gt; string, input is a keyword-keyed map.
+(defn run [input]
+  (str (count (re-seq #"\S+" (str (:text input))))))</code></pre>
+<span class="src">clojure/seed/word_count.clj:1-3</span>
+
+<p>Read it from the inside out: take <code>:text</code> from the input map, make sure it is a string, find every run of non-space characters (<code>re-seq</code> with a regex literal <code>#"\S+"</code>), count them, and turn the count back into a string. Every tool the agent writes has this shape: a function named <code>run</code> that takes a map and returns a string.</p>
+
+<h2>How eval into versioned namespaces works</h2>
+
+<p>The idea is simple. Every version of every definition gets its own namespace. Evaluating the source there creates the vars, and the kernel finds the entry var by name when it needs it. Switching versions only moves a pointer in the state.</p>
+
+<div class="diagram">propose_def word_count v2
+        │
+        ▼
+  cmh.scratch.word_count.&lt;uuid&gt;      load source, find (defn run ...),
+  (throwaway namespace)              run the agent's tests
+        │                            ── always remove-ns afterwards
+        │ tests pass
+        ▼
+  state: :defs "word_count" :live 2  ← only a number changes
+        │
+        ▼ next call
+  cmh.user.word_count.v2-9f1c03a4b2e7  created and loaded lazily,
+  (one namespace per version)          then var "run" is looked up and called
+</div>
+
+<p>(The hash in the diagram is made up; the real one is the first 6 bytes of the SHA-256 of the source, written as 12 hex digits.)</p>
+
+<h3>Loading source into a namespace</h3>
+
+<p>Everything goes through one function, <code>load-into!</code>:</p>
+
+<pre><code>(defn load-into!
+  "Create namespace ns-sym, which must not exist yet, and evaluate source
+  inside it. On failure the namespace is removed again."
+  [ns-sym source ms]
+  (let [n (create-ns ns-sym)]
+    (try
+      (with-timeout ms (fn []
+                         (binding [*ns* n]
+                           (refer-clojure)
+                           (load-string source))))
+      n
+      (catch Throwable e (remove-ns ns-sym) (throw e)))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/evaluator.clj:48-59</span>
+
+<p><code>*ns*</code> is a special var that names "the current namespace". <code>binding</code> sets it temporarily, so every <code>defn</code> in the agent's source lands in the new namespace and not in the kernel's. <code>refer-clojure</code> makes the core library (<code>defn</code>, <code>str</code>, <code>map</code> …) visible there. The agent can also <code>(require ...)</code> any other library on the classpath, and the <code>propose_def</code> description says so.</p>
+
+<p>Finding the entry point is a map lookup. <code>ns-interns</code> returns a map from symbol to var for one namespace:</p>
+
+<pre><code>(defn entry-fn [n sym]
+  (let [v (get (ns-interns n) sym)]
+    (when (and (var? v) (fn? @v)) v)))</code></pre>
+<span class="src">clojure/src/cmh/kernel/evaluator.clj:61-63</span>
+
+<p>The entry names are fixed. Tools define <code>run</code>, and the two hooks define <code>compose-system</code> and <code>select-lessons</code> (a small <code>hooks</code> table, <code>evaluator.clj:27-36</code>).</p>
+
+<h3>Scratch validation</h3>
+
+<p>Before a proposal goes live, it is loaded into a namespace with a random name and tested there. The <code>finally</code> clause deletes that namespace whatever happens, so a broken proposal leaves nothing behind:</p>
+
+<pre><code>(defn validate-in-scratch
+  "Evaluate source in a fresh scratch namespace, check the entry point and
+  run the tests. The scratch namespace is always removed, so a failing
+  proposal never touches the live version's namespace. nil = ok."
+  [{:keys [kind name source tests]} ms]
+  (let [ns-sym (symbol (str "cmh.scratch." name "." (random-uuid)))]
+    (try
+      (let [n (load-into! ns-sym source ms)
+            sym (entry-sym kind name)]
+        (if-let [v (entry-fn n sym)]
+          (run-tests kind name v tests ms)
+          (str "source must define (defn " sym " ...)")))
+      (catch Throwable e (str "eval failed: " (describe-error e)))
+      (finally (when (find-ns ns-sym) (remove-ns ns-sym))))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/evaluator.clj:105-118</span>
+
+<p>The <code>{:keys [kind name source tests]}</code> in the parameter list is <em>destructuring</em>: it pulls those four keys out of the map argument into local names. The test <code>late-binding</code> checks afterwards that no namespace starting with <code>cmh.scratch.</code> is left (<code>kernel_test.clj:70-71</code>).</p>
+
+<p>A test is <code>{"input": {...}, "expect": "..."}</code>. It passes when the output contains <code>expect</code> as a substring. Non-string results, such as the id list from <code>select_lessons</code>, are JSON-encoded before the comparison (<code>run-tests</code>, <code>evaluator.clj:89-103</code>).</p>
+
+<h3>Late binding: look it up on every call</h3>
+
+<p>Live versions are named <code>cmh.user.&lt;name&gt;.v&lt;N&gt;-&lt;hash&gt;</code>. The hash of the source keeps two kernels in one JVM (as happens in the tests) from sharing a namespace by accident. The namespace is created lazily, on the first call:</p>
+
+<pre><code>(defn live-entry
+  "Resolve the entry var of a live record, loading its namespace on first use."
+  [{:keys [kind name version source]} ms]
+  (let [ns-sym (live-ns-sym name version source)
+        n (locking load-lock (or (find-ns ns-sym) (load-into! ns-sym source ms)))]
+    (or (entry-fn n (entry-sym kind name))
+        (throw (ex-info (str "entry point " (entry-sym kind name) " missing in " ns-sym) {})))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/evaluator.clj:132-138</span>
+
+<p>The caller, <code>gate/call-live</code>, reads the live record from the state atom <em>at call time</em>, resolves the var, calls it, and records the use:</p>
+
+<pre><code>(defn call-live
+  "Late-bound call: look up the live version of name now, call it, record the
+  use. Returns {:ok true :value v} or {:ok false :error e}, plus :version,
+  :status, or {:missing true} when nothing is live."
+  [k name input input-desc]
+  (if-let [rec (st/live-record @(:state k) name)]
+    (let [res (try {:ok true
+                    :value (ev/invoke (:kind rec) name (ev/live-entry rec (:validate-ms k))
+                                      (ev/args-for (:kind rec) name input) (:call-ms k))}
+                   (catch Throwable e {:ok false :error (ev/describe-error e)}))]
+      (record-use! k rec (:ok res) (:error res) input-desc)
+      (assoc res :version (:version rec) :status (:status rec)))
+    {:ok false :missing true :error (str "no live definition named " name)}))</code></pre>
+<span class="src">clojure/src/cmh/kernel/gate.clj:111-123</span>
+
+<p>This is the key design choice of the flavor. The kernel never keeps a function reference between calls. It keeps <em>data</em> (which version is live) and turns that into a function only at the last moment. So going live and reverting are both a change to one number in a map. The <code>late-binding</code> test checks the result directly: right after <code>propose!</code> returns, the very next call in the same process gets <code>"words=3"</code> from v2 and no longer <code>"3"</code> from v1 (<code>kernel_test.clj:62-69</code>).</p>
+
+<h2>The architecture, file by file</h2>
+
+<p>The files depend on each other in one direction: <code>state</code> ← <code>knowledge</code>, <code>evaluator</code> ← <code>gate</code> ← <code>tools</code> ← <code>agent</code> ← <code>main</code>.</p>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>What it does</th></tr>
+<tr><td><code>state.clj</code></td><td>129</td><td>Journal-backed state: the pure <code>apply-event</code>, <code>replay</code>, <code>emit!</code>, queries</td></tr>
+<tr><td><code>evaluator.clj</code></td><td>138</td><td>Loading userspace into namespaces, timeouts, return checks, running tests</td></tr>
+<tr><td><code>gate.clj</code></td><td>123</td><td>Static checks, propose, trial, soak, keep, revert, rollback, late-bound calls</td></tr>
+<tr><td><code>knowledge.clj</code></td><td>51</td><td>Lessons and verdicts: add with dedupe, recall, scoring, retirement</td></tr>
+<tr><td><code>tools.clj</code></td><td>144</td><td>The nine kernel tools and their JSON schemas</td></tr>
+<tr><td><code>agent.clj</code></td><td>275</td><td>Opening a kernel, seeds, prompt assembly, the loop, reflection, refine</td></tr>
+<tr><td><code>provider.clj</code></td><td>76</td><td>Anthropic Messages API client and a scripted mock</td></tr>
+<tr><td><code>base_prompt.clj</code></td><td>30</td><td>Loads <code>../base-prompt.md</code>, with an embedded copy as fallback</td></tr>
+<tr><td><code>main.clj</code></td><td>104</td><td>CLI parsing, commands, the REPL</td></tr>
+<tr><td><code>test/cmh/kernel_test.clj</code></td><td>214</td><td>10 tests, 66 assertions</td></tr>
+</table>
+
+<p>One small wart comes from that ordering. <code>tools</code> requires <code>gate</code>, so <code>gate</code> cannot require <code>tools</code> to learn the kernel tool names it must protect. It keeps its own copy of the set, and a test checks that the two copies are equal (<code>gate.clj:11-15</code>, <code>kernel_test.clj:75</code>).</p>
+
+<p>The "kernel" itself is not a class. It is a plain map, conventionally called <code>k</code>, that <code>agent/open</code> builds and every function takes as its first argument:</p>
+
+<pre><code>        k {:home home
+           :state-dir sd
+           :journal journal
+           :kernel-dir (io/file home "src" "cmh" "kernel")
+           :state (atom (st/replay events))
+           :provider provider
+           :soak soak
+           :reflect reflect
+           :validate-ms 10000
+           :call-ms 30000
+           :max-turns 40
+           :base-prompt (bp/load-base-prompt home)
+           :trace (or trace (fn [line] (binding [*out* *err*] (println line) (flush))))}]</code></pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:41-53</span>
+
+<p>The numbers that matter are there: 10 seconds to load and test a proposal, 30 seconds for a live call, 40 turns per task, and the soak, which defaults to 3 clean uses (<code>agent.clj:35</code>). Only one entry can change over time, <code>:state</code>, the atom.</p>
+
+<h2>State and the journal</h2>
+
+<p>As <a href="02-shared-design.html">Chapter 2</a> explains, the journal (<code>&lt;state&gt;/journal.jsonl</code>, with the state dir defaulting to <code>.cmh</code>) is the only source of truth. Clojure's immutable data fits this well. The in-memory state is one immutable map, <code>{:defs {} :knowledge {} :order [] :tasks []}</code>, and every change is a <em>pure</em> function from (old state, event) to new state. Here are the two branches that move the live pointer back and forth:</p>
+
+<pre><code>    "def_kept"
+    (-&gt; st (set-status name version "kept")
+        (assoc-in [:defs name :live] version)
+        (assoc-in [:defs name :kept] version)
+        (assoc-in [:defs name :uses] 0))
+
+    "def_reverted"
+    (let [d (get-in st [:defs name])]
+      (-&gt; st (set-status name version "reverted")
+          (assoc-in [:defs name :versions version :error] (:error ev))
+          (cond-&gt; (= version (:live d)) (assoc-in [:defs name :live] (:kept d)))
+          (assoc-in [:defs name :uses] 0)))</code></pre>
+<span class="src">clojure/src/cmh/kernel/state.clj:48-59</span>
+
+<p>A revert sets <code>:live</code> back to <code>:kept</code>. If nothing was ever kept, that is <code>nil</code>, and the definition disappears. Replay is a single line, <code>(defn replay [events] (reduce apply-event empty-state events))</code> (<code>state.clj:92</code>). Live updates use the same function:</p>
+
+<pre><code>(defn emit!
+  "Append one event to the journal and apply it. The event is round-tripped
+  through JSON first so live state equals replayed state exactly."
+  [k ev]
+  (locking (:state k)
+    (let [line (json/write-str (assoc ev :ts (str (Instant/now))))
+          ev' (json/read-str line :key-fn keyword)]
+      (with-open [w (io/writer (:journal k) :append true)]
+        (.write w (str line "\n")))
+      (swap! (:state k) apply-event ev')
+      ev')))</code></pre>
+<span class="src">clojure/src/cmh/kernel/state.clj:94-104</span>
+
+<p>The JSON round trip is a small but careful detail. The event is written, read back, and only the read-back copy is applied. Anything JSON cannot represent (a keyword value becomes a string, a set becomes a vector) is changed the same way live as it will be on replay. That is why the <code>persistence</code> test can check that a kernel reopened from the journal has <em>exactly</em> the same state map, compared with plain <code>=</code> (<code>kernel_test.clj:137</code>). When the journal is read, unparseable lines are skipped, with the comment "torn final line after a crash" (<code>state.clj:89</code>).</p>
+
+<p>The eleven event types are <code>def_proposed</code>, <code>def_rejected</code>, <code>def_trial</code>, <code>def_use</code>, <code>def_kept</code>, <code>def_reverted</code>, <code>lesson_added</code>, <code>lesson_scored</code>, <code>lesson_retired</code>, <code>task_started</code> and <code>task_finished</code>. Even the soak counters need no event of their own: <code>apply-event</code> increments <code>:uses</code> on a <code>def_use</code> only when the use was ok, the version is live, and its status is <code>trial</code> (<code>state.clj:41-46</code>). Replaying the journal therefore rebuilds the counters for free.</p>
+
+<p>The compiled namespaces are only a cache. A fresh process has none of them, and <code>live-entry</code> reloads each live version the first time it is called.</p>
+
+<h2>The gate</h2>
+
+<p><code>propose_def</code> is the only way userspace changes. <code>gate/propose!</code> (<code>gate.clj:57-92</code>) runs in four stages:</p>
+
+<ol>
+<li><strong>Static check</strong> (<code>gate.clj:24-39</code>). The name must match <code>[A-Za-z][A-Za-z0-9_-]{0,63}</code>. The kind must be <code>tool</code>, <code>note</code> or <code>hook</code>, and an existing definition cannot change kind. A tool cannot take a kernel tool's name. A hook must be called <code>compose_system</code> or <code>select_lessons</code>. The source must not be empty. Tools and hooks need at least one test. A tool's <code>input_schema</code> must be a map; a missing one defaults to <code>{"type": "object"}</code> (<code>gate.clj:68-69</code>).</li>
+<li><strong>Journal the proposal.</strong> If the proposal has a name, it is written as <code>def_proposed</code> even when the static check failed. Only nameless proposals are rejected without a journal entry (comment at <code>gate.clj:71-73</code>).</li>
+<li><strong>Validate in scratch</strong> (not for notes, which are plain text), under the 10-second limit. On failure the gate emits <code>def_rejected</code> and tells the model the error, ending with "(live version unchanged)".</li>
+<li><strong>Go live as a trial.</strong> If the current live version is itself still a trial, it is reverted first with "superseded by vN". Then <code>def_trial</code> makes the new version live at once.</li>
+</ol>
+
+<p>Models sometimes send structured fields as JSON-encoded strings, so a small helper, <code>parse-json-ish</code>, accepts tests and schemas in either form (<code>gate.clj:17-22</code>).</p>
+
+<h3>Soak: kept after three clean uses, reverted on the first error</h3>
+
+<pre><code>(defn record-use!
+  "Journal one use and run soak accounting for trial versions."
+  [k {:keys [name version status] :as rec} ok error input-desc]
+  (st/emit! k {:type "def_use" :name name :version version :ok ok :error error})
+  (when (= "trial" status)
+    (if-not ok
+      (revert! k rec error input-desc)
+      (let [uses (get-in @(:state k) [:defs name :uses] 0)]
+        (when (&gt;= uses (:soak k)) (keep! k rec uses))))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/gate.clj:101-109</span>
+
+<p>Only trials are judged. A kept version that throws returns an error to the model but is never reverted (<code>kernel_test.clj:123-126</code>). Both <code>keep!</code> and <code>revert!</code> also write a <em>verdict</em>, a knowledge entry the agent will see in later prompts. The <code>soak-revert</code> test checks this one with a regex:</p>
+
+<pre><code>def word_count v2 ("ratio-based count") reverted: ArithmeticException: Divide by zero on input {"text":""}</code></pre>
+
+<p>Notes are never called, so they soak over tasks instead. <code>soak-notes!</code> (<code>agent.clj:213-220</code>) counts one use for each note that was on trial when the task started and is still that live version. A successful task is a clean use, and a failed one reverts the note with "task failed: …".</p>
+
+<p><code>rollback_def</code> does not flip any switch. It takes the old version's fields and proposes them again as a <em>new</em> version through the full gate (<code>gate.clj:94-99</code>), so the old code is re-validated. As far as the code shows, it accepts any recorded version, including one that was rejected; the gate would simply reject it again if it still fails.</p>
+
+<h2>The agent loop</h2>
+
+<p><code>run-task!</code> (<code>agent.clj:239-251</code>) is short. It makes a random UUID as the task id, selects lessons, snapshots the notes on trial, emits <code>task_started</code>, runs the turn loop, and finishes the task. The loop itself is a Clojure <code>loop</code>/<code>recur</code> over the message list:</p>
+
+<pre><code>  (loop [messages [{:role "user" :content task}] tool-errors [] turn 0 answer ""]
+    (if (&gt;= turn (:max-turns k))
+      (do (swap! errors conj "max turns exceeded")
+          {:stop_reason "max_turns" :answer answer :tool-errors tool-errors})
+      (let [resp (try (provider/complete (:provider k)
+                                         {:system (system-blocks k errors lesson-ids)
+                                          :messages messages
+                                          :tools (tool-list k)})
+                      (catch Throwable e
+                        (swap! errors conj (str "model request failed: " (ev/describe-error e)))
+                        (st/trace k "[kernel] model request failed: " (ev/describe-error e))
+                        nil))]</code></pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:184-195</span>
+
+<p>Note what is inside the loop: <code>system-blocks</code> and <code>tool-list</code> are rebuilt <em>for every model request</em>. If the agent proposes a new tool in turn 1, the tool is in the tool list of turn 2. If it redefines the <code>compose_system</code> hook, the next request already uses the new system prompt. The tests check both cases (<code>kernel_test.clj:204</code> and <code>hook-redefinition</code>, <code>:146-159</code>). In a mock run, a three-request task produced three <code>def_use compose_system</code> events.</p>
+
+<p>The loop continues while the response's <code>stop_reason</code> is <code>tool_use</code> and the response contains tool_use blocks. It runs them in order, appends the tool results as the next user message, and recurs. Otherwise it returns. The last non-blank assistant text becomes the answer.</p>
+
+<h3>Deciding whether the task succeeded</h3>
+
+<pre><code>(defn- finish-task!
+  "Journal the outcome, score the selected lessons, soak trial notes and
+  reflect. Returns result with :success :error :errors added."
+  [k {:keys [id errors lesson-ids trial-notes transcript]} {:keys [stop_reason tool-errors] :as result}]
+  (let [error (cond (seq @errors) (str/join "; " @errors)
+                    (not= "end_turn" stop_reason) (str "stop_reason " stop_reason)
+                    (some true? (take-last 2 tool-errors)) "tool error in final tool results")
+        success (nil? error)]
+    (st/emit! k {:type "task_finished" :id id :success success :error error})
+    (st/trace k "[task] " (if success "success" (str "failed: " error)))
+    (kn/score! k lesson-ids success)
+    (soak-notes! k trial-notes success error)
+    (when (:reflect k)
+      (swap! transcript conj (str "OUTCOME: " (if success "success" (str "failed: " error))))
+      (reflect! k (str/join "\n" @transcript)))
+    (assoc result :success success :error error :errors @errors)))</code></pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:222-237</span>
+
+<p>A task fails if the kernel recorded any error (a failed model request, a failed hook, too many turns), if the model stopped for any reason other than <code>end_turn</code>, or if either of the last two tool results was an error. Otherwise it succeeds. That is a self-report, not a check of the answer; the ROADMAP lists it as a gap.</p>
+
+<h2>Prompt assembly and the two hooks</h2>
+
+<p>The system prompt has at most two blocks, and the first one is fixed:</p>
+
+<pre><code>(defn system-blocks [k errors lesson-ids]
+  (let [sup (supplemental k errors lesson-ids)]
+    (cond-&gt; [{:type "text" :text (:base-prompt k)}]
+      (not (str/blank? sup)) (conj {:type "text" :text sup}))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:106-109</span>
+
+<p>Block 1 is the base prompt from <code>base-prompt.md</code>. Block 2, the "supplemental" prompt, is left out when empty; it is where userspace has a say. <code>supplemental</code> (<code>agent.clj:92-104</code>) collects the source text of every live note and the text of the selected lessons, then calls the <code>compose_system</code> hook with both lists. Afterwards it <em>always</em> appends a "## Verdicts on past userspace changes" section with the last 20 verdicts. No hook can hide the history of the agent's own changes, or remove the base prompt.</p>
+
+<p>The other hook, <code>select_lessons</code>, picks which lessons go into the prompt. It receives the task text and the active lessons as maps with <code>:id :text :score</code> and returns a list of ids. The kernel is suspicious of the answer: it turns every id into a string, drops ids that do not exist, and removes duplicates (<code>agent.clj:82-90</code>). With no active lessons it returns <code>[]</code> without calling the hook at all.</p>
+
+<p>Both hooks go through <code>call-hook</code>, which shows what happens when userspace fails at a moment the kernel cannot skip:</p>
+
+<pre><code>  (loop [tries 0]
+    (let [r (gate/call-live k name input desc)]
+      (cond
+        (:ok r) (:value r)
+        (:missing r) (fallback)
+        (and (= "trial" (:status r)) (zero? tries)) (recur 1)
+        :else (do (swap! errors conj (str name " v" (:version r) ": " (:error r)))
+                  (st/trace k "[kernel] hook " name " failed: " (:error r) "; using builtin")
+                  (fallback))))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:72-80</span>
+
+<p>If a trial version fails, <code>call-live</code> has already reverted it, so the restored version is tried once. If no definition exists, a builtin fallback is used. Any other failure also uses the builtin, but the error is recorded and the task will be marked as failed. A broken hook therefore never stops the agent from working, but it does show up in the score.</p>
+
+<h2>Kernel tools</h2>
+
+<p>The model always sees nine kernel tools, followed by one entry for each live userspace tool (<code>tool-list</code>, <code>agent.clj:111-114</code>).</p>
+
+<table>
+<tr><th>Tool</th><th>Behavior</th></tr>
+<tr><td><code>bash</code></td><td><code>bash -c</code> through <code>ProcessBuilder</code> in the caller's working directory, stderr merged. Timeout <code>timeout_s</code> (default 60), then <code>destroyForcibly</code>. Output truncated to 20,000 characters, plus <code>[exit code N]</code>.</td></tr>
+<tr><td><code>read_file</code></td><td><code>slurp</code>, truncated to 50,000 characters</td></tr>
+<tr><td><code>write_file</code></td><td>Refuses the state dir and the kernel source; creates parent directories</td></tr>
+<tr><td><code>list_defs</code></td><td>Name, kind, live version, status, clean uses for trials, description</td></tr>
+<tr><td><code>show_def</code></td><td>A version (default: live, else latest) with its source and tests, as JSON</td></tr>
+<tr><td><code>propose_def</code></td><td>The gate</td></tr>
+<tr><td><code>rollback_def</code></td><td>Re-propose an old version as a new trial</td></tr>
+<tr><td><code>remember</code></td><td>Add a lesson with source <code>"model"</code></td></tr>
+<tr><td><code>recall</code></td><td>Lessons and verdicts sharing a word with the query</td></tr>
+</table>
+
+<p>The <code>propose_def</code> description is worth reading, because it is the only place where the model learns the Clojure contracts. It is the language manual in one paragraph:</p>
+
+<pre><code>    :description (str "Propose a new version of a userspace definition. It is validated in a scratch namespace, "
+                      "goes live as a trial, and is kept after clean uses or reverted on error. "
+                      "Language: Clojure. kind=tool: source must define (defn run [input] ...) where input is a "
+                      "keyword-keyed map and the result is a string; give input_schema. kind=hook: name "
+                      "compose_system defines (defn compose-system [notes lessons] ...) -&gt; string (both are vectors "
+                      "of strings); name select_lessons defines (defn select-lessons [task lessons] ...) -&gt; vector of "
+                      "ids (lessons are maps with :id :text :score). kind=note: source is plain prompt text. "
+                      "tests: [{\"input\": {...}, \"expect\": \"substring of output\"}], at least one for tools and "
+                      "hooks; hook test input is {\"notes\",\"lessons\"} or {\"task\",\"lessons\"}; select_lessons "
+                      "output is compared JSON-encoded. Use clojure.string etc. via (require ...).")</code></pre>
+<span class="src">clojure/src/cmh/kernel/tools.clj:30-39</span>
+
+<p>Here is the <code>write_file</code> guard. It compares canonical paths, so <code>..</code> segments and symlinks are resolved before the check:</p>
+
+<pre><code>(defn- write-file [k {:keys [path content]}]
+  (cond
+    (str/blank? path) {:content "path is required" :is_error true}
+    (inside? path (:state-dir k)) {:content "refused: path is inside the state dir" :is_error true}
+    (inside? path (:kernel-dir k)) {:content "refused: path is inside the kernel source" :is_error true}
+    :else (let [f (io/file path)]
+            (when-let [parent (.getParentFile (.getAbsoluteFile f))] (.mkdirs parent))
+            (spit f (str content))
+            {:content (str "wrote " (count (str content)) " chars to " path)})))</code></pre>
+<span class="src">clojure/src/cmh/kernel/tools.clj:83-91</span>
+
+<p><code>run-tool</code> (<code>tools.clj:121-144</code>) dispatches with a <code>case</code> and wraps everything in a catch-all, so an exception in any kernel tool becomes an <code>is_error</code> tool result instead of a crash.</p>
+
+<h2>Lessons, verdicts and reflection</h2>
+
+<p><code>knowledge.clj</code> holds two kinds of entries: lessons (ids <code>L1</code>, <code>L2</code> …) and verdicts (<code>V1</code> …). A new lesson whose text matches an existing one after normalizing whitespace and case is skipped (<code>knowledge.clj:15-31</code>). <code>recall</code> matches on shared words of three or more letters or digits.</p>
+
+<p>Scoring is crude on purpose:</p>
+
+<pre><code>(defn score!
+  "+1 to each selected lesson on success, -1 on failure; retire at &lt;= -3."
+  [k ids success?]
+  (doseq [id ids]
+    (let [l (get-in @(:state k) [:knowledge id])]
+      (when (and l (= "lesson" (:kind l)) (not (:retired l)))
+        (let [score ((if success? inc dec) (:score l))]
+          (st/emit! k {:type "lesson_scored" :id id :delta (if success? 1 -1) :score score})
+          (when (&lt;= score retire-at)
+            (st/emit! k {:type "lesson_retired" :id id})
+            (st/trace k "[lesson] " id " retired at score " score)))))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/knowledge.clj:41-51</span>
+
+<p>Every lesson that was put in the prompt shares the credit or the blame for the whole task. A lesson whose score reaches −3 (for a new lesson, three failed tasks in a row) is retired, and retired lessons are neither selected nor scored again (test <code>lesson-scoring</code>).</p>
+
+<p>After each task, <code>reflect!</code> (<code>agent.clj:144-162</code>) makes one more model call with only the base prompt as system and no tools. It sends a compact transcript: the task, assistant texts clipped to 400 characters, one line per tool call with its input and result each clipped to 200, and the outcome. It asks for "only a JSON array of 0 to 3 short, reusable lessons". The kernel takes the text from the first <code>[</code> to the last <code>]</code> in the reply, parses it, keeps strings of at most 400 characters, adds up to three of them, and only traces errors. <code>--no-reflect</code> turns this off.</p>
+
+<p><code>refine</code> is a task like any other, with a fixed prompt built from the last 10 tasks, the last 15 verdicts, the definitions table and the active lessons. The prompt asks for "at most 3 changes" and allows "make no changes and say so" (<code>agent.clj:253-275</code>).</p>
+
+<h2>Seeds</h2>
+
+<p>A fresh state dir is not empty. When the journal has no events, <code>install-seeds!</code> (<code>agent.clj:25-30</code>) reads <code>seed/seeds.edn</code> (EDN is Clojure's data format, like JSON with keywords and sets) and writes each seed as a <code>def_proposed</code> version 1 followed by <code>def_kept</code>. The seeds skip the gate at install time; the test <code>seeds-pass-their-own-tests</code> checks that they would pass it. There are three: <code>word_count</code> (shown above) and the two hooks.</p>
+
+<pre><code>;; Hook: (compose-system notes lessons) -&gt; string
+;; notes and lessons are vectors of strings. The kernel prepends the base prompt.
+(require '[clojure.string :as str])
+
+(defn- section [title items]
+  (when (seq items)
+    (str "## " title "\n" (str/join "\n" (map #(str "- " %) items)))))
+
+(defn compose-system [notes lessons]
+  (str/join "\n\n" (remove nil? [(section "Notes" notes)
+                                 (section "Lessons" lessons)])))</code></pre>
+<span class="src">clojure/seed/compose_system.clj:1-11</span>
+
+<pre><code>(defn select-lessons [task lessons]
+  (let [tw (words task)
+        ranked (sort-by #(- (:score %)) lessons)
+        matching (filter #(seq (set/intersection tw (words (:text %)))) ranked)]
+    (mapv :id (if (seq matching) (take 8 matching) (take 3 ranked)))))</code></pre>
+<span class="src">clojure/seed/select_lessons.clj:9-13</span>
+
+<p>The seed <code>select_lessons</code> takes up to 8 lessons that share a word of four or more letters with the task, best score first, and falls back to the top 3. Seeds are not special: they are kept version 1 of ordinary definitions, and the agent can replace them through the gate like anything else.</p>
+
+<h2>The provider</h2>
+
+<p><code>provider.clj</code> talks to the Anthropic Messages API using the JDK's own <code>java.net.http.HttpClient</code>. This is Java interop: <code>(HttpClient/newBuilder)</code> calls a static Java method, and <code>(.build x)</code> calls an instance method. It forces HTTP/1.1, with a 30-second connect timeout and a 600-second request timeout. The base URL comes from <code>ANTHROPIC_BASE_URL</code> (the eval suite points it at a proxy), and authentication uses an API key or an OAuth token from the environment. Every request asks for <code>max_tokens 32000</code>. Responses are parsed with <code>:key-fn keyword</code>, so tool inputs arrive as keyword-keyed maps, exactly what a <code>run</code> function expects. The retry loop:</p>
+
+<pre><code>         (loop [attempt 0]
+           (let [resp (.send client http-req (HttpResponse$BodyHandlers/ofString))
+                 status (.statusCode resp)
+                 text (.body resp)]
+             (cond
+               (= 200 status) (json/read-str text :key-fn keyword)
+               (and (#{429 500 502 503 529} status) (&lt; attempt 4))
+               (do (Thread/sleep (long (* 2000 (Math/pow 2 attempt)))) (recur (inc attempt)))
+               :else (throw (ex-info (str "anthropic API error " status ": "
+                                          (subs text 0 (min 800 (count text))))
+                                     {:status status})))))))}))</code></pre>
+<span class="src">clojure/src/cmh/kernel/provider.clj:66-76</span>
+
+<p>It retries up to four times on 429, 500, 502, 503 and 529, waiting 2, 4, 8 and then 16 seconds. Network exceptions (as opposed to error statuses) are not retried. The model defaults to <code>claude-sonnet-5-5</code>, overridden by <code>CMH_MODEL</code> or <code>--model</code>.</p>
+
+<p>The mock provider (<code>provider.clj:18-32</code>) replays a script of response content arrays in order and records every request it receives in an atom. It infers <code>stop_reason</code> from the content (any tool_use block means <code>tool_use</code>). The tests use it to look at exactly what the model would have been sent.</p>
+
+<h2>The CLI</h2>
+
+<pre><code>(defn parse-args [args]
+  (loop [opts {:state ".cmh" :provider "anthropic" :soak 3 :reflect true
+               :model (or (System/getenv "CMH_MODEL") "claude-sonnet-5-5")}
+         [a &amp; more :as args] args]
+    (case a
+      "--state" (recur (assoc opts :state (first more)) (rest more))
+      "--provider" (recur (assoc opts :provider (first more)) (rest more))
+      "--script" (recur (assoc opts :script (first more)) (rest more))
+      "--model" (recur (assoc opts :model (first more)) (rest more))
+      "--soak" (recur (assoc opts :soak (parse-long (str (first more)))) (rest more))
+      "--no-reflect" (recur (assoc opts :reflect false) more)
+      (assoc opts :command a :args (vec more)))))</code></pre>
+<span class="src">clojure/src/cmh/kernel/main.clj:22-33</span>
+
+<p>The commands are <code>repl</code>, <code>run "TASK"</code> (exit 0 on success, 1 on failure), <code>refine</code>, <code>defs</code> and <code>knowledge</code>. An unknown command prints usage and exits 2. Only the first three build a provider, so you can inspect a state dir without credentials. The REPL treats each line as a task and also accepts <code>/defs /knowledge /show NAME [V] /rollback NAME V /refine /quit</code>.</p>
+
+<p>The launcher, <code>bin/cmh</code>, exists so the agent works in <em>your</em> directory and not in the flavor's:</p>
+
+<pre><code>#!/usr/bin/env bash
+# cmh (Clojure flavor). Runs in the caller's working directory.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." &amp;&amp; pwd)"
+CP="$(cd "$DIR" &amp;&amp; clojure -Spath)"
+ABS=""
+IFS=: read -ra parts &lt;&lt;&lt; "$CP"
+for p in "${parts[@]}"; do
+  case "$p" in /*) ;; *) p="$DIR/$p" ;; esac
+  ABS="${ABS:+$ABS:}$p"
+done
+exec java -Dcmh.home="$DIR" -cp "$ABS" clojure.main -m cmh.kernel.main "$@"</code></pre>
+<span class="src">clojure/bin/cmh:1-12</span>
+
+<p>It asks the Clojure CLI for the classpath from inside <code>clojure/</code>, makes the relative entries absolute, and runs <code>java</code> directly with <code>cmh.home</code> set, so the kernel can find its seeds and <code>base-prompt.md</code>.</p>
+
+<p>Trace lines go to stderr with a tag per subsystem: <code>[tool]</code>, <code>[gate]</code>, <code>[lesson]</code>, <code>[task]</code>, <code>[reflect]</code>, <code>[kernel]</code>. In a mock run where the agent writes a <code>reverse</code> tool and uses it, stderr reads:</p>
+
+<pre><code>[tool] propose_def reverse -&gt; trial v1: reverse is live now; kept after 3 clean uses, reverted on the first error
+[tool] reverse "hello" -&gt; olleh
+[task] success
+[lesson] +L1 Write a small tool for repeated string transforms.
+[reflect] 1 new lesson(s)</code></pre>
+
+<p>and stdout reads just <code>olleh</code>. The journal of that run, in order: three pairs of <code>def_proposed</code>/<code>def_kept</code> for the seeds, <code>task_started</code>, <code>def_use compose_system</code>, <code>def_proposed reverse</code>, <code>def_trial reverse</code>, <code>def_use compose_system</code>, <code>def_use reverse</code>, <code>def_use compose_system</code>, <code>task_finished</code> with success, and <code>lesson_added L1</code> from reflection. The tool went from a string in the model's reply to a live, journaled function within a single task.</p>
+
+<h2>Building and testing</h2>
+
+<p>Nothing needs to be built ahead of time; Clojure compiles as it loads. From <code>clojure/</code>:</p>
+
+<pre><code>clojure -X:test                 # or: clojure -M:test
+clojure -M:run defs             # print the registry
+bin/cmh run "TASK"              # one task, in the current directory</code></pre>
+
+<p>The test alias in <code>deps.edn</code> adds <code>test/</code> to the path and Cognitect's test-runner (<code>v0.5.1</code>). Running it on the current tree prints:</p>
+
+<pre><code>Ran 10 tests containing 66 assertions.
+0 failures, 0 errors.</code></pre>
+
+<p>The run takes under 10 seconds on this orb (Clojure CLI 1.12.6.1673, OpenJDK 27.0.1). The ten tests are <code>seeds-pass-their-own-tests</code>, <code>late-binding</code>, <code>gate-rejection</code>, <code>soak-revert</code>, <code>soak-revert-removes-new-definition</code>, <code>soak-keep</code>, <code>persistence</code>, <code>hook-redefinition</code>, <code>lesson-scoring</code> and <code>end-to-end-run</code>. They cover the eight tests SPEC.md requires, plus the seeds checking themselves and the case where reverting a brand-new definition removes it. Each test uses a temporary directory and the mock provider; all but the last open a kernel directly, with reflection off and a silent trace. The end-to-end test instead drives <code>main/run-cli</code> with <code>*out*</code> and <code>*err*</code> bound to string writers, so it checks what a user would actually see.</p>
+
+<p>The flavor has had two commits, both on 2026-10-29: the first created all 17 files, and a later "simplify for readability" commit (+182/−135 over 9 files) split <code>run-task!</code> into the turn loop, tool uses, outcome and note soak, and added the hook table. Its message records the check used: "No behavior change: tests pass and a mock run gives identical stdout, stderr and journal." Because the journal is deterministic apart from timestamps and ids, it doubles as a regression oracle.</p>
+
+<p>In the committed eval results (<a href="11-evals.html">Chapter 11</a>), the Clojure flavor solved 48 of 48 episodes on DeepSeek V4.1 Flash (102% of Prime Agent's rate, median 27.6 s per episode, 2,671,200 tokens). On GLM 5.3 Flash it reached 92% overall, 116% of Prime, with 83% learning transfer and 880,669 tokens. These numbers come from two trials and are noisy, and the ROADMAP is blunt about what they mean: "Most of the score comes from the shared design (lessons, reflection, the gate), not from self-modification." It adds that across about 60 episodes per flavor, the agents proposed only 5 to 78 changes. In the later isolated reuse matrix (four reuse suites, one trial, DeepSeek V4.1 Flash), Clojure passed 28 of 32 episodes (88%) against Prime's 32 of 32; Chapter 11 has the details.</p>
+
+<h2>The safety wall, and where it stops</h2>
+
+<p>The kernel enforces a few clear rules:</p>
+<ul>
+<li>Kernel tools cannot be redefined, hooks are limited to the two known names, and a definition cannot change kind (<code>gate.clj:30-33</code>).</li>
+<li><code>write_file</code> refuses the state dir and <code>src/cmh/kernel/</code>, after resolving the path.</li>
+<li>Loading and tests get 10 seconds, and live calls get 30.</li>
+<li>A tool must return a string, and <code>select_lessons</code> a sequence of ids (<code>check-return</code>, <code>evaluator.clj:65-75</code>).</li>
+<li>Any exception from userspace is caught, becomes an error message for the model, and reverts a trial.</li>
+<li>The base prompt and the verdicts section are added by the kernel, outside any hook.</li>
+</ul>
+
+<p>Here is the timeout:</p>
+
+<pre><code>(defn with-timeout
+  "Run f on another thread; throw TimeoutException after ms."
+  [ms f]
+  (let [fut (future (f))
+        r (try (deref fut ms ::timeout)
+               (catch ExecutionException e (throw (or (.getCause e) e))))]
+    (when (= r ::timeout)
+      (future-cancel fut)
+      (throw (TimeoutException. (str "timed out after " ms " ms"))))
+    r))</code></pre>
+<span class="src">clojure/src/cmh/kernel/evaluator.clj:10-19</span>
+
+<div class="warn">
+<p><strong>There is no sandbox.</strong> The agent's code runs in the kernel's own JVM with full access to Clojure and Java. The research for this book confirmed it by running code in a throwaway copy: a proposal that called <code>(spit "/tmp/...")</code> at load time created the file during <em>scratch validation</em>, before any test ran. The same code could read any file or environment variable, including the API key. Judging from the code, it could also call <code>System/exit</code> or redefine kernel vars.</p>
+<p><strong>The timeout does not stop anything.</strong> <code>future-cancel</code> only <em>interrupts</em> the thread. A busy loop that never checks for interruption keeps running after the <code>TimeoutException</code>; this was also observed. The kernel moves on, but a core keeps spinning until the process exits.</p>
+</div>
+
+<p>The ROADMAP says the same thing in its status table: "Agent code can crash the harness: yes (no sandbox)" and "Runaway loop is actually stopped: no (thread keeps running)". It adds two gaps that every flavor shares. First, <code>bash</code> can do anything, including editing the kernel source or the journal, which makes the <code>write_file</code> guard a courtesy, not a wall. "In chess terms, the agent can flip the board." Second, old versions leak: <code>remove-ns</code> is only called on scratch namespaces and failed loads, so every superseded <code>cmh.user.*</code> namespace stays in memory. One smaller gap: <code>write_file</code> does not protect <code>../base-prompt.md</code>, <code>seed/</code> or <code>bin/</code>. SPEC does not require it to, but the Racket flavor does protect the base prompt.</p>
+
+<p>The proposed fix is to run Clojure userspace out of process, in a forked worker or a WASM module, so a crash or runaway loop only kills the worker. That change would also remove what makes this flavor elegant: calling userspace would no longer be a plain function call.</p>
+
+<h2>What Clojure makes easy, and what it makes hard</h2>
+
+<table>
+<tr><th>Easy</th><th>Hard</th></tr>
+<tr><td>Loading new code at runtime: <code>create-ns</code> + <code>load-string</code>, all in <code>clojure.core</code></td><td>Isolation: the JVM has no in-process sandbox for this, so the agent's code shares a heap and permissions with the kernel</td></tr>
+<tr><td>Late binding: vars are looked up by name, so switching versions is moving a pointer</td><td>Stopping code: JVM threads can only be asked to stop, and interruption is cooperative</td></tr>
+<tr><td>One language: userspace is the host language, with the whole standard library and Java behind it</td><td>Unloading: namespaces hold onto classes, and nothing in the kernel removes old versions</td></tr>
+<tr><td>Event sourcing: immutable maps, a pure <code>apply-event</code>, replay with <code>reduce</code></td><td>Feedback quality: errors are raw JVM exception text such as <code>ArithmeticException: Divide by zero</code>, not structured diagnostics</td></tr>
+<tr><td>Small code: the whole kernel is 1,070 lines</td><td>No scratchpad: to try a snippet, the agent must propose a definition and pass the gate</td></tr>
+</table>
+
+<p>The last row points to an improvement the ROADMAP lists: an <code>eval</code> tool that runs <code>load-string</code> in a throwaway namespace and returns the result. The machinery already exists in <code>validate-in-scratch</code>. The ROADMAP reports that in the Forth flavor the equivalent tool, <code>forth_eval</code>, cut rejected proposals from 69 to 0. In Clojure it would also make the missing sandbox matter more, since arbitrary code would then run on every call to it.</p>
+
+<p>The Clojure flavor gives a clear baseline for the rest of the book. Self-modification can be very cheap when the language already treats code as data and namespaces as values. That cheapness comes from running the agent's code with all the kernel's power. The next chapter keeps the same Lisp idea and adds the piece this one lacks: Racket's sandboxed evaluators, which give the agent's code memory and time limits that are actually enforced.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Every version of every definition is evaluated into its own namespace, <code>cmh.user.&lt;name&gt;.v&lt;N&gt;-&lt;hash&gt;</code>. Proposals are tested first in a throwaway <code>cmh.scratch.*</code> namespace that is always removed.</li>
+<li>The kernel holds data, not functions: it looks up the live version and its entry var on every call. Going live and reverting each change one number in the state.</li>
+<li>State is an immutable map updated by a pure <code>apply-event</code>. Live updates and replay use the same function, and a JSON round trip in <code>emit!</code> makes them match exactly.</li>
+<li>The system prompt and tool list are rebuilt on every model request, so a new tool or hook takes effect on the very next turn.</li>
+<li>1,070 lines of kernel and 10 tests with 66 assertions, all passing. The flavor reached 102% of Prime on DeepSeek V4.1 Flash and 116% on GLM 5.3 Flash, mostly thanks to the shared design rather than self-modification.</li>
+<li>The wall is thin: no sandbox, timeouts that do not stop threads, <code>bash</code> unrestricted, and old namespaces never freed. The ROADMAP's answer is out-of-process userspace and a scratchpad <code>eval</code> tool.</li>
+</ul>
+</main>
+<footer class="nav"><a href="03-prime-agent.html">← The reference: Prime Agent</a><a href="index.html">Contents</a><a href="05-racket.html">Racket: sandboxed evaluators →</a></footer>
+</body></html>

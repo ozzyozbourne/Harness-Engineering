@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. Lean 4: proofs at the gate · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 7</header>
+<main>
+<h1>7. Lean 4: proofs at the gate</h1>
+<p class="subtitle">A harness whose agent writes code in a proof assistant, so a new tool can carry a claim about itself that the compiler has to check before the tool goes live.</p>
+
+<p>Every flavor of cmh has a gate. Before new userspace code goes live, the kernel checks
+that it compiles and that it passes the tests the agent wrote for it. Tests are examples:
+they show the code is right on the inputs someone thought of. The Lean flavor adds a check
+of a different kind. A proposal may contain <em>theorems</em>, statements about the code
+such as "counting the words of the empty string gives zero", and each one must be proved
+to Lean's type checker or the proposal is rejected. A false claim fails the gate just as a
+failing test does.</p>
+
+<h2>A Lean 4 primer</h2>
+
+<p>Lean 4 is two things at once. It is a <strong>functional programming language</strong>
+that compiles to C and to native executables, with strict evaluation, a Haskell-like type
+system in which types can mention values, and an <code>IO</code> type for effects. It is also a <strong>proof
+assistant</strong>, a tool in which mathematicians write definitions and proofs that a
+small trusted checker verifies. The two are the same language. A proof is a value, and the
+statement it proves is that value's type.</p>
+
+<p>The few pieces of syntax this chapter needs:</p>
+
+<table>
+<tr><th>Lean</th><th>Meaning</th></tr>
+<tr><td><code>def f (x : Nat) : String := …</code></td><td>A function from natural numbers to strings. <code>:</code> means "has type".</td></tr>
+<tr><td><code>IO String</code></td><td>An action that may do I/O (files, processes, exceptions) and produces a string. Code without <code>IO</code> in its type is pure.</td></tr>
+<tr><td><code>theorem t : countWords "" = 0 := rfl</code></td><td>A claim (the type, after the colon) and its proof (after <code>:=</code>). <code>rfl</code> means "both sides compute to the same value", which the checker confirms by evaluating them.</td></tr>
+<tr><td><code>example : 1 + 1 = 2 := rfl</code></td><td>A theorem without a name.</td></tr>
+<tr><td><code>sorry</code></td><td>A placeholder that "proves" anything. Lean accepts it with a warning. It exists so people can work on unfinished proofs.</td></tr>
+<tr><td><code>axiom</code></td><td>Declares a fact without proof. One false axiom makes every statement provable.</td></tr>
+<tr><td><code>namespace A … end A</code></td><td>A scope for names, so <code>run</code> inside it is really <code>A.run</code>.</td></tr>
+<tr><td><code>unsafe</code>, <code>@[implemented_by g]</code>, <code>@[extern "c_fn"]</code></td><td>Escape hatches. They let code skip type safety, or swap the logical definition of a function for a different implementation at run time.</td></tr>
+<tr><td><code>#eval e</code></td><td>Runs <code>e</code> while the file is being compiled.</td></tr>
+</table>
+
+<p>Two more words matter. <strong>Elaboration</strong> is Lean's front end: it parses source,
+fills in implicit details, type-checks every declaration (including proofs), and adds the
+results to an <strong>environment</strong>, the table of all known declarations. The
+environment is an ordinary immutable value, so you can elaborate the same file against
+the same starting environment twice and get two independent results.
+<strong>Heartbeats</strong> are Lean's deterministic measure of elaboration work (a count of
+small memory allocations, in thousands). The
+<code>maxHeartbeats</code> option caps how long the elaborator may grind on one
+declaration, for example while searching for a proof.</p>
+
+<p>Lean 4 is written in Lean 4. The parser, the elaborator and the environment are library
+code under <code>import Lean</code>. An executable that links that library, plus Lean's
+bytecode interpreter, can compile Lean source while it runs and then call what it just
+compiled. That is the whole trick behind this flavor.</p>
+
+<div class="note">The Lean flavor targets <code>leanprover/lean4:v4.35.0</code> (pinned in
+<code>lean/lean-toolchain</code>) and uses no packages beyond Lean's own core libraries:
+<code>Lean</code>, <code>Lean.Data.Json</code>, <code>Std.Time</code> and
+<code>Std.Data.HashMap</code>. The Lake manifest lists no dependencies.</div>
+
+<h2>Compiling new code inside the running process</h2>
+
+<p>When the agent calls <code>propose_def</code> with some Lean source, the kernel goes
+through five steps: wrap, elaborate, check messages, evaluate, keep alive.</p>
+
+<div class="diagram"><pre>
+ agent's source                         kernel
+ ──────────────                         ──────
+ def countWords …       ──► bannedIn? ──► rejected before elaboration
+ theorem … := rfl              │ no banned tokens
+ def run (input …) …           ▼
+                       namespace Cmh.Def.word_count.v2
+                         &lt;agent's source&gt;
+                         def __cmh_entry : Lean.Json → IO String := run
+                       end Cmh.Def.word_count.v2
+                               │
+                               ▼  Lean.Elab.process   (base env: Init + Lean.Data.Json,
+                               │                       maxHeartbeats 200000)
+                 errors or "sorry"? ──► rejected, messages sent back to the model
+                               │ no
+                               ▼  env'.evalConst  __cmh_entry
+                       native closure  Json → IO String
+                               │
+                               ▼  run the proposal's tests, then go live as a trial
+</pre></div>
+
+<h3>Wrap</h3>
+
+<p>Each version gets its own namespace, <code>Cmh.Def.&lt;name&gt;.v&lt;N&gt;</code>, so two
+versions of <code>word_count</code> never fight over the name <code>run</code>. After the
+agent's source, the kernel appends one line of its own: a declaration called
+<code>__cmh_entry</code> with a fixed type, defined as the agent's function. The contract
+table says which type each kind of definition must have:</p>
+
+<pre><code>def contract? (kind name : String) : Option Contract :=
+  match kind, name with
+  | "tool", _ =&gt; some {
+      signature := "def run (input : Lean.Json) : IO String"
+      entry := "def __cmh_entry : Lean.Json → IO String := run" }
+  | "hook", "compose_system" =&gt; some {
+      signature := "def composeSystem (notes lessons : List String) : String"
+      entry := "def __cmh_entry : List String → List String → String := composeSystem" }
+  | "hook", "select_lessons" =&gt; some {
+      signature := "def selectLessons (task : String) (lessons : List (Nat × String × Int)) : List Nat"
+      entry := "def __cmh_entry : String → List (Nat × String × Int) → List Nat := selectLessons" }
+  | _, _ =&gt; none</code></pre>
+<span class="src">lean/Cmh/Elab.lean:63-74</span>
+
+<p>This one appended line is the shape check. If the agent writes
+<code>def run (n : Nat) : String</code>, the entry line fails to type-check and the
+proposal is rejected with the elaborator's own error message. Test 2 in the suite checks
+exactly that case. A tool takes JSON and returns a string in <code>IO</code>. The two hooks
+are <em>pure</em> functions: they cannot do I/O at all, which their types guarantee.</p>
+
+<h3>Elaborate</h3>
+
+<p>The base environment is built once per process, on first use, and cached in a global
+reference. Importing modules means reading Lean's precompiled <code>.olean</code> files
+from the toolchain directory; the kernel finds it through <code>Lean.findSysroot</code>
+(which honours <code>LEAN_SYSROOT</code> or asks <code>lean --print-prefix</code>) and falls
+back to the pinned toolchain under <code>$ELAN_HOME</code>.</p>
+
+<pre><code>def getBaseEnv : IO Environment := do
+  if let some e ← baseEnvRef.get then return e
+  enableInits
+  Lean.initSearchPath (← leanSysroot)
+  let env ← importModules userImports {} (loadExts := true)
+  baseEnvRef.set (some env)
+  return env</code></pre>
+<span class="src">lean/Cmh/Elab.lean:46-52</span>
+
+<p><code>userImports</code> is just <code>Init</code> (Lean's prelude) and
+<code>Lean.Data.Json</code>. Userspace may not write <code>import</code> lines, so that is
+everything a proposal can see. Then the core of <code>elaborate</code>:</p>
+
+<pre><code>  let ns := s!"Cmh.Def.{name}.v{version}"
+  let full := s!"namespace {ns}\n{source}\n{contract.entry}\nend {ns}\n"
+  let opts : Options := (Options.empty.set `maxHeartbeats maxHeartbeats).set `Elab.async false
+  try
+    let env ← getBaseEnv
+    let (env', msgs) ← Lean.Elab.process full env opts (fileName := s!"{name}.v{version}.lean")
+    -- errors first: they are what the model needs to fix
+    let (errs, others) := msgs.toList.partition (·.severity == .error)
+    let rendered ← (errs ++ others).mapM fmtMessage
+    let usesSorry := rendered.any (·.contains "sorry")
+    if msgs.hasErrors || usesSorry then
+      return .error s!"elaboration failed:\n{String.intercalate "\n" rendered}\n\
+        (contract: {contract.signature}; theorems/examples must check; \
+        the last source line is followed by the kernel's entry declaration)"
+    match evalEntry kind name env' s!"{ns}.__cmh_entry".toName with</code></pre>
+<span class="src">lean/Cmh/Elab.lean:116-130</span>
+
+<p><code>Lean.Elab.process</code> runs the same parser and elaborator the <code>lean</code>
+command uses on a file, called here as a function on a string. It returns a new environment
+<code>env'</code> and a list of messages. Because <code>env</code> is an immutable value,
+the base environment is untouched: in the module's own words, "The kernel never
+elaborates into a shared live environment: every version lives in its own environment
+value." Errors are sorted first, since they are what the model must fix. Line numbers are
+shifted back by one to hide the <code>namespace</code> line the kernel added, so "line 3"
+in the message means line 3 of what the agent wrote.</p>
+
+<h3>Evaluate</h3>
+
+<p>An environment holds declarations, not running code. To get something callable, the
+kernel asks for the value of <code>__cmh_entry</code> with <code>evalConst</code>, which
+runs the declaration through Lean's interpreter and returns a real closure at the
+requested type. The kernel packs it into a small sum type, <code>Compiled</code>, with one
+case per contract (<code>tool</code>, <code>compose</code>, <code>select</code>,
+<code>note</code>).</p>
+
+<pre><code>unsafe def evalEntryImpl (kind name : String) (env : Environment) (n : Name) : Except String Compiled :=
+  match kind, name with
+  | "tool", _ =&gt; (env.evalConst (Json → IO String) {} n (checkMeta := false)).map .tool
+  | "hook", "compose_system" =&gt;
+    (env.evalConst (List String → List String → String) {} n (checkMeta := false)).map .compose
+  | "hook", "select_lessons" =&gt;
+    (env.evalConst (String → List (Nat × String × Int) → List Nat) {} n (checkMeta := false)).map .select
+  | _, _ =&gt; .error s!"no entry point for kind {kind}"
+
+/-- `evalConst` at the entry's known type. Only called on declarations we generated with that type. -/
+@[implemented_by evalEntryImpl]
+opaque evalEntry (kind name : String) (env : Environment) (n : Name) : Except String Compiled</code></pre>
+<span class="src">lean/Cmh/Elab.lean:86-97</span>
+
+<p><code>evalConst</code> is marked <code>unsafe</code> because nothing stops a caller from
+asking for the wrong type, which would crash. The kernel only ever asks for the type it
+wrote into the entry line itself, so the pairing is safe by construction. The
+<code>opaque</code> + <code>@[implemented_by]</code> pattern lets safe code call it: the
+logical definition is an opaque constant, and at run time the compiler substitutes the
+unsafe implementation. Note the irony. The two tokens that do this,
+<code>unsafe</code> and <code>implemented_by</code>, are among those the agent is forbidden
+to write.</p>
+
+<h3>Keep alive</h3>
+
+<p>The closures from <code>evalConst</code> point into the environment they came from. If
+<code>env'</code> were freed, the closure would dangle. So every successful environment is
+pushed onto a global array called <code>keepAlive</code> and never dropped ("closures
+produced by the interpreter refer to declarations of <code>env'</code>; keep it alive",
+Elab.lean:132). The price is that old versions stay in memory until the process exits.</p>
+
+<p>Both executables are built with <code>supportInterpreter := true</code>, which links the
+interpreter into the binary:</p>
+
+<pre><code>@[default_target]
+lean_exe cmh where
+  root := `Main
+  supportInterpreter := true
+
+lean_exe «cmh-test» where
+  root := `Test
+  supportInterpreter := true</code></pre>
+<span class="src">lean/lakefile.lean:9-16</span>
+
+<h2>Why theorems make a stronger gate</h2>
+
+<p>A test runs a function on one input and compares the output. A theorem is checked
+for every input its statement covers. "<code>rev (rev s) = s</code> for all strings
+<code>s</code>" cannot be established by any finite number of tests, but it can be proved,
+and once Lean accepts the proof it holds for every string. In Lean the checker that
+enforces the contract type also checks the proofs, so a single elaboration pass validates
+both the shape of the code and the claims made about it.</p>
+
+<p>The seed tool <code>word_count</code> shows the idea at its smallest:</p>
+
+<pre><code>/-- Number of maximal runs of non-whitespace characters. -/
+def countWords (s : String) : Nat :=
+  (s.toList.foldl (fun (acc : Nat × Bool) c =&gt;
+    if c.isWhitespace then (acc.1, false)
+    else if acc.2 then acc else (acc.1 + 1, true)) (0, false)).1
+
+theorem countWords_empty : countWords "" = 0 := rfl
+
+def run (input : Lean.Json) : IO String := do
+  let text := (input.getObjValAs? String "text").toOption.getD ""
+  pure (toString (countWords text))</code></pre>
+<span class="src">lean/userspace/word_count.lean:1-11</span>
+
+<p>The theorem lives in the same file as the code it talks about. If a later version kept
+the theorem but changed <code>countWords</code> so that the empty string gave 1, the theorem
+would no longer hold, and that version could not get through the gate at all. (It could also just
+drop the theorem.) To see this happen, I
+ran the harness with a scripted mock model that proposed a tool with a deliberately false
+claim, <code>theorem rev_empty : rev "a" = "b" := rfl</code>. The kernel's trace:</p>
+
+<pre><code>[gate] reverse_bad v1 rejected (60ms): elaboration failed: line 3:37: error: Type mismatch   rfl has type   ?m.3 = ?m.3 but is expected to have type   rev "a" = "b" …</code></pre>
+<span class="src">output of .lake/build/bin/cmh --provider mock, measured 2026-11-13</span>
+
+<p>The model gets back an exact location and the reason, the same as for a type error.</p>
+
+<div class="warn"><strong>Be honest about how strong this is.</strong> Nothing requires a
+proposal to contain any theorem; the gate only insists that the theorems present are
+true. The seed's <code>rfl</code> proof is about one concrete input, so it is really a test
+that runs at compile time. Proofs can only talk about pure functions such as
+<code>countWords</code>, not about what <code>run</code> does in <code>IO</code>. And the
+proof only means what its statement says: a true but irrelevant theorem passes as easily
+as a useful one. The mechanism makes strong claims <em>possible</em> and false claims
+<em>impossible</em>; it does not make the agent write good ones.</div>
+
+<h2>Banning the escape hatches</h2>
+
+<p>A proof checker is only as honest as the axioms it is allowed to use. If the agent could
+write <code>sorry</code> or declare an <code>axiom</code>, every theorem would "check". If it
+could write <code>unsafe</code>, <code>implemented_by</code> or <code>extern</code>, it could
+make the function that runs differ from the function that was proved. If it could write
+<code>#eval</code> or <code>initialize</code>, arbitrary code would run during
+elaboration, before any test. And <code>import</code> would pull in modules outside the
+allowed two. So, before elaboration, the kernel splits the source into tokens and looks
+for a fixed list of words:</p>
+
+<pre><code>def bannedWords : List String :=
+  ["sorry", "sorryAx", "axiom", "implemented_by", "unsafe", "extern", "#eval", "#exit",
+   "import", "initialize", "builtin_initialize", "#print"]
+
+def bannedIn (src : String) : List String :=
+  let toks := src.splitToList (fun c =&gt; !(c.isAlphanum || c == '_' || c == '#'))
+  bannedWords.filter (toks.contains ·)</code></pre>
+<span class="src">lean/Cmh/Elab.lean:77-83</span>
+
+<table>
+<tr><th>Banned token</th><th>Why</th></tr>
+<tr><td><code>sorry</code>, <code>sorryAx</code></td><td>Proves anything; <code>sorryAx</code> is the axiom <code>sorry</code> expands to.</td></tr>
+<tr><td><code>axiom</code></td><td>Adds an unproved assumption.</td></tr>
+<tr><td><code>unsafe</code>, <code>implemented_by</code>, <code>extern</code></td><td>Run code other than the code that was type-checked.</td></tr>
+<tr><td><code>#eval</code>, <code>#exit</code>, <code>#print</code></td><td>Commands that act during elaboration instead of defining something.</td></tr>
+<tr><td><code>initialize</code>, <code>builtin_initialize</code></td><td>Run code at module initialization.</td></tr>
+<tr><td><code>import</code></td><td>Userspace sees only <code>Init</code> and <code>Lean.Data.Json</code>.</td></tr>
+</table>
+
+<p>There is also a second line of defence: after elaboration, any
+message that mentions "sorry" fails the proposal, which catches tactics that fall back to
+<code>sorry</code> internally.</p>
+
+<p>The check is <em>lexical</em>: it does not know about strings or comments. A tool
+that prints <code>"no import needed"</code>, or a comment that says "sorry", is refused.
+That is crude but hard to fool, and the README states it openly ("This is a token check,
+so the words are also refused inside strings and comments").</p>
+
+<div class="note">The lists do not quite agree across the repo. The code bans all twelve
+words above. The README lists ten (it omits <code>#exit</code> and
+<code>builtin_initialize</code>), the rejection message names eight, and the
+<code>propose_def</code> tool description given to the model names six.</div>
+
+<h2>Architecture by file</h2>
+
+<p>The kernel is 1,257 lines of Lean (everything under <code>Cmh/</code> plus
+<code>Main.lean</code> and <code>Cmh.lean</code>), the seeds are 47 lines including the
+manifest, and the tests are 237.</p>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>What it holds</th></tr>
+<tr><td><code>Main.lean</code></td><td>9</td><td>Calls <code>cliMain</code>, flushes, exits through <code>IO.Process.exit</code>.</td></tr>
+<tr><td><code>Cmh.lean</code></td><td>7</td><td>Imports every module.</td></tr>
+<tr><td><code>Cmh/Util.lean</code></td><td>76</td><td>String helpers, JSON getters, ISO timestamps (second precision).</td></tr>
+<tr><td><code>Cmh/Embedded.lean</code></td><td>15</td><td><code>include_str</code> copies of <code>base-prompt.md</code>, <code>seeds.json</code> and the three seed sources, baked in at build time.</td></tr>
+<tr><td><code>Cmh/Elab.lean</code></td><td>156</td><td>Runtime elaboration, contracts, banned tokens, <code>evalConst</code>, the timed runner.</td></tr>
+<tr><td><code>Cmh/State.lean</code></td><td>157</td><td>The registry and knowledge types, the pure <code>apply</code> reducer, journal read and append.</td></tr>
+<tr><td><code>Cmh/Provider.lean</code></td><td>120</td><td>The <code>Provider</code> record, the mock, the curl-based Anthropic client.</td></tr>
+<tr><td><code>Cmh/Kernel.lean</code></td><td>617</td><td>Config, kernel tools, hooks, the gate, the agent loop, reflection, scoring, seeding.</td></tr>
+<tr><td><code>Cmh/Cli.lean</code></td><td>100</td><td>Argument parsing, the REPL, <code>cliMain</code>.</td></tr>
+<tr><td><code>userspace/</code></td><td>47</td><td><code>seeds.json</code> and three seed sources.</td></tr>
+<tr><td><code>Test.lean</code></td><td>237</td><td>A small custom test runner and the 8 required tests.</td></tr>
+</table>
+
+<div class="diagram"><pre>
+ Main ──► Cli ──► Kernel ──┬──► Elab      (elaborate, evalConst, runTimed)
+                           ├──► State     (apply, journal.jsonl)
+                           ├──► Provider  (curl subprocess | mock)
+                           └──► Embedded  (base prompt, seeds)
+                     all ──► Util
+</pre></div>
+
+<p>The kernel's configuration is a plain structure: soak 3, reflection on, a 30,000 ms
+limit per userspace call and at most 60 model turns per task (Rust uses 15 s and 40). A
+<code>Kernel</code> value holds that config, an <code>IO.Ref</code> with the current state,
+the closure cache keyed by <code>(name, version)</code>, the provider, the base prompt and
+the protected directories. A provider is a record holding one function,
+<code>complete : Request → IO Response</code>, so swapping in the mock is trivial.</p>
+
+<h2>The agent loop</h2>
+
+<p>A task is one call to <code>runTask</code>:</p>
+
+<pre><code>def runTask (k : Kernel) (task : String) : IO Outcome := do
+  let tid := (← k.st).tasks.size + 1
+  k.emit "task_started" [("id", tid), ("task", task)]
+  let active := (← k.st).activeLessons
+  let ids ← k.selectLessons task (active.map fun e =&gt; (e.id, e.text, e.score))
+  let selected := ids.filterMap fun i =&gt; active.find? (·.id == i)
+  let c ← k.converse task (selected.map (·.text))
+  -- an error in the last two tool results means the task is not trusted as a success
+  let lastErr := (c.toolErrors.toList.drop (c.toolErrors.size - 2)).any id
+  let success := c.kernelErr.isNone &amp;&amp; !lastErr
+  let outcome : Outcome := { success, answer := c.answer, error := c.kernelErr }
+  k.emit "task_finished" [("id", tid), ("success", success), ("summary", strTake c.answer 300),
+    ("error", toJson (c.kernelErr.map (strTake · 300)))]
+  k.scoreLessons selected success
+  k.soakNotes tid success
+  k.trace s!"[task] {tid} {if success then "succeeded" else "failed"}{match c.kernelErr with | some e =&gt; s!": {strTake e 200}" | none =&gt; ""}"
+  if k.cfg.reflect then k.reflect task c.msgs outcome
+  return outcome</code></pre>
+<span class="src">lean/Cmh/Kernel.lean:551-568</span>
+
+<p>The lesson-selection hook picks which lessons go into the prompt. Then
+<code>converse</code> talks to the model. It starts with the error "turn limit (60)
+reached" and clears it only when the model stops cleanly. On each turn it rebuilds the
+system prompt and the tool list, so a tool that went live on turn 3 is offered on turn 4.
+If the model stops without asking for tools, the loop ends; a stop reason other than
+<code>end_turn</code> (say, <code>max_tokens</code>) becomes the error "stopped with
+max_tokens". Otherwise every requested tool runs and the results go back as the next user
+message.</p>
+
+<p>Success is self-reported but guarded: the model must have finished with
+<code>end_turn</code>, and neither of the last two tool results may be an error. That rule
+has a side effect worth knowing. A rejected <code>propose_def</code> counts as a tool
+error, so a task that ends with a rejection followed by one successful call is still
+scored as a failure. I saw exactly this in the mock run above: the model's last three
+calls were an accepted proposal, a rejected one and a successful use, and the kernel
+printed <code>[task] 1 failed</code>.</p>
+
+<p>The system prompt has two blocks. The first is always the base prompt from
+<code>base-prompt.md</code> (read from the repo at startup, else the embedded copy). The
+second is whatever the <code>compose_system</code> hook makes of the live notes and the
+selected lessons, followed by the last 20 verdicts under "Verdicts on past userspace
+changes". The second block is left out when it is empty.</p>
+
+<h2>Tools</h2>
+
+<p>The nine kernel tools from SPEC, with the Lean flavor's details:</p>
+
+<table>
+<tr><th>Tool</th><th>Behaviour here</th></tr>
+<tr><td><code>bash</code></td><td>Runs through coreutils <code>timeout -k 5</code>, default 60 s, stderr folded into stdout, output capped at 20,000 characters.</td></tr>
+<tr><td><code>read_file</code></td><td>Capped at 50,000 characters.</td></tr>
+<tr><td><code>write_file</code></td><td>Refuses the state dir, <code>lean/Cmh</code>, <code>lean/Main.lean</code> and <code>lean/lakefile.lean</code>. Paths are resolved through <code>realPath</code> first, so symlinks do not sneak past.</td></tr>
+<tr><td><code>list_defs</code></td><td>One line per name, with soak progress such as <code>trial (1/3)</code>.</td></tr>
+<tr><td><code>show_def</code></td><td>The full record of a version as pretty JSON.</td></tr>
+<tr><td><code>propose_def</code></td><td>The gate. Accepts <code>tests</code> and <code>input_schema</code> even when the model sends them as JSON-encoded strings.</td></tr>
+<tr><td><code>rollback_def</code></td><td>Re-proposes an old version's source through the full gate.</td></tr>
+<tr><td><code>remember</code></td><td>Adds a lesson; ignores case-insensitive duplicates.</td></tr>
+<tr><td><code>recall</code></td><td>Lessons and verdicts sharing a word of 3+ characters with the query, retired lessons excluded, best score first, top 20.</td></tr>
+</table>
+
+<p>One choice differs from the Rust flavor. Only a timeout counts as a <code>bash</code>
+error; a failing command just reports its exit code:</p>
+
+<pre><code>def bash (k : Kernel) (cmd : String) (timeoutS : Nat) : IO (String × Bool) := do
+  let child ← IO.Process.spawn {
+    cmd := "timeout", args := #["-k", "5", toString timeoutS, "sh", "-c", "exec 2&gt;&amp;1\n" ++ cmd]
+    cwd := k.cfg.workDir, stdin := .null, stdout := .piped, stderr := .null }
+  let out ← child.stdout.readToEnd
+  let code ← child.wait
+  let note := if code == 124 || code == 137 then s!" (timed out after {timeoutS}s)" else ""
+  return (truncate out 20000 ++ s!"\n[exit code {code}{note}]", code == 124 || code == 137)</code></pre>
+<span class="src">lean/Cmh/Kernel.lean:342-349</span>
+
+<p>Since the success rule looks at the last two tool results, this matters: a task that
+ends with a failing <code>grep</code> is not marked failed in Lean, while in Rust it would
+be.</p>
+
+<p><code>callTool</code> tries the kernel tools first, then looks up the live userspace tool
+by name on every call: SPEC's late binding. The closure comes from the cache, or after a
+restart from re-elaborating the journaled source.</p>
+
+<h2>The gate: validate, trial, soak, keep or revert</h2>
+
+<p><code>propose</code> first runs cheap static checks: the name matches
+<code>[A-Za-z][A-Za-z0-9_]*</code> and is at most 64 characters, the kind is
+<code>tool</code>, <code>note</code> or <code>hook</code>, hooks use one of the two hook
+names and nothing else does, kernel tool names are off limits, and a name keeps its kind
+across versions. A failure here returns "rejected: …" and journals nothing. Past that
+point the kernel allocates a version number and journals <code>def_proposed</code>, so a
+rejected version still uses up its number.</p>
+
+<p><code>validate</code> then requires at least one test for tools and hooks, elaborates
+the source as described above, and runs each test under the timed runner. A test passes
+if the output contains the <code>expect</code> string. For <code>select_lessons</code> the
+returned id list is rendered as JSON, so a test can expect <code>[2,1]</code>. A failure
+journals <code>def_rejected</code> with the error (capped at 4,000 characters) and sends
+the same text to the model. Success journals <code>def_trial</code>, and the new version is
+live immediately:</p>
+
+<pre><code>  | .ok c =&gt;
+    k.cachePut name version c
+    -- `s` is still current for `live`: proposing and validating never change it.
+    -- A trial replacing another trial restores what that trial would have restored.
+    let prev := match s.liveDef? name with
+      | some d =&gt; if d.status == "kept" then some d.version else d.prev
+      | none =&gt; none
+    k.emit "def_trial" [("name", name), ("version", version), ("prev", toJson prev)]</code></pre>
+<span class="src">lean/Cmh/Kernel.lean:304-311</span>
+
+<p><code>prev</code> is the version to fall back to. If you replace a trial with another
+trial, the fallback is the last <em>kept</em> version, never the untested trial in
+between.</p>
+
+<p>Every use of a trial version is recorded. Kept versions are not journaled per use,
+since their status can no longer change:</p>
+
+<pre><code>  match err with
+  | some e =&gt;
+    let s ← k.st
+    let restored := cur.prev.filter (fun v =&gt; (s.find? d.name v).isSome)
+    k.emit "def_reverted" [("name", d.name), ("version", d.version), ("error", strTake e 500),
+      ("restored", toJson restored)]
+    let inp := if input.isNull then "" else s!" on input {strTake input.compress 200}"
+    discard &lt;| k.addEntry "verdict" s!"{verdictLabel cur} reverted: {strTake e 300}{inp}"
+    let to := match restored with | some v =&gt; s!"v{v}" | none =&gt; "removed"
+    k.trace s!"[gate] {d.name} v{d.version} reverted -&gt; {to}: {strTake (e.replace "\n" " ") 160}"
+  | none =&gt;
+    -- re-read on purpose: the `def_use` event above just bumped `soakUses`
+    let some now := (← k.st).find? d.name d.version | return
+    if now.soakUses ≥ k.cfg.soak then
+      k.emit "def_kept" [("name", d.name), ("version", d.version)]
+      discard &lt;| k.addEntry "verdict" s!"{verdictLabel now} kept after {now.soakUses} clean uses"
+      k.trace s!"[gate] {d.name} v{d.version} kept"</code></pre>
+<span class="src">lean/Cmh/Kernel.lean:131-147</span>
+
+<p>The first error reverts the trial, restores <code>prev</code>, and writes a verdict that
+quotes the error and the input that caused it. Three clean uses (the default soak) make the
+version kept and write a "kept after 3 clean uses" verdict. Notes have no calls of their own,
+so each finished task counts as one use of every trial note, and a failed task as an
+error.</p>
+
+<div class="diagram"><pre>
+ propose_def ─► static checks ─✗─► "rejected: …"            (nothing journaled)
+                     │✓
+                     ▼
+               def_proposed vN ─► validate ─✗─► def_rejected (live unchanged)
+                                    │✓
+                                    ▼
+                               def_trial vN  (live now, prev = last kept)
+                                    │
+                 error on any use ◄─┴─► clean use: soakUses + 1
+                       │                         │ soakUses ≥ 3
+                       ▼                         ▼
+                def_reverted → prev          def_kept
+                + "reverted" verdict         + "kept" verdict
+</pre></div>
+
+<h2>Journal and replay</h2>
+
+<p>All state lives in <code>.cmh/journal.jsonl</code>, one JSON event per line. One pure
+function folds events into state, and it is used both live and at startup. The State
+module's doc comment puts it this way: "<code>apply</code> is the only function that
+changes state. The live process appends an event and then applies it, and startup replays
+the same events through the same function, so a replayed state is identical to the state
+of the process that wrote the journal."</p>
+
+<pre><code>  | "def_trial" =&gt;
+    (s.updDef name ver (fun d =&gt; { d with status := "trial", soakUses := 0, prev := jNat? ev "prev" })).setLive
+      name (some ver)
+  | "def_use" =&gt;
+    if jBool ev "ok" then
+      s.updDef name ver (fun d =&gt; if d.status == "trial" then { d with soakUses := d.soakUses + 1 } else d)
+    else s
+  | "def_kept" =&gt; (s.updDef name ver (fun d =&gt; { d with status := "kept" })).setLive name (some ver)
+  | "def_reverted" =&gt;
+    (s.updDef name ver (fun d =&gt; { d with status := "reverted", error := jStr ev "error" })).setLive name
+      (jNat? ev "restored")</code></pre>
+<span class="src">lean/Cmh/State.lean:116-126</span>
+
+<p>The kernel's <code>emit</code> appends the line, flushes, and then runs
+<code>apply</code> on the in-memory state. <code>readJournal</code> skips a torn final line
+left by a crash. The cache of compiled closures is <em>not</em> saved; after a restart each
+definition is re-elaborated from its journaled source the first time it is called. SPEC
+would allow caching elaborated environments, but this flavor does not bother.</p>
+
+<p>Verdicts are stored differently from the Rust flavor. Here they are knowledge entries,
+journaled as <code>lesson_added</code> with <code>"kind": "verdict"</code>, and lessons and
+verdicts share one id counter. Test 5 checks replay by comparing a JSON snapshot of the
+whole state before and after reopening, and by checking that a trial's soak counter
+survives (version 2, trial, 1 use).</p>
+
+<h2>Lessons, reflection and refine</h2>
+
+<p>After each task, every lesson that was in the prompt gains 1 point on success and loses
+1 on failure. At a score of −3 the lesson is retired and no longer selected. With
+reflection on, the kernel sends a compact transcript (task, assistant text, tool calls,
+tool results with errors marked, outcome) to the model, with only the base prompt as system
+and no tools, and asks for "a JSON array of 0 to 3 short, reusable lessons". The parser
+takes the text from the first <code>[</code> to the last <code>]</code>, so prose around the
+array does not break it, and keeps at most three non-empty strings. Each goes through
+<code>remember</code>, so duplicates are dropped.</p>
+
+<p><code>refine</code> is an ordinary task with a fixed prompt: review the last 10 task
+outcomes, the verdicts and the current userspace, then "Make at most 3 changes and prefer
+small ones."</p>
+
+<h2>Hooks and seeds</h2>
+
+<p>A fresh state dir is seeded with three definitions, each journaled as
+<code>def_proposed</code> with origin <code>seed</code> followed by <code>def_kept</code>:
+the two hooks and one example tool. The manifest <code>userspace/seeds.json</code> gives
+each a description, tests and (for the tool) an input schema. The sources are read from
+<code>lean/userspace/</code> if present and from the embedded copies otherwise.</p>
+
+<pre><code>/-- Lower-cased words of 4 or more letters. -/
+def longWords (s : String) : List String :=
+  (s.toLower.splitToList (fun c =&gt; !c.isAlpha)).filter (·.length ≥ 4)
+
+/-- The 8 highest-scored lessons sharing a 4+ letter word with the task, else the top 3. -/
+def selectLessons (task : String) (lessons : List (Nat × String × Int)) : List Nat :=
+  let tw := longWords task
+  let sorted := lessons.mergeSort (fun a b =&gt; decide (a.2.2 ≥ b.2.2))
+  let matching := sorted.filter (fun l =&gt; (longWords l.2.1).any (tw.contains ·))
+  (if matching.isEmpty then sorted.take 3 else matching.take 8).map (·.1)</code></pre>
+<span class="src">lean/userspace/select_lessons.lean:1-10</span>
+
+<p><code>compose_system</code> (7 lines) turns notes and lessons into two Markdown sections,
+<code>## Notes</code> and <code>## Lessons</code>, one bullet per item. Test 1 checks that
+each seed passes its own gate, so the shipped seeds are proof that the contracts work.</p>
+
+<p>A hook can break the agent's own prompt, so hook calls have a fallback chain:</p>
+
+<pre><code>partial def callHook (k : Kernel) (name : String) (input : Unit → Json) (builtin : α)
+    (pick : Compiled → Option (IO α)) : IO α := do
+  let some d := (← k.st).liveDef? name | return builtin
+  let r ← k.callLive d input s!"bad return type: not a {name} hook" pick
+    (onError := fun e =&gt; k.trace s!"[hook] {name} v{d.version} error: {strTake e 200}")
+  match r with
+  | .ok v =&gt; return v
+  | .error _ =&gt; if d.status == "trial" then k.callHook name input builtin pick else return builtin</code></pre>
+<span class="src">lean/Cmh/Kernel.lean:206-213</span>
+
+<p>If a trial hook fails, the failure has already reverted it, so the kernel simply calls
+the hook again and gets the restored version. If a kept hook fails, or no version is
+live, the kernel uses a built-in copy written in the kernel itself. Those copies duplicate
+the seeds on purpose: "seeds are elaborated in their own isolated environment, so the
+kernel cannot call them" as ordinary functions. <code>selectLessons</code> also counts a
+hook call as failed if it returns a lesson id that was not offered.</p>
+
+<p>The hooks are pure functions, but the kernel still runs them on the timed thread by
+wrapping them in <code>IO.lazyPure</code>, so a hook that loops forever hits the same
+30-second limit as a tool.</p>
+
+<h2>The provider: curl as the HTTP client</h2>
+
+<p>The kernel uses no HTTP library. The Anthropic provider shells out to
+<code>curl</code>, which the README lists as a requirement next to elan. The request body and the response go through temporary files that are
+removed in a <code>finally</code> block. The headers, including the secret, are written to
+curl's standard input as a config file (<code>-K -</code>), so the token never appears in
+the process's argument list, where any user on the machine could read it with
+<code>ps</code>:</p>
+
+<pre><code>private def runCurl (url bodyPath respPath : String) (config : String) : IO (UInt32 × String × String) := do
+  let child ← IO.Process.spawn {
+    cmd := "curl"
+    args := #["-sS", "-X", "POST", url, "-K", "-", "--data-binary", s!"@{bodyPath}",
+              "-o", respPath, "-w", "%{http_code}", "--max-time", "600"]
+    stdin := .piped, stdout := .piped, stderr := .piped }
+  let (stdin, child) ← child.takeStdin
+  stdin.putStr config
+  stdin.flush  -- last use: the handle is released (closed) here, so curl sees EOF</code></pre>
+<span class="src">lean/Cmh/Provider.lean:53-61</span>
+
+<p>The rest follows SPEC's provider rules:</p>
+<ul>
+<li><strong>Auth.</strong> <code>ANTHROPIC_API_KEY</code> sends <code>x-api-key</code>. Without
+it, <code>CLAUDE_CODE_OAUTH_TOKEN</code> sends a Bearer header plus the OAuth beta header, and
+the kernel puts the Claude Code system preamble first. With neither, the provider refuses
+to start.</li>
+<li><strong>Endpoint.</strong> <code>ANTHROPIC_BASE_URL</code> (default
+<code>https://api.anthropic.com</code>, trailing slash stripped) plus
+<code>/v1/messages</code>. Requests use <code>max_tokens</code> 32000 and send
+<code>tools</code> only when there are some.</li>
+<li><strong>Retries.</strong> A curl error, 429, 529 or any 5xx is retried up to 4 times,
+waiting 4, 8, 16 and 32 seconds. Other non-200 replies throw with the API's error
+object.</li>
+<li><strong>Model.</strong> <code>--model</code>, then <code>CMH_MODEL</code>, then
+<code>claude-sonnet-5-5</code>.</li>
+<li><strong>Mock.</strong> A scripted provider that returns canned content arrays in order,
+reports <code>tool_use</code> when a block asks for a tool, records every request in an
+in-memory list for the tests, and throws when the script runs out.</li>
+</ul>
+
+<h2>CLI, build and test</h2>
+
+<pre><code>cmh [--state DIR] [--provider anthropic|mock] [--script FILE] [--model M]
+    [--soak N] [--no-reflect] &lt;command&gt;
+  repl | run "TASK" | refine | defs | knowledge
+  repl slash commands: /defs /show NAME [VERSION] /knowledge /refine /rollback NAME VERSION /quit</code></pre>
+<span class="src">lean/README.md:50-53</span>
+
+<p><code>run</code> prints only the final answer on stdout and exits 0 on success and 1
+on failure. A usage error exits 2, and an exception while opening the state or building the
+provider exits 1. The trace (<code>[tool]</code>, <code>[gate]</code>, <code>[hook]</code>,
+<code>[task]</code>, <code>[reflect]</code>, <code>[lesson]</code>, <code>[kernel]</code>,
+<code>[provider]</code>) goes to stderr. <code>defs</code> and <code>knowledge</code> never
+build a provider, so they work without credentials.</p>
+
+<pre><code>cd lean
+lake build                     # builds .lake/build/bin/cmh
+lake test                      # or: lake exe cmh-test   (8 required tests, mock provider, offline)
+.lake/build/bin/cmh run "count the words in README.md"</code></pre>
+<span class="src">lean/README.md:41-44</span>
+
+<p>The tests do not use a framework. <code>Test.lean</code> defines a <code>check</code>
+helper that counts checks and collects failures, and <code>main</code> runs the eight
+SPEC tests in order, each against a fresh state dir under <code>/tmp</code>:</p>
+
+<ol>
+<li><strong>Late binding</strong>, including every seed passing its own gate.</li>
+<li><strong>Gate rejection</strong> of a type error, a failing test, the wrong shape, <code>sorry</code>, a false theorem and no tests.</li>
+<li><strong>Soak revert</strong> on a thrown error, with a verdict.</li>
+<li><strong>Soak keep</strong> after three clean uses.</li>
+<li><strong>Persistence:</strong> the replayed state matches a snapshot.</li>
+<li><strong>Hook redefinition</strong> changes the prompt; the base prompt stays first.</li>
+<li><strong>Lesson scoring</strong>, retirement at −3, and a final tool error failing the task.</li>
+<li><strong>End to end</strong> through <code>cliMain</code> with reflection: propose a <code>reverse</code> tool, call it, add a lesson (4 mock requests).</li>
+</ol>
+
+<pre><code>PASS 1 late binding (608ms)
+PASS 2 gate rejection (217ms)
+PASS 3 soak revert (50ms)
+PASS 4 soak keep (63ms)
+PASS 5 persistence (198ms)
+PASS 6 hook redefinition (73ms)
+PASS 7 lesson scoring (199ms)
+olleh
+PASS 8 end-to-end run (106ms)
+8/8 tests passed (53 checks, 0 failed)</code></pre>
+<span class="src">output of lake exe cmh-test on a copy of lean/, 2026-11-13</span>
+
+<h2>What it costs: timing and memory</h2>
+
+<p>I took these measurements in an orb (a cloud sandbox) on 2026-11-13, using copies
+of <code>lean/</code> under <code>/tmp</code> with Lean 4.35.0. Each figure is a single run
+on one machine (two runs where a range is shown). Read them as orders of magnitude, not benchmarks.</p>
+
+<table>
+<tr><th>What</th><th>Wall time</th><th>Peak memory (RSS)</th></tr>
+<tr><td>Clean <code>lake build</code> (20 jobs)</td><td>34.6 s</td><td>about 1.6 GB (largest process)</td></tr>
+<tr><td><code>lake exe cmh-test</code>, all 8 tests</td><td>2.76 s</td><td>816 MB (with <code>lake</code> itself)</td></tr>
+<tr><td>One test</td><td>26–608 ms (across two runs)</td><td>—</td></tr>
+<tr><td><code>cmh defs</code> (no elaboration)</td><td>0.08 s</td><td>90 MB</td></tr>
+<tr><td><code>cmh run</code> with a one-reply mock script</td><td>0.77–0.79 s</td><td>535 MB</td></tr>
+<tr><td><code>cmh run</code>: two proposals and a tool call</td><td>1.21 s</td><td>538 MB</td></tr>
+<tr><td>Gate on one small accepted tool (elaborate + test)</td><td>31 ms</td><td>—</td></tr>
+<tr><td>Gate on one rejected tool (false theorem)</td><td>60 ms</td><td>—</td></tr>
+</table>
+
+<p>Most of the cost is paid once. The first userspace call in a process (here, the
+lesson-selection hook at the start of a task) imports the base environment and elaborates
+the seed hooks, and that brings the process from 90 MB to about 535 MB and takes most of
+the 0.8 seconds. After that, elaborating a small proposal takes tens of milliseconds.</p>
+
+<p>The static footprint is large. The <code>cmh</code> executable is 231,596,928 bytes
+(about 232 MB) because it links the compiler and the interpreter, and the toolchain's
+<code>lib/lean</code> directory, which must be present at run time for the
+<code>.olean</code> files, is 2.7 GB.</p>
+
+<p>In the evals (<a href="11-evals.html">chapter 11</a>) the cheap gate did not make Lean
+cheap per task. In the committed DeepSeek V4.1 Flash results it scored 96% overall (46/48),
+98% of Prime and the only flavor below 100% of it, with a 30.1 s median episode and the
+most tokens of any flavor, 4.02 M. With GLM 5.3 Flash it scored 92%, 116% of Prime. In the
+later isolated memory matrix it passed 24/32 (75%), below the 80%-of-Prime bar, and spent
+the most tokens (16.7 M) with the slowest median (122.0 s), though 27% of its summed wall
+time in that run was orb pauses. Its misses there were in the suites where rules pile up
+and get corrected: in r2 it forgot rules given one episode earlier, and in r3 it did not
+apply a correction. These runs had one or
+two trials each, so the differences between flavors are noisy.</p>
+
+<h2>Limitations</h2>
+
+<p>The Lean flavor's wall is partial. The ROADMAP's summary table says "partly
+(<code>panic!</code> not caught)" for "Agent code can crash the harness" and "no (thread
+keeps spinning)" for "Runaway loop is actually stopped".</p>
+
+<h3>panic! is not turned into a gate error</h3>
+
+<p>Lean code can call <code>panic!</code> (for example through an out-of-bounds
+<code>a[i]!</code>). The kernel catches <code>IO</code> exceptions and converts them to
+errors that revert a trial, but a panic is not an exception, so the gate does not see it.
+By default, Lean prints the panic message to stderr and carries on with the type's
+<code>Inhabited</code> default value; this is documented Lean behaviour, not anything in
+this repo. A tool can therefore
+return a wrong answer after a panic and still count as a clean use. Stack overflow and
+running out of memory are not caught either; they take the whole process down.</p>
+
+<h3>Threads cannot be killed</h3>
+
+<p>Each userspace call runs on its own thread under <code>runTimed</code>:</p>
+
+<pre><code>def runTimed (ms : Nat) (act : IO α) : IO (Except String α) := do
+  let t ← IO.asTask act .dedicated
+  let start ← IO.monoMsNow
+  let mut delay : UInt32 := 1
+  repeat
+    if ← IO.hasFinished t then break
+    if (← IO.monoMsNow) - start &gt; ms then
+      IO.cancel t
+      return .error s!"timeout after {ms / 1000}s"
+    IO.sleep delay
+    delay := min 20 (delay * 2)</code></pre>
+<span class="src">lean/Cmh/Elab.lean:141-151</span>
+
+<p>It polls with a backoff from 1 to 20 ms. After 30 seconds it calls
+<code>IO.cancel</code> and reports a timeout, which reverts a trial. But Lean's
+cancellation is cooperative: it sets a flag that the task may check, and a tight loop
+never checks it. The comment says so: "On timeout the thread cannot be killed (Lean tasks
+are cooperative); it is abandoned." The abandoned thread keeps burning a CPU core until
+the process exits. <code>partial def</code>, which allows non-terminating functions, is
+not on the banned list, so writing such a loop is easy. To keep abandoned threads from
+blocking shutdown, <code>Main</code> exits the hard way:</p>
+
+<pre><code>/-- Exit through `IO.Process.exit` so a userspace call abandoned after a timeout (Lean threads
+cannot be killed) does not keep the process alive at shutdown. -/
+def main (args : List String) : IO UInt32 := do
+  let code ← Cmh.cliMain args
+  (← IO.getStdout).flush
+  (← IO.getStderr).flush
+  IO.Process.exit code.toUInt8</code></pre>
+<span class="src">lean/Main.lean:3-9</span>
+
+<p>Elaboration itself does not run under the timer. It is bounded by the 200,000-heartbeat
+limit instead, which caps proof search and other elaborator work.</p>
+
+<h3>Other gaps</h3>
+
+<ul>
+<li><strong>IO is open.</strong> A tool's <code>run</code> is in <code>IO</code>, and
+<code>Init</code> includes file and process functions such as <code>IO.FS</code> and
+<code>IO.Process.spawn</code>. Banning <code>unsafe</code> and <code>import</code> limits the
+language, not what a tool can do to the machine. And <code>bash</code>, as in every flavor,
+can edit anything, including the kernel source and the journal.</li>
+<li><strong>No accumulation.</strong> Every proposal is elaborated against the same base
+environment, "so a macro defined in one tool is not visible to the next". A helper
+function cannot be shared between tools; each must carry its own copy. The ROADMAP proposes
+chaining environments so kept definitions form a prelude. Its experiment 10 goes further:
+an "accumulating Lean prelude with proofs", where new versions must "prove equivalence or
+a stated property against the previous one".</li>
+<li><strong>No scratchpad.</strong> To try out a piece of Lean, the agent has to propose a
+definition. The ROADMAP suggests a tool that would "elaborate in a scratch environment and
+<code>#eval</code>".</li>
+<li><strong>Memory only grows.</strong> Every elaborated environment stays in
+<code>keepAlive</code> for the life of the process.</li>
+<li><strong>Small differences from SPEC and from Rust:</strong> static-check rejections and superseded
+trials leave no journal event, <code>base-prompt.md</code> is not write-protected, and
+timestamps have one-second precision.</li>
+</ul>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Lean 4's compiler is a library, so the harness elaborates new source with
+<code>Lean.Elab.process</code> into a fresh environment value and turns it into a callable
+closure with <code>evalConst</code>, all inside one process.</li>
+<li>A kernel-written entry line with a fixed type checks that a proposal has the right
+shape; one namespace and one environment per version keep versions apart.</li>
+<li>Every <code>theorem</code> and <code>example</code> in a proposal must check, so a tool can
+carry machine-checked claims about itself and false claims cannot go live.
+Nothing forces the agent to write useful claims.</li>
+<li>Twelve banned tokens (<code>sorry</code>, <code>axiom</code>, <code>unsafe</code>,
+<code>import</code> and the rest) keep the proofs meaningful, at the
+cost of a lexical check that also refuses them in strings and comments.</li>
+<li>The gate is fast (tens of milliseconds per small proposal once warm), but the process
+needs about half a gigabyte after the first elaboration and a 232 MB binary.</li>
+<li>The wall is partial: <code>panic!</code> is not turned into a gate error, and a runaway
+call is abandoned on a thread that cannot be killed.</li>
+</ul>
+</main>
+<footer class="nav"><a href="06-rust.html">← Rust: a compiled library per definition</a><a href="index.html">Contents</a><a href="08-forth.html">Forth in WebAssembly: a language built for the agent →</a></footer>
+</body></html>

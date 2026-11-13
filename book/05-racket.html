@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5. Racket: sandboxed evaluators · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 5</header>
+<main>
+<h1>5. Racket: sandboxed evaluators</h1>
+<p class="subtitle">The same design as the Clojure flavor, but every piece of agent-written code runs inside a walled-off evaluator with its own time and memory budget.</p>
+
+<p>The Racket flavor of cmh implements the same <code>SPEC.md</code> as the Clojure flavor in the
+previous chapter. It has the same kernel tools, the same gate, the same journal and the same eight
+required tests. If you read chapter 4, most of this chapter will feel familiar: both flavors follow
+one spec, so most of what differs comes from the language.</p>
+
+<p>One thing changes a lot. In Clojure, code the agent writes is loaded into the same JVM as
+the kernel, with full access to everything. In Racket it is loaded into a <em>sandboxed
+evaluator</em>, a small separate world that cannot read files, open sockets or start programs, and
+that is stopped when it runs too long or uses too much memory. Racket ships this in its standard
+library. This chapter explains how cmh uses it, walks through the kernel file by file, and ends
+with an honest list of what the wall still misses.</p>
+
+<h2>A tiny Racket primer</h2>
+
+<p>Racket is a Lisp, like Clojure. Programs are written as nested lists in parentheses, and the
+first element of a list is the thing being called. <code>(+ 1 2)</code> calls <code>+</code> with
+<code>1</code> and <code>2</code>. A few forms appear in every excerpt in this chapter:</p>
+
+<ul>
+<li><code>(define x 5)</code> names a value; <code>(define (f a b) body)</code> defines a function
+<code>f</code> with two parameters. The last expression in the body is the return value; there is
+no <code>return</code> keyword.</li>
+<li><code>(λ (x) ...)</code> (also spelled <code>lambda</code>) is an anonymous function.</li>
+<li><code>(cond [test1 result1] [test2 result2] [else ...])</code> is an if/else-if chain. Square
+brackets are just parentheses with a different look.</li>
+<li><code>#t</code> and <code>#f</code> are true and false. Only <code>#f</code> counts as false,
+so functions often return <code>#f</code> for "nothing" and a value otherwise.</li>
+<li><code>'foo</code> is a <em>symbol</em>, a bare name used as data. <code>(quote (+ 1 2))</code>,
+written <code>'(+ 1 2)</code>, is the list of three items, not the number 3. This is what "code is
+data" means: a program is a list, and a list can be built, stored and evaluated later.</li>
+<li><code>`(f ,x)</code> is a <em>quasiquote</em>: a template list where <code>,x</code> plugs in
+the value of <code>x</code>. cmh uses it to build function calls as data.</li>
+<li><code>(hasheq 'a 1 'b 2)</code> builds a hash table with symbol keys. The <code>json</code>
+library turns JSON objects into exactly these tables; Racket calls parsed JSON values
+<em>jsexprs</em>. JSON <code>null</code> becomes the symbol <code>'null</code>.</li>
+<li><code>(values a b)</code> returns two results at once, and <code>(define-values (a b) ...)</code>
+receives them. Many kernel functions return <code>(values ok? message)</code>.</li>
+<li><code>(with-handlers ([pred handler]) body)</code> is try/catch: if <code>body</code> raises
+something that <code>pred</code> accepts, <code>handler</code> runs instead.</li>
+<li><code>(parameterize ([p v]) body)</code> sets a <em>parameter</em> (a dynamically scoped
+setting) for the duration of <code>body</code>.</li>
+<li>Names ending in <code>!</code>, like <code>emit!</code>, mutate something by convention.
+Names ending in <code>?</code> return a boolean.</li>
+</ul>
+
+<p>Every kernel file starts with <code>#lang racket/base</code>, which picks the small core
+language.</p>
+
+<h2>How code becomes live: <code>racket/sandbox</code></h2>
+
+<p>Racket's runtime has several features that most languages keep out of user reach.
+A <em>namespace</em> is a table of names that <code>eval</code> can run code against. A
+<em>custodian</em> owns resources such as threads, files and memory, and can shut all of them down
+at once. A <em>security guard</em> is consulted on every file, network and process operation and
+can refuse it. The <code>racket/sandbox</code> library packages these into one call,
+<code>make-evaluator</code>, which returns an <em>evaluator</em>: a function you hand code to
+(as a string or as a list), and which runs that code in a fresh namespace, in its own thread, under
+its own custodian and security guard, with time and memory limits. The kernel can therefore treat
+every definition the agent proposes as untrusted code without writing any isolation of its own.</p>
+
+<h3>Creating and loading an evaluator</h3>
+
+<pre><code>(define (new-evaluator)
+  (parameterize ([sandbox-output #f]
+                 [sandbox-error-output #f]
+                 [sandbox-input #f]
+                 [sandbox-eval-limits (list (sandbox-time-limit) (sandbox-memory-mb))]
+                 [sandbox-memory-limit (* 2 (sandbox-memory-mb))])
+    (make-evaluator 'racket/base)))
+
+(define (destroy-evaluator ev) (kill-evaluator ev))
+
+;; Evaluate all top-level forms of the source. A leading #lang line is dropped.
+(define (load-source! ev source)
+  (ev (regexp-replace #px"^\\s*#lang[^\n]*" source ""))
+  (void))</code></pre>
+<span class="src">racket/kernel/sandbox.rkt:12-25</span>
+
+<p>The two parameters at the top of the file set the limits: 10 seconds and 128 MB for
+<em>each evaluation</em> (<code>sandbox-eval-limits</code>), and 256 MB for everything the
+evaluator holds (<code>sandbox-memory-limit</code>). Going over a per-evaluation limit only
+fails that evaluation; going over the 256 MB cap terminates the evaluator. Standard output, error output and input are
+switched off, so agent code cannot print into the kernel's trace or wait on the terminal. The
+language inside is <code>racket/base</code>; agent code may <code>require</code> other standard
+libraries such as <code>racket/string</code> or <code>json</code>.</p>
+
+<p>Loading a definition is one call: pass the whole source string to the evaluator, which runs
+every top-level form in it. A leading <code>#lang</code> line is stripped, because an evaluator
+takes forms, not a module file.</p>
+
+<h3>Entry points and the boundary</h3>
+
+<p>Each kind of definition has one function it must define. A tool must define
+<code>(run input)</code>. The <code>select_lessons</code> hook must define
+<code>(select-lessons task lessons)</code>, and the <code>compose_system</code> hook must define
+<code>(compose-system notes lessons)</code>. The kernel describes each with a small struct:</p>
+
+<pre><code>(struct entry (symbol arity signature args check))
+
+(define tool-entry
+  (entry 'run 1 "(define (run input) ...)"
+         (λ (input) (list input))
+         check-string))</code></pre>
+<span class="src">racket/kernel/sandbox.rkt:43-48</span>
+
+<p>Before a definition goes live, <code>check-entry!</code> asks the evaluator for the value of
+that symbol and checks that it is a procedure accepting the right number of arguments
+(<code>procedure-arity-includes?</code>). Then, to call it, the kernel never takes the procedure
+out of the sandbox. It builds the call as a list and evaluates the list <em>inside</em>:</p>
+
+<pre><code>;; Call the entry point inside the evaluator (time and memory limits apply)
+;; and check the shape of the result. Arguments cross as quoted data.
+(define (invoke-entry ev kind name input)
+  (define e (entry-for kind name))
+  (define sym (entry-symbol e))
+  (define call `(,sym ,@(for/list ([a (in-list ((entry-args e) input))]) `(quote ,a))))
+  ((entry-check e) sym (ev call)))</code></pre>
+<span class="src">racket/kernel/sandbox.rkt:71-77</span>
+
+<p>For a <code>word_count</code> call with input <code>{"text": "a b"}</code>, the list built is
+roughly <code>(run (quote #hasheq((text . "a b"))))</code>. Two things follow from doing it this
+way. First, the time and memory limits apply to every single call, not only to loading. Second,
+only plain data crosses the boundary in either direction. Inputs go in as quoted JSON-shaped
+values. Results come back through a check: tools and <code>compose_system</code> must return a
+string (copied into an immutable string), and <code>select_lessons</code> must return a list of
+exact integers. A wrong type is an error, and errors count against a trial like any other.</p>
+
+<div class="diagram">  kernel (host Racket)                      sandboxed evaluator
+  ─────────────────────                     ──────────────────────────────
+  input jsexpr ──► `(run (quote ,input)) ─► eval in fresh namespace
+                                            security guard: no files, net, exec
+                                            limits: 10 s, 128 MB per eval
+  check-string ◄── result value ◄────────── (run input) returns "3"
+  (string? else error)                      256 MB cap for the evaluator</div>
+
+<h3>What the wall blocks</h3>
+
+<p>The research for this book configured a throwaway evaluator exactly like
+<code>new-evaluator</code> and tried to escape. Every one of these was stopped:</p>
+
+<table>
+<tr><th>Attempt inside the sandbox</th><th>Result</th></tr>
+<tr><td>Read <code>/etc/hostname</code></td><td>denied: "`read' access denied"</td></tr>
+<tr><td>Write a file under <code>/tmp</code></td><td>denied</td></tr>
+<tr><td><code>directory-list "/"</code></td><td>denied</td></tr>
+<tr><td><code>tcp-connect</code></td><td>denied: "network access denied"</td></tr>
+<tr><td><code>(system "echo hi")</code></td><td>denied: "`execute' access denied for /bin/sh"</td></tr>
+<tr><td>An infinite loop <code>(let l () (l))</code></td><td>stopped: "with-limit: out of time"</td></tr>
+<tr><td><code>(make-vector 100000000 0)</code></td><td>"out of memory"</td></tr>
+<tr><td><code>(exit 3)</code></td><td>only the evaluator ends ("evaluator: terminated (exited)"); the host keeps running</td></tr>
+</table>
+
+<p>This is the main reason the project's <code>ROADMAP.md</code> marks Racket as the only Lisp
+flavor where agent code cannot crash the harness and where a runaway loop is actually stopped.
+In the Clojure flavor a timed-out call is abandoned but its thread keeps burning CPU; here the
+evaluator's custodian kills it.</p>
+
+<div class="warn"><strong>The environment-variable caveat.</strong> The security guard checks file,
+network and process operations. It does not hide environment variables: by default each evaluator
+gets a copy of the host's, so <code>(getenv "HOME")</code> returns a string inside the sandbox, and
+the same call can read <code>ANTHROPIC_API_KEY</code> or <code>CLAUDE_CODE_OAUTH_TOKEN</code> if
+they are set. Agent code cannot send them over the network, but a userspace tool could return one
+as its result, putting it in the model's context. In the eval suite the key is a placeholder
+(<code>"ANTHROPIC_API_KEY": "via-eval-proxy"</code> in <code>evals/harnesses.json</code>; the
+runner strips real keys and a proxy adds them), so the risk is only in direct runs. The fix, not
+yet in the code, is one more binding in <code>new-evaluator</code>:
+<code>[sandbox-make-environment-variables (λ () (make-environment-variables))]</code> gives the
+evaluator an empty set (tried while writing this chapter: <code>getenv</code> then returns
+<code>#f</code>).</div>
+
+<h2>The architecture, file by file</h2>
+
+<p>The kernel is nine files, 1,223 lines in total. Userspace starts as three small seed files.
+Tests are one 294-line file.</p>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>What it does</th></tr>
+<tr><td><code>kernel/core.rkt</code></td><td>500</td><td>State, journal replay, the gate, the evaluator cache, hooks, lessons, text views</td></tr>
+<tr><td><code>kernel/tools.rkt</code></td><td>176</td><td>The nine kernel tools and dispatch to userspace tools</td></tr>
+<tr><td><code>kernel/agent.rkt</code></td><td>134</td><td>The agent loop, reflection, the refine prompt</td></tr>
+<tr><td><code>kernel/provider.rkt</code></td><td>132</td><td>Mock provider and the Anthropic HTTP client with retries</td></tr>
+<tr><td><code>kernel/cli.rkt</code></td><td>89</td><td>Command line and REPL</td></tr>
+<tr><td><code>kernel/sandbox.rkt</code></td><td>82</td><td>Evaluators, entry points, result checks</td></tr>
+<tr><td><code>kernel/util.rkt</code></td><td>50</td><td>Time stamps, text helpers, <code>always?</code>, <code>trace!</code></td></tr>
+<tr><td><code>kernel/base-prompt.rkt</code></td><td>36</td><td>Reads <code>../base-prompt.md</code>, with an embedded fallback copy</td></tr>
+<tr><td><code>kernel/journal.rkt</code></td><td>24</td><td>Append and read <code>journal.jsonl</code></td></tr>
+<tr><td><code>seed/*.rktl</code> + <code>seeds.json</code></td><td>17 + 21 + 5 + 32</td><td>Version 1 of the two hooks and the <code>word_count</code> tool</td></tr>
+<tr><td><code>tests/test-cmh.rkt</code></td><td>294</td><td>12 test cases</td></tr>
+</table>
+
+<p>The <code>require</code> lines give the dependency order:</p>
+
+<div class="diagram">  main.rkt    ──► cli.rkt
+  cli.rkt     ──► agent.rkt, core.rkt, provider.rkt
+  agent.rkt   ──► tools.rkt, core.rkt, provider.rkt, base-prompt.rkt
+  tools.rkt   ──► core.rkt, base-prompt.rkt
+  core.rkt    ──► journal.rkt, sandbox.rkt
+  sandbox.rkt ──► racket/sandbox, json
+
+  (util.rkt is required by every kernel file except sandbox.rkt)</div>
+
+<p>One small wrinkle comes from that order. <code>tools.rkt</code> requires <code>core.rkt</code>,
+so <code>core.rkt</code> cannot ask <code>tools.rkt</code> which names are kernel tools. It keeps
+its own list, used to refuse proposals that try to redefine <code>bash</code> or
+<code>propose_def</code>, and the last test checks that the two lists agree. A Racket package file,
+<code>info.rkt</code>, lists the dependencies (<code>base</code>, <code>sandbox-lib</code>,
+<code>net-lib</code>, <code>rackunit-lib</code>, all part of the standard distribution) and tells
+the test runner to skip <code>seed/</code> and <code>bin/</code>.</p>
+
+<p>Unlike Clojure, where state is one immutable map in an atom, Racket's kernel state is a set of
+mutable structs and hash tables: a <code>kernel</code> struct holding <code>defs</code>,
+<code>lessons</code>, <code>verdicts</code>, <code>tasks</code> and the evaluator cache, and a
+<code>def</code> struct per name with its versions, its live version, its kept version and its soak
+count. Mutation is fine here because one function owns it, as the journal section shows.</p>
+
+<h2>Late binding and the evaluator cache</h2>
+
+<p>"Late binding" means the kernel looks a definition up by name at the moment it is called,
+rather than holding on to a reference. That is what makes a new version take effect on the very
+next call.</p>
+
+<pre><code>;; Late binding: look the name up in the registry on every call.
+;; Returns (values ok? result-or-error-text).
+(define (use-def! k name input)
+  (define d (get-def k name))
+  (define rec (live-record d))
+  (cond
+    [(not rec) (values #f (format "no live definition named ~a" name))]
+    [else
+     (define v (hash-ref rec 'version))
+     (define-values (ok? out)
+       (with-handlers ([always? (λ (e) (values #f (error-text e)))])
+         (let ([ev (live-evaluator k d rec)])
+           (values #t (invoke-entry ev (def-kind d) name input)))))
+     (record-use! k name v ok? (if ok? #f out) input)
+     (values ok? out)]))</code></pre>
+<span class="src">racket/kernel/core.rkt:290-304</span>
+
+<p>Making a new evaluator and loading source into it on every call would be slow, so the kernel
+keeps one evaluator per name, tagged with the version it was loaded from:</p>
+
+<pre><code>(define (live-evaluator k d rec)
+  (define cache (kernel-evcache k))
+  (define name (def-name d))
+  (define version (hash-ref rec 'version))
+  (define cached (hash-ref cache name #f))
+  (cond
+    [(and cached (eqv? (car cached) version)) (cdr cached)]
+    [else
+     (when cached
+       (destroy-evaluator (cdr cached))
+       (hash-remove! cache name))
+     (define ev (new-evaluator))
+     (with-handlers ([always? (λ (e) (destroy-evaluator ev) (raise e))])
+       (load-source! ev (hash-ref rec 'source)))
+     (hash-set! cache name (cons version ev))
+     ev]))</code></pre>
+<span class="src">racket/kernel/core.rkt:273-288</span>
+
+<p>If the live version is the cached one, reuse it. Otherwise kill the stale evaluator and load a
+fresh one from the live record's source. A new trial or a revert changes which version is live, so
+the next call sees the change. The cache is only a cache: nothing about it is journaled, and after
+a restart it fills up again on first use.</p>
+
+<div class="note">The <code>racket/README.md</code> says evaluators are "cached by
+<code>(name . version)</code>". The code caches by <em>name</em> and stores a
+<code>(version . evaluator)</code> pair, as the comment at <code>core.rkt:27-28</code> correctly
+says. The difference matters: only one evaluator per name stays alive, not one per version.</div>
+
+<p>Every kernel <code>with-handlers</code> uses the predicate <code>always?</code>, defined in
+<code>util.rkt</code> as "anything that is not a break". It catches every raised value, including
+odd ones like <code>(raise 'nope)</code> that are not exception structs (test 5 uses exactly
+that), and still lets Ctrl-C through.</p>
+
+<h2>The agent loop</h2>
+
+<p><code>agent.rkt</code> runs one task in four steps: build the prompt, run model and tool turns,
+score the outcome, reflect.</p>
+
+<p><strong>Prompt.</strong> The task gets an integer id (one more than the number of finished
+tasks) and a <code>task_started</code> event. The kernel then calls the
+<code>select_lessons</code> hook to pick lessons, collects the notes still on trial, and builds the
+system prompt with <code>system-blocks</code>: the immutable base prompt first, then the
+supplemental prompt from <code>compose_system</code> if it is not empty. This happens <em>once
+per task</em> and the result is reused on every turn. Clojure rebuilds it on every model request,
+so a <code>compose_system</code> redefined mid-task takes effect on the next request there, and on
+the next task here.</p>
+
+<p><strong>Turns.</strong> <code>run-turns</code> is a loop that calls the provider with the system
+prompt, the current tool list and the messages so far. The tool list is rebuilt on every request
+from the kernel tools plus the live userspace tools, so a tool proposed in turn 3 can be called
+in turn 4. If the reply contains <code>tool_use</code> blocks, each is run, the results are
+appended as a user message, and the loop continues. If it contains none, the loop ends. A provider
+error ends the loop as a <em>kernel error</em>, and so does passing 40 turns ("turn limit 40
+reached").</p>
+
+<p><strong>Outcome.</strong> Success has a precise meaning:</p>
+
+<pre><code>  ;; A task succeeds when the model ended its turn normally, nothing broke in
+  ;; the kernel, and its last two tool calls (if any) did not fail.
+  (define success?
+    (and (equal? stop "end_turn") (not kernel-error)
+         (not (ormap values (take-up-to tool-errors 2)))))
+  ;; Notes soak over tasks: a failed task counts as an error for trial notes.
+  (for ([n trial-notes])
+    (record-use! k (car n) (cdr n) success? (if success? #f (or kernel-error "task failed")) #f))
+  (score-lessons! k lesson-ids success?)
+  (emit! k (hasheq 'type "task_finished" 'task_id task-id 'task task 'success success?
+                   'summary (one-line (or kernel-error answer) 300)))
+  (trace! "[task] #~a ~a" task-id (if success? "succeeded" "failed"))
+  (when (kernel-reflect? k) (reflect! k task success? (reverse transcript)))
+  (values success? (if (and kernel-error (string=? answer "")) (string-append "error: " kernel-error) answer)))</code></pre>
+<span class="src">racket/kernel/agent.rkt:34-47</span>
+
+<p>Notes are plain text, so they have no "call" that can fail. Instead each note on trial counts
+one use per task, and the use is clean only if the task succeeded. The lessons that were put in
+the prompt are scored up or down by the same outcome. Then the kernel reflects (below).</p>
+
+<h2>The kernel tools</h2>
+
+<p>Nine tools are always present and cannot be redefined.</p>
+
+<table>
+<tr><th>Tool</th><th>What it does in Racket</th></tr>
+<tr><td><code>bash</code></td><td>Runs <code>/bin/sh -c</code> as a subprocess in its own process group; output (stdout and stderr merged) truncated to 20,480 characters; default timeout 60 s, after which the whole group is killed and the call is an error</td></tr>
+<tr><td><code>read_file</code></td><td>Reads a file, truncated to 51,200 characters</td></tr>
+<tr><td><code>write_file</code></td><td>Writes a file, refusing the state dir, <code>kernel/</code> and <code>base-prompt.md</code></td></tr>
+<tr><td><code>list_defs</code></td><td>Lists userspace definitions, with <code>(soak n/N)</code> for trials</td></tr>
+<tr><td><code>show_def</code></td><td>Shows one definition: version history, errors, schema, tests and source</td></tr>
+<tr><td><code>propose_def</code></td><td>Sends a new version through the gate</td></tr>
+<tr><td><code>rollback_def</code></td><td>Re-proposes an older version that was once live</td></tr>
+<tr><td><code>remember</code></td><td>Adds a lesson (never an error, even for a duplicate)</td></tr>
+<tr><td><code>recall</code></td><td>Searches lessons and verdicts by shared words</td></tr>
+</table>
+
+<p>The <code>bash</code> tool is worth a look, because a shell command that hangs is a classic way
+for an agent to get stuck:</p>
+
+<pre><code>(define (run-bash command timeout-s)
+  (define-values (sp out in _err)
+    (parameterize ([subprocess-group-enabled #t])
+      (subprocess #f #f 'stdout "/bin/sh" "-c" command)))
+  (close-output-port in)
+  (define buf (open-output-bytes))
+  (define reader (thread (λ () (copy-port out buf))))
+  (define finished? (sync/timeout timeout-s sp))
+  (unless finished? (subprocess-kill sp #t))
+  (sync/timeout 5 reader)
+  (kill-thread reader)
+  (close-input-port out)
+  (define text (truncate-text (bytes-&gt;string/utf-8 (get-output-bytes buf) #\uFFFD) 20480))
+  (if finished?
+      (values #f (format "~a\n[exit code ~a]" text (subprocess-status sp)))
+      (values #t (format "~a\n[timed out after ~a s]" text timeout-s))))</code></pre>
+<span class="src">racket/kernel/tools.rkt:75-90</span>
+
+<p>Running the shell in its own process group means a timeout kills the shell <em>and</em>
+everything it started. A reader thread copies output so a chatty command cannot fill a pipe and
+block.</p>
+
+<p><code>write_file</code> resolves symlinks on the longest existing part of the path and compares
+path components, so <code>kernel/../kernel/core.rkt</code> or a symlink pointing into the kernel is
+still refused:</p>
+
+<pre><code>(define (write-file-tool k path content)
+  (define target (real-path path))
+  (cond
+    [(inside? target (real-path (kernel-dir k)))
+     (values #t "refused: path is inside the harness state dir")]
+    [(inside? target (real-path kernel-src-dir))
+     (values #t "refused: path is inside the harness kernel source")]
+    [(equal? target (real-path base-prompt-file))
+     (values #t "refused: the base prompt is immutable")]
+    [else
+     (make-parent-directory* target)
+     (display-to-file content target #:exists 'truncate/replace)
+     (values #f (format "wrote ~a bytes to ~a" (string-utf-8-length content) path))]))</code></pre>
+<span class="src">racket/kernel/tools.rkt:107-119</span>
+
+<p>Any name that is not a kernel tool is looked up in the live userspace tools and sent to
+<code>use-def!</code>. Everything runs inside <code>run-tool</code>, which catches any error, turns
+it into an error result for the model, and prints one <code>[tool]</code> trace line to stderr.</p>
+
+<p>The <code>propose_def</code> tool description is also where the model learns the Racket
+contracts. It says the source runs "in a racket/base sandbox (no #lang line; you may (require
+racket/string racket/list json ...); no file writes or network; time and memory limits)", spells
+out each entry point, and notes that JSON <code>null</code> arrives as the symbol
+<code>'null</code> (<code>tools.rkt:14-23</code>).</p>
+
+<h2>The gate: validate, trial, soak, keep or revert</h2>
+
+<p>A proposal goes through four stages.</p>
+
+<div class="diagram">  propose_def ─► static checks ──fail──► "invalid proposal: ..."  (not journaled)
+                     │ ok
+                     ▼
+               def_proposed vN ─► validate in scratch evaluator ──fail──► def_rejected
+                                          │ ok
+                                          ▼
+               (old trial? revert it: "superseded by vN")
+                                          │
+                                          ▼
+                                  def_trial: vN is live now
+                                          │
+                  each use ─► def_use ────┼──── error ──► def_reverted (kept version live again)
+                                          │
+                              N clean uses (default 3)
+                                          ▼
+                                       def_kept</div>
+
+<p><strong>Static checks.</strong> The name must match <code>^[A-Za-z0-9_-]{1,64}$</code> and
+not be a kernel tool; the kind must be <code>tool</code>, <code>note</code> or <code>hook</code>; a
+hook must be one of the two hook names; a name cannot change kind; tests must be a list of
+<code>{"input": {...}, "expect": "..."}</code>. A proposal that fails
+here is answered with "invalid proposal: ..." and is not written to the journal.</p>
+
+<p><strong>Validation in scratch.</strong> The kernel builds a brand-new evaluator, loads the source,
+checks the entry point, runs every test, and kills the evaluator whatever happens. Live evaluators
+are never touched.</p>
+
+<pre><code>       (when (null? tests) (error "tools and hooks need at least one test"))
+       (define ev (new-evaluator))
+       (dynamic-wind
+        void
+        (λ ()
+          (with-handlers ([always? (λ (e) (error (string-append "source failed to evaluate: "
+                                                                (error-text e))))])
+            (load-source! ev source))
+          (check-entry! ev kind name)
+          (for ([t (in-list tests)] [i (in-naturals 1)])
+            (define expect (hash-ref t 'expect))
+            (define out
+              (with-handlers ([always? (λ (e) (error (format "test ~a raised: ~a" i (error-text e))))])
+                (test-output ev kind name (hash-ref t 'input))))
+            (unless (string-contains? out expect)
+              (error (format "test ~a failed: expected ~s as a substring of the output ~s"
+                             i expect (truncate-text out 500)))))
+          #f)
+        (λ () (destroy-evaluator ev)))])))</code></pre>
+<span class="src">racket/kernel/core.rkt:155-173</span>
+
+<p><code>dynamic-wind</code> takes three functions: before, body, after. The "after" runs even if
+the body raises, which is how the scratch evaluator is always destroyed. A test passes when its
+<code>expect</code> string is a substring of the output; for <code>select_lessons</code> the list
+of ids is JSON-encoded first, so a test expects something like <code>"[2,1]"</code>. Error messages
+are written for the model to read: "source must define (define (run input) ...)", "test 2 failed:
+expected ... as a substring of the output ...".</p>
+
+<p><strong>Trial and soak.</strong> If validation passes, any version still on trial is reverted
+first ("superseded by vN before its soak finished"), then the new version goes live as a trial.
+Every use emits a <code>def_use</code> event; while the version is on trial, an error reverts it
+and enough clean uses keep it:</p>
+
+<pre><code>(define (gate-decision! d v status err #:live live)
+  (set-status! d v status err)
+  (set-def-live! d live)
+  (set-def-soak-count! d 0))
+
+;; True while version v is live and still on trial (its uses count toward soak).
+(define (in-soak? d v)
+  (and (eqv? (def-live d) v) (equal? (live-status d) "trial")))</code></pre>
+<span class="src">racket/kernel/core.rkt:100-107</span>
+
+<pre><code>;; Count one use; during soak an error reverts and enough clean uses keep.
+(define (record-use! k name version ok? err input)
+  (emit! k (hasheq 'type "def_use" 'name name 'version version 'ok ok? 'error (if ok? 'null err)))
+  (define d (get-def k name))
+  (when (and d (in-soak? d version))
+    (cond [(not ok?) (revert! k d err input)]
+          [(&gt;= (def-soak-count d) (kernel-soak k)) (keep! k d)])))</code></pre>
+<span class="src">racket/kernel/core.rkt:263-269</span>
+
+<p>The soak count itself is incremented in <code>apply-event!</code> when a clean
+<code>def_use</code> arrives, so the same rule runs live and during replay. Once a version is kept,
+its errors are still returned to the model, but they no longer revert anything (test 4 checks
+this).</p>
+
+<p><strong>Verdicts.</strong> Every keep and revert produces a one-line verdict, such as
+<code>def word_count v2 ("test version") reverted: ... on input {...}</code> or "... kept after 3
+clean uses". Racket stores the verdict as a field on the <code>def_kept</code> and
+<code>def_reverted</code> events and keeps a list of strings in memory. The last 30 are always
+appended to the supplemental prompt under "## Verdicts on earlier userspace changes", bypassing
+both hooks, so the agent always sees what happened to its earlier changes. Seeds have no verdicts.
+SPEC.md asks that keeps and reverts write knowledge entries; Racket meets the intent with the event
+field rather than a <code>lesson_added</code> event as Clojure does.</p>
+
+<p><strong>Rollback.</strong> <code>rollback_def NAME V</code> takes the source of an older
+version and proposes it again as a new version number, so it goes through the gate like anything
+else. Racket refuses to roll back to a version that was never live ("was never live (rejected)").</p>
+
+<h2>The journal and replay</h2>
+
+<p>Every state change is an event, appended as one JSON line to
+<code>&lt;state&gt;/journal.jsonl</code>:</p>
+
+<pre><code>(define (journal-append! path ev)
+  (define full (hash-set ev 'ts (now-iso)))
+  ;; Closing the port (when call-with-output-file returns) flushes the line.
+  (call-with-output-file path #:exists 'append
+    (λ (o) (write-json full o) (newline o)))
+  full)</code></pre>
+<span class="src">racket/kernel/journal.rkt:6-11</span>
+
+<p>The trick that makes persistence reliable is that live changes and replay go through the same
+function. <code>emit!</code> is a single line:</p>
+
+<pre><code>(define (emit! k ev)
+  (apply-event! k (journal-append! (kernel-journal k) ev)))</code></pre>
+<span class="src">racket/kernel/core.rkt:42-43</span>
+
+<p>When a process starts, <code>open-kernel</code> reads the journal and feeds every event to the
+same <code>apply-event!</code>. If the journal is empty, it installs the seeds. A final line torn
+by a crash mid-write is skipped with a <code>[journal] skipping unreadable line</code> trace.
+<code>apply-event!</code> handles the <code>def_*</code> events, <code>lesson_added</code>,
+<code>lesson_scored</code>, <code>lesson_retired</code> and <code>task_finished</code>;
+<code>task_started</code> and unknown types are ignored. Evaluators are not state, so replay
+creates none; they are rebuilt lazily on first call. Test 5 opens a second kernel on the same
+directory and checks that definitions, knowledge and an unfinished soak all carry over.</p>
+
+<h2>Lessons, reflection and refine</h2>
+
+<p>Lessons are short strings with integer ids, a score and a retired flag. <code>remember</code>
+adds one with source <code>"model"</code>; reflection adds them with source
+<code>"reflection"</code>. Text is whitespace-normalised, and a lesson that matches an existing one
+ignoring case is rejected as a duplicate.</p>
+
+<pre><code>(define (score-lessons! k ids success?)
+  (for ([id (in-list ids)])
+    (define l (hash-ref (kernel-lessons k) id #f))
+    (when (and l (not (lesson-retired? l)))
+      (define delta (if success? 1 -1))
+      (define new (+ (lesson-score l) delta))
+      (emit! k (hasheq 'type "lesson_scored" 'id id 'delta delta 'score new))
+      (when (&lt;= new -3)
+        (emit! k (hasheq 'type "lesson_retired" 'id id))
+        (trace! "[lesson] #~a retired at score ~a" id new)))))</code></pre>
+<span class="src">racket/kernel/core.rkt:400-409</span>
+
+<p>A lesson that was in the prompt gains a point when the task succeeds and loses one when it
+fails; at −3 it is retired and never shown again. Test 7 walks a lesson from 1 down to −3.</p>
+
+<p><strong>Reflection</strong> runs after every task (unless <code>--no-reflect</code>). The kernel
+sends the model a fixed prompt asking for "only a JSON array of 0 to 3 short, reusable lessons",
+the outcome, and the transcript truncated to 12,000 characters, with the base prompt as the only
+system block and no tools. It pulls the first <code>[...]</code> out of the reply, parses it, takes
+up to three strings and adds them. Racket puts no length cap on each lesson (Clojure caps at 400
+characters).</p>
+
+<p><strong>Refine</strong> (<code>cmh refine</code> or <code>/refine</code>) runs a normal task
+whose text is built by <code>refine-task-text</code>: an instruction to make at most three small
+improvements, then the last 10 tasks, all verdicts, and the list of userspace definitions. Unlike
+Clojure, the refine prompt does not include the lessons.</p>
+
+<h2>Hooks</h2>
+
+<p>Two parts of prompt assembly are userspace hooks the agent can rewrite:
+<code>select_lessons</code> picks which lessons go into the prompt, and
+<code>compose_system</code> turns notes and lessons into the supplemental prompt. The kernel always
+puts the base prompt first, so no hook can remove it (test 6). Both go through one helper:</p>
+
+<pre><code>;; Call a hook by name; on failure (which reverts a trial) try the now-live
+;; version once more, then fall back to the kernel's built-in behavior.
+(define (hook-call k name input fallback)
+  (let loop ([tries 0])
+    (cond
+      [(and (&lt; tries 2) (live-record (get-def k name)))
+       (define-values (ok? out) (use-def! k name input))
+       (cond [ok? out]
+             [else (trace! "[hook] ~a failed: ~a" name (one-line out 160))
+                   (loop (add1 tries))])]
+      [else (fallback)])))</code></pre>
+<span class="src">racket/kernel/core.rkt:328-338</span>
+
+<p>If a hook on trial fails, that failure reverts it, so the second try runs the restored kept
+version. If that also fails, or nothing is live, the kernel uses its built-in behavior: the first
+three active lessons, or a <code>default-compose</code> that deliberately copies the seed (the seed
+runs sandboxed, so the two cannot share code). A hook failure is traced but is not a kernel error,
+so it does not fail the task; in Clojure it does. The <code>select_lessons</code> hook is called
+even when there are no lessons. Whatever ids it returns are filtered to active lessons and
+de-duplicated.</p>
+
+<h2>Seeds</h2>
+
+<p>A new state dir starts with three version-1 definitions described in
+<code>seed/seeds.json</code>. Their sources are <code>.rktl</code> files: bare forms with no
+<code>#lang</code> line, exactly what an evaluator expects. The smallest is the tool:</p>
+
+<pre><code>;; Userspace tool. Contract: (define (run input) ...) where input is a
+;; jsexpr hasheq with symbol keys; returns a string.
+(define (run input)
+  (define text (hash-ref input 'text ""))
+  (number-&gt;string (length (regexp-match* #px"\\S+" text))))</code></pre>
+<span class="src">racket/seed/word_count.rktl:1-5</span>
+
+<p>The <code>select_lessons</code> seed (21 lines) returns the 8 highest-scored lessons that share
+a word of four or more letters with the task, or else the top 3 by score. The
+<code>compose_system</code> seed (17 lines) puts notes under "## Notes", separated by blank lines,
+and lessons as bullets under "## Lessons". Both are written with only <code>racket/base</code>
+primitives, including a hand-rolled <code>first-n</code> and a <code>join-notes</code> loop.</p>
+
+<p>Unlike Clojure, the Racket kernel runs each seed through <code>validate</code> before installing
+it, and refuses to start if one fails. The events are marked <code>"seed": true</code> and the
+seeds go straight to kept.</p>
+
+<h2>The provider</h2>
+
+<p>A provider is a struct holding one function, <code>(system tools messages) → response</code>.
+There are two.</p>
+
+<p>The <strong>mock</strong> provider plays a JSON script: an array of assistant content arrays,
+one per request. It records every request it receives, so tests can check exactly what the model
+would have seen, and fails with "script exhausted at request N" if the kernel asks for more than the
+script holds. All 12 tests run offline against it.</p>
+
+<p>The <strong>Anthropic</strong> provider uses <code>net/http-client</code> from the standard
+library over <code>https://</code> (with certificate checks) or plain <code>http://</code>, so a
+local logging proxy works through <code>ANTHROPIC_BASE_URL</code>. It authenticates with
+<code>ANTHROPIC_API_KEY</code> or else <code>CLAUDE_CODE_OAUTH_TOKEN</code> (a bearer token, the
+OAuth beta header, and the Claude Code identity as the first system block). Each request sends
+<code>max_tokens</code> 32,000 and omits <code>tools</code> when the list is empty. A request runs
+in its own thread with a 600-second timeout. Retries look like this:</p>
+
+<pre><code>     (let loop ([attempt 1])
+       (define (retry!) (sleep (expt 2 attempt)) (loop (add1 attempt)))
+       (define retries-left? (&lt; attempt max-attempts))
+       (define (retryable-network-error? e)
+         (and retries-left? (exn:fail? e) (not (exn:fail:user? e))))
+       ;; code is #f when the request failed with a retryable network error.
+       (define-values (code resp)
+         (with-handlers ([retryable-network-error?
+                          (λ (e) (trace! "[provider] network error (attempt ~a): ~a" attempt (exn-message e))
+                            (values #f #f))])
+           (http-post url headers data 600)))
+       (cond
+         [(not code) (retry!)]
+         [(= code 200) (bytes-&gt;jsexpr resp)]
+         [(and (memv code retryable) retries-left?)
+          (trace! "[provider] HTTP ~a, retrying" code)
+          (retry!)]
+         [else (error 'anthropic "HTTP ~a: ~a" code (one-line (bytes-&gt;string/utf-8 resp #\?) 600))])))</code></pre>
+<span class="src">racket/kernel/provider.rkt:114-131</span>
+
+<p>Statuses 408, 429, 500, 502, 503, 504 and 529, and network errors, are retried up to three
+times, waiting 2, 4 and 8 seconds. The model comes from <code>--model</code>, then
+<code>CMH_MODEL</code>, then the default <code>claude-sonnet-5-5</code>.</p>
+
+<h2>The command line</h2>
+
+<pre><code>    (cond
+      [(null? args) (eprintf "~a\n" usage) 2]
+      [else
+       (case (car args)
+         [("run")
+          (when (null? (cdr args)) (raise-user-error "run needs a TASK"))
+          (task! (open #t) (string-join (cdr args) " "))]
+         [("refine") (let ([k (open #t)]) (task! k (refine-task-text k)))]
+         [("defs") (displayln (defs-text (open #f))) 0]
+         [("knowledge") (displayln (knowledge-text (open #f))) 0]
+         [("repl") (repl (open #t))]
+         [else (eprintf "unknown command ~a\n~a\n" (car args) usage) 2])])))</code></pre>
+<span class="src">racket/kernel/cli.rkt:50-61</span>
+
+<p>The flags are <code>--state DIR</code> (default <code>.cmh</code>), <code>--provider
+anthropic|mock</code>, <code>--script FILE</code>, <code>--model M</code>, <code>--soak N</code>
+(clean uses before keep, default 3) and <code>--no-reflect</code>, parsed by the standard
+<code>racket/cmdline</code>. <code>run</code> prints only the final answer to stdout and exits 0
+on success, 1 on failure; usage errors exit 2. The trace goes to stderr, one line per event, at
+most 400 characters. A mock run from the research looked like this:</p>
+
+<pre><code>[assistant] I'll make a tool.
+[tool] propose_def reverse -&gt; trial v1
+[tool] reverse {"text":"hello"} -&gt; olleh
+[task] #1 succeeded
+[reflect] lesson #1 Write a small tool for repeated string transforms.</code></pre>
+
+<p>The REPL (<code>cmh repl</code>) prints a <code>cmh&gt; </code> prompt on
+stdout and accepts tasks plus <code>/defs</code>, <code>/knowledge</code>, <code>/show NAME
+[V]</code>, <code>/rollback NAME V</code>, <code>/refine</code> and <code>/quit</code>.
+<code>bin/cmh</code> is a four-line shell script that runs <code>racket main.rkt</code>.</p>
+
+<h2>Building and testing</h2>
+
+<p>The flavor needs Racket 9 CS (checked with v9.3) and nothing outside the standard
+distribution.</p>
+
+<pre><code>raco make racket/main.rkt            # compile once for fast startup
+racket/bin/cmh run "TASK"            # or: racket racket/main.rkt run "TASK"
+raco test racket/</code></pre>
+
+<p><code>raco test racket/</code> reports <strong>12 tests passed</strong>. Run uncompiled in a
+fresh copy, it took between about 16 and 23 seconds across runs during the research and while
+writing this chapter. The 12 cases are:</p>
+
+<ol>
+<li>Late binding: a new <code>word_count</code> version is used on the next call.</li>
+<li>Gate rejection: an evaluation failure and a test failure leave the live version unchanged.</li>
+<li>Soak revert: an error during soak reverts to the kept version, with a verdict.</li>
+<li>Soak keep: after enough clean uses the version is kept.</li>
+<li>Persistence: a fresh kernel replays the same state.</li>
+<li>Hook redefinition changes the system prompt; the base prompt stays first.</li>
+<li>Lesson scoring: +1 on success, −1 on failure, retired at −3.</li>
+<li>End-to-end mock run: propose a tool and call it within one task.</li>
+<li>Anthropic wire format: OAuth headers and system blocks, API key, base URL.</li>
+<li>Anthropic over a plain <code>http://</code> base URL, against a real TCP listener on 127.0.0.1.</li>
+<li><code>write_file</code> refuses the state dir and kernel source.</li>
+<li>The kernel tool names in <code>core.rkt</code> match the specs in <code>tools.rkt</code>.</li>
+</ol>
+
+<p>rackunit counts test cases, not individual checks, so "12" here is not comparable with
+Clojure's "10 tests, 66 assertions". A macro, <code>with-state</code>, gives each test a temporary
+directory and silences the trace.</p>
+
+<h3>Eval results</h3>
+
+<p>Chapter 11 covers the eval suite. In short, from <code>ROADMAP.md</code>: Racket scored 102% of
+the reference Prime Agent on DeepSeek V4.1 Flash, the same as Clojure and Rust, and 118% on GLM 5.3
+Flash, the highest of the four flavors run there (Clojure 116%; Forth was not run). Treat these as noisy. The roadmap
+itself says most of the score comes from the shared design (lessons, reflection, the gate), not
+from self-modification: across about 60 episodes per flavor, the agents proposed only 5 to 78
+changes. On the later reuse matrix (four eight-episode suites, one trial each, DeepSeek V4.1
+Flash), Racket and Prime both passed 32/32, the best of the seven harnesses in that run, though Racket used 1.8 times
+Prime's tokens (8.2 M against 4.5 M) and its median episode took 98.1 s against 33.1 s
+(<span class="src">evals/results/matrix-memory/summary.md</span>). The sandbox makes Racket
+safer; the evals do not show it making Racket smarter.</p>
+
+<h2>Limitations</h2>
+
+<ul>
+<li><strong>Environment variables leak into the sandbox</strong>, as described above. Userspace
+can read API keys and return them to the model.</li>
+<li><strong><code>bash</code> is unrestricted.</strong> The sandbox walls off userspace code, but the
+agent can still run any shell command, including one that edits <code>kernel/</code> or the
+journal. <code>write_file</code>'s refusals do not apply to <code>bash</code>. This is true of every
+flavor.</li>
+<li><strong>A dead evaluator stays cached.</strong> If a kept version calls <code>exit</code> or
+hits the 256 MB cap, its evaluator is terminated, but the cache still holds it. A small script run
+while writing this chapter showed every later call failing with "evaluator: terminated (exited)"
+while the version stays kept, until the live version changes or the process restarts. A trial
+would simply be reverted.</li>
+<li><strong>No scratchpad.</strong> To try a snippet, the agent must propose a whole definition with
+tests. The roadmap proposes an <code>eval</code> tool backed by a throwaway evaluator, and says
+Forth's scratchpad (<code>forth_eval</code>) cut that flavor's rejected proposals from 69 to 0.</li>
+<li><strong>Thin feedback, narrow scope.</strong> Errors are raw exception text, the gate only runs
+the agent's own tests, and a trial is kept for three error-free uses, not for helping. Only tools,
+notes and two hooks can change.</li>
+<li><strong>Small deviations from SPEC</strong>: verdicts are event fields, not knowledge entries,
+and statically invalid proposals are not journaled. Other differences (prompt built once per task,
+no lessons in the refine prompt) are allowed by SPEC but differ from Clojure, and the README
+describes the evaluator cache key incorrectly.</li>
+</ul>
+
+<h2>Racket compared with Clojure</h2>
+
+<p>Both flavors use the host Lisp as the userspace language, replay one
+journal through one function, and pass the same eight SPEC tests. The differences:</p>
+
+<table>
+<tr><th>Aspect</th><th>Clojure</th><th>Racket</th></tr>
+<tr><td>Code becomes live via</td><td><code>load-string</code> into a fresh namespace per version; var looked up per call</td><td>A sandboxed evaluator per name, cached with its version; the call is evaluated inside it</td></tr>
+<tr><td>Scratch validation</td><td>Throwaway namespace, removed after</td><td>Fresh evaluator, killed after</td></tr>
+<tr><td>Isolation</td><td>None: same JVM, full access</td><td>Security guard: no files, network or subprocesses; <code>exit</code> ends only the evaluator</td></tr>
+<tr><td>Time limits</td><td>10 s load/tests, 30 s call; the thread keeps running</td><td>10 s and 128 MB per evaluation, 256 MB per evaluator; enforced</td></tr>
+<tr><td>Can agent code crash the harness?</td><td>Yes</td><td>No</td></tr>
+<tr><td>State</td><td>Immutable map in an atom; pure <code>apply-event</code></td><td>Mutable structs and hashes; imperative <code>apply-event!</code></td></tr>
+<tr><td>Lesson ids</td><td>Strings like <code>"L1"</code></td><td>Integers</td></tr>
+<tr><td>Verdicts</td><td><code>lesson_added</code> entries of kind verdict; last 20 in prompt</td><td>Field on keep/revert events; last 30 in prompt</td></tr>
+<tr><td>Seeds</td><td>Installed without the gate</td><td>Validated in the sandbox first</td></tr>
+<tr><td>Invalid proposal</td><td>Journaled and rejected</td><td>Not journaled</td></tr>
+<tr><td>Rollback to a rejected version</td><td>Allowed (re-gated)</td><td>Refused</td></tr>
+<tr><td>System prompt built</td><td>Every model request</td><td>Once per task</td></tr>
+<tr><td>Hook failure</td><td>Kernel error; task fails</td><td>Traced; up to 2 tries, then built-in; task not failed</td></tr>
+<tr><td>Loop continues while</td><td><code>stop_reason</code> is <code>tool_use</code> and tool calls are present</td><td>Tool calls are present</td></tr>
+<tr><td>Task id</td><td>Random UUID</td><td>1 + number of finished tasks</td></tr>
+<tr><td><code>write_file</code> refuses</td><td>State dir, kernel dir</td><td>State dir, kernel dir, <code>base-prompt.md</code></td></tr>
+<tr><td>Provider retries</td><td>5 statuses, 4 retries (2-16 s)</td><td>7 statuses plus network errors, 3 retries (2-8 s)</td></tr>
+<tr><td>Reflection lesson length cap</td><td>400 characters</td><td>None</td></tr>
+<tr><td>Tests</td><td>10 tests / 66 assertions, under 10 s</td><td>12 test cases, about 16-23 s uncompiled</td></tr>
+<tr><td>Kernel lines</td><td>1,070</td><td>1,223</td></tr>
+<tr><td>Score vs Prime (DeepSeek / GLM)</td><td>102% / 116%</td><td>102% / 118%</td></tr>
+</table>
+
+<p>Racket costs about 150 more kernel lines and a slower test suite, and buys a real wall with
+almost no code of its own: the whole sandbox layer is 82 lines because the language runtime does
+the hard part. Clojure is quicker and its state handling is purer, but any code the agent writes
+can take the process down. The lesson for harness designers is that "can the language run
+untrusted code safely, out of the box?" is one of the first questions to ask. Of the first four
+flavors, Racket was the only one that could answer yes. Chapters 8 and 9 get the same guarantee another way, by moving userspace,
+and later the whole harness, into WebAssembly.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Racket's <code>racket/sandbox</code> gives each definition its own evaluator with a security
+guard, a custodian and time and memory limits, all from the standard library.</li>
+<li>The kernel calls userspace by building the call as a quoted list and evaluating it inside the
+sandbox, so limits apply to every call and only checked plain data crosses the boundary.</li>
+<li>Late binding is one cached evaluator per name, replaced when the live version changes and
+rebuilt lazily after a restart.</li>
+<li>File reads and writes, network, subprocesses, runaway loops, memory bombs and <code>exit</code>
+are all contained. Environment variables are not, and <code>bash</code> is not sandboxed at all.</li>
+<li>All 12 tests pass offline. Eval scores match or slightly beat Clojure, but the evals are noisy
+and do not yet reward self-modification.</li>
+</ul>
+</main>
+<footer class="nav"><a href="04-clojure.html">← Clojure: eval into namespaces</a><a href="index.html">Contents</a><a href="06-rust.html">Rust: a compiled library per definition →</a></footer>
+</body></html>

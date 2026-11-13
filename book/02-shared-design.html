@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2. The shared design: SPEC.md · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 2</header>
+<main>
+<h1>2. The shared design: SPEC.md</h1>
+<p class="subtitle">One 192-line contract that every flavor implements: three rings, a gate, a journal, and eight tests</p>
+
+<p>Every harness in this repository is called <strong>cmh</strong>, short for
+"continual, self-modifying harness". They are written in very different
+languages: Clojure, Racket, Rust, Lean, a home-made Forth inside WebAssembly, a
+whole harness compiled to WebAssembly, and Roc. But they all do the same job in
+the same way, because they all implement one document: <code>SPEC.md</code> at the
+repository root. This chapter walks through that document section by section.
+The later chapters can then concentrate on what is different about each
+language, because you will already know what is the same.</p>
+
+<p>The spec opens with the whole idea in two clauses:</p>
+
+<pre>Each is a coding agent that (1) rewrites parts of itself while it runs and
+(2) learns across runs, keeping only the changes and lessons that hold up.</pre>
+<span class="src">SPEC.md:4-5</span>
+
+<p>"Rewrites parts of itself while it runs" is the self-modification half. "Learns
+across runs" is the continual-learning half. "Keeping only the changes and lessons
+that hold up" is the selection mechanism that ties them together, and it is where
+most of the design effort goes.</p>
+
+<div class="note"><strong>The documents drift on one number.</strong>
+<code>SPEC.md:3</code> says "One design, four implementations: <code>clojure/</code>,
+<code>rust/</code>, <code>racket/</code>, <code>lean/</code>." That was true when the spec was
+written on 29 October 2026. The repository now has seven flavors plus a Roc
+prototype; the Forth, WASM and Roc flavors were added later and follow the same
+spec, but the spec was never renumbered. Where this chapter says "every flavor", it
+means all seven.</div>
+
+<p>The spec credits its ideas to earlier harnesses (<code>SPEC.md:7-11</code>): samizdat for the immutable kernel and the validate/soak/rollback gate, Prime Agent for versioned prompt notes and lessons on top of an immutable base prompt, and autolith and oh-my-lisp for live redefinition. Chapter 3 covers Prime Agent; chapter 12 covers the rest.</p>
+
+<h2>Three rings</h2>
+
+<p>The first design decision is to split the harness into three parts with
+different rules about who may change them. The spec calls them rings, borrowing
+the operating-system idea of privilege rings (the kernel runs with more rights than
+user programs).</p>
+
+<pre>1. **Kernel** (host code, immutable to the agent): model client, agent loop,
+   journal, gate, evaluator, kernel tools. The agent can read it but no kernel
+   tool writes it.
+2. **Userspace** (mutable, versioned): named definitions written in the
+   flavor's eval language. The kernel resolves every userspace definition **by
+   name at call time** (late binding), so a newly installed version takes effect
+   on the very next call without a restart.
+3. **Knowledge** (durable): lessons and verdicts that carry across runs and are
+   scored by outcome.</pre>
+<span class="src">SPEC.md:15-23</span>
+
+<div class="diagram">+------------------------------------------------------------+
+| KERNEL  (host code; the agent may read it, never write it) |
+|   model client · agent loop · gate · evaluator · journal   |
+|   kernel tools: bash read_file write_file list_defs ...    |
+|                                                            |
+|   +----------------------------------------------------+   |
+|   | USERSPACE  (versioned definitions, agent-written)  |   |
+|   |   tools      e.g. word_count                       |   |
+|   |   notes      plain text for the prompt             |   |
+|   |   hooks      compose_system, select_lessons        |   |
+|   +----------------------------------------------------+   |
+|                                                            |
+|   +----------------------------------------------------+   |
+|   | KNOWLEDGE  (survives across runs)                  |   |
+|   |   lessons   scored +1 / -1 by task outcome         |   |
+|   |   verdicts  what the gate decided, and why         |   |
+|   +----------------------------------------------------+   |
++------------------------------------------------------------+
+        everything above is rebuilt from journal.jsonl</div>
+
+<h3>Late binding, in plain words</h3>
+
+<p>"Late binding" means the program decides which function to run at the moment it
+calls it, not earlier. A cmh kernel never keeps a direct pointer to, say, the
+<code>word_count</code> tool. Each time the model calls <code>word_count</code>, the kernel
+asks its registry "which version of <code>word_count</code> is live right now?" and runs
+that one. So installing version 2 needs no restart and no reload step: the next
+lookup simply finds version 2. This one property is what makes "rewrite yourself
+while running" cheap. The Clojure kernel's <code>call-live</code> (<code>clojure/src/cmh/kernel/gate.clj:111-123</code>) does exactly this: look up the live record, call it, record the use.</p>
+
+<p>The spec's table of how code becomes live lists only the first four flavors, but
+it shows how far apart "late binding" can be in practice:</p>
+
+<table>
+<tr><th>Flavor</th><th>How code becomes live at runtime (SPEC.md:25-30)</th></tr>
+<tr><td>Clojure</td><td><code>load-string</code>/<code>eval</code> into a dedicated namespace; vars resolved by name per call</td></tr>
+<tr><td>Racket</td><td><code>eval</code> in a sandboxed namespace (<code>racket/sandbox</code>, time and memory limits)</td></tr>
+<tr><td>Rust</td><td>each version is compiled by <code>cargo</code> into a cdylib and hot-loaded with <code>libloading</code>; the Rust compiler is part of the gate</td></tr>
+<tr><td>Lean</td><td>source is elaborated in-process (<code>Lean.Elab</code> frontend) and evaluated with <code>evalConst</code>; any <code>theorem</code>s in the source must type-check, so proofs are part of the gate</td></tr>
+</table>
+
+<p>(A <em>cdylib</em> is a Rust shared library that a running program can load; <em>elaborating</em> Lean source means type-checking it into definitions. Each flavor chapter explains its own mechanism.)</p>
+
+<h2>Userspace definitions</h2>
+
+<p>Userspace is a set of named, versioned records, each with a <code>name</code>, <code>kind</code>, <code>version</code>, <code>source</code>, <code>description</code>, <code>tests</code> and a <code>status</code> of <code>trial</code>, <code>kept</code>, <code>reverted</code> or <code>rejected</code> (<code>SPEC.md:34-35</code>).</p>
+
+<p>Versions are never overwritten; the registry just remembers which one is live. There are three kinds.</p>
+
+<h3>Tools</h3>
+
+<p>A <strong>tool</strong> is exposed to the model under its name, with an <code>input_schema</code>. "Contract: takes one JSON object (the tool input), returns a string" (<code>SPEC.md:38-42</code>); each flavor fixes the exact function signature. To the model it looks exactly like a built-in tool. (Roc bends the contract: a tool gets its input as JSON text and may return requests, such as reading a file, that the host performs before the tool returns its string; chapter 10.)</p>
+
+<h3>Notes</h3>
+
+<pre>- **`note`**: prompt note. `source` is plain text, appended to the supplemental
+  system prompt. No evaluation, but still versioned and soaked.</pre>
+<span class="src">SPEC.md:43-44</span>
+
+<p>A note is a standing instruction the agent writes to itself. It is not code, but it still goes through the gate.</p>
+
+<h3>Hooks</h3>
+
+<pre>- **`hook`**: kernel extension points the kernel calls by these fixed names:
+  - `compose_system(notes: [string], lessons: [string]) -> string`: builds the
+    *supplemental* system prompt. The kernel always prepends the immutable base
+    prompt itself, so a hook cannot remove it.
+  - `select_lessons(task: string, lessons: [{id, text, score}]) -> [id]`:
+    picks which lessons go into the prompt for this task.</pre>
+<span class="src">SPEC.md:45-50</span>
+
+<p>Hooks let the agent change kernel behavior in two narrow places: how the prompt is assembled and which lessons are shown.</p>
+
+<h3>The seed userspace</h3>
+
+<p>A brand-new harness is not empty. On first start each flavor installs a small
+seed:</p>
+
+<pre>Seed userspace, shipped as source files in each flavor and installed as
+`kept` version 1 when the journal is empty: both hooks with their default
+behavior (`compose_system` joins notes under a "Notes" heading and lessons
+under "Lessons"; `select_lessons` returns the 8 highest-scored lessons that
+share at least one word of 4+ letters with the task, else the top 3 by score),
+and one example tool, `word_count` (`{"text": string}` -> count as a string).</pre>
+<span class="src">SPEC.md:52-57</span>
+
+<p>The seed <code>word_count</code> tool is a good way to see the flavors side by side,
+since it does the same trivial thing in every language. In Clojure the tool is a
+function named <code>run</code> that takes the input map:</p>
+
+<pre>;; Tool: (run input) -> string, input is a keyword-keyed map.
+(defn run [input]
+  (str (count (re-seq #"\S+" (str (:text input))))))</pre>
+<span class="src">clojure/seed/word_count.clj:1-3</span>
+
+<p>In Lean the seed also carries a <code>theorem</code>, a small machine-checked proof
+that the counter returns 0 for the empty string. If the agent proposes a version
+whose theorem does not check, the gate rejects it:</p>
+
+<pre>/-- Number of maximal runs of non-whitespace characters. -/
+def countWords (s : String) : Nat :=
+  (s.toList.foldl (fun (acc : Nat × Bool) c =&gt;
+    if c.isWhitespace then (acc.1, false)
+    else if acc.2 then acc else (acc.1 + 1, true)) (0, false)).1
+
+theorem countWords_empty : countWords "" = 0 := rfl
+
+def run (input : Lean.Json) : IO String := do
+  let text := (input.getObjValAs? String "text").toOption.getD ""
+  pure (toString (countWords text))</pre>
+<span class="src">lean/userspace/word_count.lean:1-11</span>
+
+<p>The seeds carry their own tests in the same JSON format the agent must use, for example <code>{"input": {"text": ""}, "expect": "0"}</code> (<code>lean/userspace/seeds.json:18</code>).</p>
+
+<h2>The gate: validate, trial, soak, keep or revert</h2>
+
+<p>This is the heart of the design. The spec states the rule in one line:</p>
+
+<pre>`propose_def` is the only way userspace changes.</pre>
+<span class="src">SPEC.md:61</span>
+
+<p>The agent submits source and tests; the kernel decides. Here is the lifecycle of one proposal:</p>
+
+<div class="diagram">   propose_def(name, kind, source, description, tests)
+                        |
+                        v
+   +-------------------------------------------+
+   | 1. VALIDATE  in a scratch environment     |
+   |    compiles / evaluates?                  |
+   |    entry point has the right shape?       |
+   |    every test's "expect" is a substring   |
+   |    of the output?                         |
+   +-------------------------------------------+
+          | no                          | yes
+          v                             v
+   +--------------+        +----------------------------------+
+   |  REJECTED    |        | 2. TRIAL   new version is live   |
+   |  live version|        |    now; previous version kept    |
+   |  unchanged;  |        |    in reserve                    |
+   |  model gets  |        +----------------------------------+
+   |  the error   |                       |
+   +--------------+                       v
+                           +----------------------------------+
+                           | 3. SOAK   count the next N uses  |
+                           |    (default N = 3)               |
+                           +----------------------------------+
+                              |                         |
+            any error (exception, panic,       N clean uses
+            timeout, bad return type)                   |
+                              v                         v
+                  +-------------------+       +-------------------+
+                  |    REVERTED       |       |      KEPT         |
+                  | previous kept     |       | becomes the new   |
+                  | version is live   |       | stable version    |
+                  | again (or the def |       |                   |
+                  | is removed)       |       |                   |
+                  +-------------------+       +-------------------+
+                              \                         /
+                               v                       v
+                  +---------------------------------------------+
+                  | 4. VERDICT  written to knowledge, always    |
+                  |    shown to the model in later prompts      |
+                  +---------------------------------------------+</div>
+
+<h3>1. Validate</h3>
+
+<pre>1. **Validate** in a scratch environment, never the live one: the source
+   compiles/evaluates, defines the required entry point with the right shape,
+   and every test passes. Tests are JSON: `[{"input": {...}, "expect": "..."}]`
+   where `expect` must be a substring of the output (hooks get their arguments
+   as `input`; for `select_lessons` compare the JSON-encoded result). Tools
+   and hooks need at least one test. On failure the proposal is `rejected`, the
+   live version is unchanged, and the model gets the error text.</pre>
+<span class="src">SPEC.md:63-69</span>
+
+<p>The scratch environment is throwaway (a temporary Clojure namespace, a fresh Racket sandbox, a new WebAssembly instance), so code that does not compile never touches the live harness. The loose substring test format works in every language.</p>
+
+<h3>2. Trial</h3>
+
+<pre>2. **Trial**: the new version goes live immediately with status `trial`. The
+   previous live version is retained.</pre>
+<span class="src">SPEC.md:70-71</span>
+
+<p>Passing its own tests earns a version a trial, not trust. Going live at once is what lets the agent write a tool and use it in the same task.</p>
+
+<h3>3. Soak</h3>
+
+<pre>3. **Soak**: the next `soak` uses (default 3; a hook use is one invocation by
+   the kernel) are counted. Any error (exception, panic, timeout, bad return
+   type) during soak reverts immediately to the previous kept version (or
+   removes the definition if there was none) with status `reverted`. After
+   `soak` clean uses the version becomes `kept`. Notes soak over tasks: a task
+   that ends in an error counts as an error.</pre>
+<span class="src">SPEC.md:72-77</span>
+
+<p>"Soak" is a hardware term: leave a new machine running and see whether it fails. The Clojure kernel counts after each call:</p>
+
+<pre>(defn record-use!
+  "Journal one use and run soak accounting for trial versions."
+  [k {:keys [name version status] :as rec} ok error input-desc]
+  (st/emit! k {:type "def_use" :name name :version version :ok ok :error error})
+  (when (= "trial" status)
+    (if-not ok
+      (revert! k rec error input-desc)
+      (let [uses (get-in @(:state k) [:defs name :uses] 0)]
+        (when (&gt;= uses (:soak k)) (keep! k rec uses))))))</pre>
+<span class="src">clojure/src/cmh/kernel/gate.clj:101-109</span>
+
+<p>Every use is journaled first, which is what lets a restarted harness resume a half-finished soak.</p>
+
+<h3>4. Inherit the verdict</h3>
+
+<pre>4. **Inherit the verdict**: every keep or revert writes a knowledge entry,
+   e.g. `def word_count v2 ("counts unicode words") reverted: ArithmeticException
+   on input {...}`. Verdicts are always shown to the model (they bypass
+   `select_lessons`), so it does not retry a failed idea blindly.</pre>
+<span class="src">SPEC.md:78-81</span>
+
+<p>A <strong>verdict</strong> is the gate's decision as one line of text: the agent's memory of its own self-edits. Because verdicts skip the selection hook, a broken <code>select_lessons</code> cannot hide its own failure.</p>
+
+<h3>After the gate</h3>
+
+<pre>Runtime errors from a `kept` definition are returned to the model as tool
+errors but do not trigger revert. `rollback_def(name, version)` reinstalls an
+older version as a new `trial` version (new version number, same source).</pre>
+<span class="src">SPEC.md:83-85</span>
+
+<p>So a kept version stays kept, and rollback never rewrites history: rolling <code>word_count</code> v4 back to v2 creates v5 with v2's source, which soaks again.</p>
+
+<div class="warn"><strong>What "keeps only the changes that help" really means
+today.</strong> The gate keeps a change when it did not error during its next three
+uses. It does not check that the change made the agent better: faster, cheaper or
+more often correct. <code>ROADMAP.md</code> lists this as an open gap ("changes are kept
+for not crashing, not for helping") and also notes that the gate only runs the
+agent's own tests, and an agent can write a test that agrees with a wrong
+implementation. Chapter 13 comes back to this.</div>
+
+<h2>Continual learning: lessons, reflection, scoring</h2>
+
+<p>Code is one way the agent improves; text is the other. The knowledge ring holds
+<strong>lessons</strong>, short free-text insights with a score.</p>
+
+<pre>- **Lessons**: free-text entries in knowledge with an integer `score`
+  (starts 0). Created by the model through `remember`, and by reflection.
+- **Reflection**: after each task finishes, the kernel makes one extra model
+  call (no tools) with a compact transcript and asks for a JSON array of 0 to 3
+  short, reusable lessons. Lessons are added unless they duplicate an existing
+  lesson's text. Reflection can be disabled with `--no-reflect`.
+- **Scoring**: each lesson that was in the prompt for a task gets +1 if the task
+  succeeded and -1 if it failed. A task succeeds when the model ends with
+  `end_turn` and the task had no kernel errors and no tool errors in its final
+  2 tool results. Lessons at score &lt;= -3 are retired (excluded from
+  selection, still in the journal).</pre>
+<span class="src">SPEC.md:89-99</span>
+
+<p><strong>Reflection</strong> is the kernel asking the model, after the task, "what did you learn?". <code>end_turn</code> is the API's signal that the model stopped on its own. The credit is crude: every lesson in the prompt gets the same +1 or -1 whether or not it mattered, which the ROADMAP lists as a gap.</p>
+
+<p>There is also a deliberate "improve yourself" mode, <code>/refine</code> or <code>cmh refine</code>: a normal task with a fixed prompt to review recent outcomes, verdicts and userspace, "making at most 3 changes and preferring small ones" (<code>SPEC.md:100-103</code>).</p>
+
+<h2>How the prompt is assembled, and where the hooks sit</h2>
+
+<p>Put the pieces together and you get the path from the stored state to the
+system prompt the model sees on each request:</p>
+
+<div class="diagram">  task text          live lessons (not retired)
+      |                     |
+      +----------+----------+
+                 v
+       select_lessons(task, lessons)   &lt;-- hook: one "use" for soak
+                 |  ids
+                 v
+  live notes + selected lesson texts
+                 |
+                 v
+       compose_system(notes, lessons)  &lt;-- hook: one "use" for soak
+                 |  supplemental text
+                 v
+  +---------------------------------------------------------+
+  | system block 1: base-prompt.md     (added by the kernel)|
+  | system block 2: supplemental text                       |
+  |                 + "Verdicts on past userspace changes"  |
+  |                   (added by the kernel, skips the hooks)|
+  +---------------------------------------------------------+
+  tools: kernel tools + live userspace tools (rebuilt per request)</div>
+
+<p>The Clojure kernel builds the two blocks like this. Notice that the base prompt
+is put in place by the kernel, outside any hook, and the verdicts are appended
+after the hook's output:</p>
+
+<pre>(defn supplemental [k errors lesson-ids]
+  (let [s @(:state k)
+        notes (mapv :source (st/live-defs s "note"))
+        lessons (vec (keep #(some-&gt; (get-in s [:knowledge %]) :text) lesson-ids))
+        composed (call-hook k errors "compose_system" {:notes notes :lessons lessons}
+                            (str "(" (count notes) " notes, " (count lessons) " lessons)")
+                            #(str/join "\n\n" (concat notes lessons)))
+        verdicts (take-last 20 (st/verdicts s))]
+    (str/trim
+     (str composed
+          (when (seq verdicts)
+            (str "\n\n## Verdicts on past userspace changes\n"
+                 (bullets :text verdicts)))))))
+
+(defn system-blocks [k errors lesson-ids]
+  (let [sup (supplemental k errors lesson-ids)]
+    (cond-&gt; [{:type "text" :text (:base-prompt k)}]
+      (not (str/blank? sup)) (conj {:type "text" :text sup}))))</pre>
+<span class="src">clojure/src/cmh/kernel/agent.clj:92-109</span>
+
+<p>This is why it is safe to let the agent rewrite its prompt builder: a bad <code>compose_system</code> can only produce a bad supplement, never delete the base prompt, and a hook that throws is reverted during soak. (Clojure also passes a fallback, the last argument to <code>call-hook</code>, so a failing hook degrades to a plain join.)</p>
+
+<h2>Kernel tools</h2>
+
+<p>The kernel tools are always present and cannot be redefined. They are the
+fixed instruction set the agent builds everything else from:</p>
+
+<table>
+<tr><th>Tool</th><th>Input</th><th>Effect (SPEC.md:107-117)</th></tr>
+<tr><td><code>bash</code></td><td><code>command</code>, optional <code>timeout_s</code> (default 60)</td><td>runs in the working directory, returns combined stdout/stderr and exit code, truncated to 20 KB</td></tr>
+<tr><td><code>read_file</code></td><td><code>path</code></td><td>file contents, truncated to 50 KB</td></tr>
+<tr><td><code>write_file</code></td><td><code>path</code>, <code>content</code></td><td>writes the file. Refuses paths inside the state dir or the harness's own <code>kernel</code> source directory</td></tr>
+<tr><td><code>list_defs</code></td><td>none</td><td>name, kind, live version, status, description for every definition</td></tr>
+<tr><td><code>show_def</code></td><td><code>name</code>, optional <code>version</code></td><td>that version's full record including source and tests</td></tr>
+<tr><td><code>propose_def</code></td><td><code>name</code>, <code>kind</code>, <code>source</code>, <code>description</code>, <code>tests</code>, <code>input_schema</code> (tools only)</td><td>runs the gate, returns the verdict</td></tr>
+<tr><td><code>rollback_def</code></td><td><code>name</code>, <code>version</code></td><td>reinstalls an old version as a new trial</td></tr>
+<tr><td><code>remember</code></td><td><code>text</code></td><td>adds a lesson</td></tr>
+<tr><td><code>recall</code></td><td><code>query</code></td><td>lessons and verdicts whose text shares words with the query, highest score first</td></tr>
+</table>
+
+<pre>Userspace tools are added to the tool list on every model request, rebuilt
+from the live registry each time.</pre>
+<span class="src">SPEC.md:119-120</span>
+
+<p>That is late binding for the tool list.</p>
+
+<div class="warn"><strong><code>bash</code> is a hole in the wall.</strong>
+<code>write_file</code> refuses the state directory and the kernel source, but
+<code>bash</code> can run any command, including one that edits those same files. The
+ROADMAP puts it bluntly: "In chess terms, the agent can flip the board." The spec
+does not close this gap. Only the WASM flavor does, by running <code>bash</code> in a
+mount namespace where the state dir, <code>wasm/</code> and <code>base-prompt.md</code> are
+read-only (when user namespaces are available). Roc checks its tools' file
+requests on the host side, but its README admits that <code>Bash</code> "can break
+every rule, as in the other flavors". The eval suite hit the same problem: until per-episode isolation
+was added, agents could read other episodes' files and the checkers under
+<code>evals/</code>.</div>
+
+<p>Later flavors add kernel tools that the spec does not mention:
+<code>forth_eval</code> (forth, wasm) and <code>roc_eval</code> (roc) are scratchpads that
+run code without proposing it, and the wasm flavor adds <code>propose_kernel</code> and
+<code>list_images</code> for replacing the kernel itself.</p>
+
+<h2>The journal and replay</h2>
+
+<p>Where does all this state live? In exactly one file:</p>
+
+<pre>State dir, default `.cmh/` in the working directory, overridable with
+`--state DIR`. The single source of truth is `journal.jsonl`, an append-only
+log of one JSON object per line, each with `type` and `ts` (ISO-8601). Event
+types: `def_proposed`, `def_rejected`, `def_trial`, `def_use` (name, version,
+ok, error), `def_kept`, `def_reverted`, `lesson_added`, `lesson_scored`,
+`lesson_retired`, `task_started`, `task_finished` (success flag). On startup
+the kernel replays the journal to rebuild the registry (including soak
+counters of trial versions), and the knowledge. Replay must reproduce the
+same state that the process had; never rewrite earlier lines. The Rust
+flavor may also cache build artifacts in the state dir; the Lean flavor may
+cache elaborated environments. Caches must be rebuildable from the journal.</pre>
+<span class="src">SPEC.md:124-134</span>
+
+<p>This pattern is <strong>event sourcing</strong>: store what happened, not the current state, and compute the state by replaying the events. Compiled Rust libraries, Racket sandboxes, Lean closures and Forth snapshots are all caches that can be rebuilt.</p>
+
+<div class="diagram">journal.jsonl  (append-only, one event per line)
+ ------------------------------------------------------------
+  def_proposed  word_count v1      \
+  def_kept      word_count v1       |  seed install
+  ...                              /
+  task_started  "count the words..."
+  def_proposed  word_count v2
+  def_trial     word_count v2        live = v2, uses = 0
+  def_use       word_count v2 ok     uses = 1
+  def_use       word_count v2 ok     uses = 2
+  task_finished success              &lt;-- process stops here
+ ------------------------------------------------------------
+                    |
+       fresh process: read every line, fold in order
+                    v
+  empty state --apply--&gt; s1 --apply--&gt; s2 ... --apply--&gt; sN
+                    |
+                    v
+  registry:  word_count  live v2, status trial, uses = 2
+  knowledge: lessons with scores, verdicts
+                    |
+                    v
+  next use of word_count ok  -&gt;  uses = 3  -&gt;  def_kept v2</div>
+
+<p>(A schematic sequence, not a real journal.) A soak survives a restart: two clean uses before the stop, one more after.</p>
+
+<p>In Clojure replay is one line, and the live process uses the same function, so the two cannot disagree:</p>
+
+<pre>(defn replay [events] (reduce apply-event empty-state events))
+
+(defn emit!
+  "Append one event to the journal and apply it. The event is round-tripped
+  through JSON first so live state equals replayed state exactly."
+  [k ev]
+  (locking (:state k)
+    (let [line (json/write-str (assoc ev :ts (str (Instant/now))))
+          ev' (json/read-str line :key-fn keyword)]
+      (with-open [w (io/writer (:journal k) :append true)]
+        (.write w (str line "\n")))
+      (swap! (:state k) apply-event ev')
+      ev')))</pre>
+<span class="src">clojure/src/cmh/kernel/state.clj:92-104</span>
+
+<p><code>reduce</code> (a "fold") applies the pure <code>apply-event</code> to each event in order, starting from <code>empty-state</code>. A half-written last line after a crash is skipped (<code>clojure/src/cmh/kernel/state.clj:88-89</code>).</p>
+
+
+
+<h2>The base prompt</h2>
+
+<p>Every flavor sends the model the same immutable system prompt, read from
+<code>base-prompt.md</code> at the repository root, "falling back to a copy embedded at
+build time" (<code>SPEC.md:153-155</code>). It is 18 lines long, so here it is in
+full:</p>
+
+<pre>You are cmh, a coding agent that can improve itself while it runs.
+
+You work in the user's current directory with the kernel tools `bash`,
+`read_file`, and `write_file`, plus any userspace tools listed in this request.
+
+Your userspace (tools, prompt notes, and the hooks `compose_system` and
+`select_lessons`) is code you can rewrite with `propose_def`. Every proposal is
+validated against its tests in a scratch environment, goes live as a trial, and
+is kept only if its next uses succeed; otherwise it is reverted and the verdict
+is remembered. Use `list_defs` and `show_def` before changing a definition.
+
+Make a userspace change when a capability would clearly help this or future
+tasks, such as a tool for something you keep doing by hand. Keep changes small
+and give every tool or hook real tests. Record durable, reusable insights with
+`remember`; do not record task-specific trivia.
+
+The kernel, this base prompt, and the journal are not yours to change.
+Finish each task with a concise answer for the user.</pre>
+<span class="src">base-prompt.md:1-18</span>
+
+<p>It explains the gate (lines 6-10), says when self-modification is worth it (12-15) and states the one hard rule (17). It permits self-modification without pushing it. In the evals of the first five flavors, agents proposed only 5 to 78 changes per flavor across about 60 episodes; the ROADMAP adds that the evals do not yet reward self-modification (<code>ROADMAP.md:23-26</code>). Language references never go in this file: the Forth, WASM and Roc kernels send theirs as extra system blocks between the base prompt and the supplement.</p>
+
+<h2>Model provider and the mock</h2>
+
+<p>The default provider is the Anthropic Messages API (<code>SPEC.md:138-146</code>); in the evals every cmh harness points at a logging proxy via <code>ANTHROPIC_BASE_URL</code>, so all use the same model. The second provider is what makes the tests possible:</p>
+
+<p>The <code>mock</code> provider "replays a JSON array of assistant <code>content</code> arrays in order, one per model request", "and records every request it received so tests can assert on the system prompt and tool list" (<code>SPEC.md:147-151</code>). In other words, a fake model that plays back pre-written replies.</p>
+
+<h2>One CLI for every flavor</h2>
+
+<pre>cmh [--state DIR] [--provider anthropic|mock] [--script FILE] [--model M]
+    [--soak N] [--no-reflect] &lt;command&gt;
+
+  repl            interactive; each line is a task. Slash commands:
+                  /defs  /show NAME [VERSION]  /knowledge  /refine
+                  /rollback NAME VERSION  /quit
+  run "TASK"      one task, prints the final answer, exits 0 on success
+  refine          one refine task
+  defs            print the registry
+  knowledge       print lessons and verdicts</pre>
+<span class="src">SPEC.md:160-169</span>
+
+<p>Answers go to stdout; a one-line-per-event trace such as <code>[tool] propose_def word_count -&gt; trial v2</code> goes to stderr (<code>SPEC.md:172-174</code>).</p>
+
+<p>An identical CLI lets one eval runner drive every flavor (<code>evals/harnesses.json</code>; chapter 11).</p>
+
+<h2>The eight required tests</h2>
+
+<p>The spec ends with an executable definition of "this is a cmh". Each flavor must
+pass these, in its own language's test framework, with the mock provider and no
+network:</p>
+
+<pre>1. Late binding: propose a new `word_count` version; the next call in the
+   same process uses it.
+2. Gate rejection: source that fails to compile/eval, and source that fails a
+   test, are both rejected; the live version is unchanged.
+3. Soak revert: a version that throws on some input reverts on that use; the
+   previous version is live again; a verdict entry exists.
+4. Soak keep: after `soak` clean uses the version is `kept`.
+5. Persistence: a fresh kernel on the same state dir has the same live
+   versions, statuses, soak counters, and knowledge.
+6. Hook redefinition: a new `compose_system` changes the system prompt seen by
+   the mock provider, and the base prompt is still present.
+7. Lesson scoring: lessons gain and lose score with task outcomes and retire
+   at -3.
+8. One end-to-end mock run through `run` where the model proposes a tool and
+   then calls it within the same task.</pre>
+<span class="src">SPEC.md:178-192</span>
+
+<p>For example, Clojure's test 6 (<code>clojure/test/cmh/kernel_test.clj:146-159</code>) scripts the mock to propose a new <code>compose_system</code> and finish, then checks that the second request in the same task already carries the custom supplement while its first system block is still the base prompt. The eight are a floor: the wasm flavor has 27 tests and Roc 14.</p>
+
+<h2>What the spec leaves open</h2>
+
+<p>The spec fixes behavior but not safety mechanisms: it says a timeout is an error, not how to stop a runaway loop or keep agent code from crashing the host. That is where the flavors differ most: a real wall in Racket (sandbox), Forth and WASM (fuel and memory limits) and Roc (a fork per call), and almost none in Clojure, Rust and Lean, where agent code runs in the harness process.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Every flavor implements the same 192-line <code>SPEC.md</code>: an immutable kernel,
+a versioned userspace of tools, notes and two hooks, and a knowledge store of
+lessons and verdicts.</li>
+<li>Late binding (look up the live version by name on every call, and rebuild the
+tool list on every request) is what lets a change take effect on the very next
+call without a restart.</li>
+<li><code>propose_def</code> is the only way userspace changes. Each proposal is
+validated in scratch, goes live as a trial, soaks for 3 uses, and is kept or
+reverted; either way a verdict is written and always shown to the model.</li>
+<li>"Kept" currently means "did not error for 3 uses", not "measurably helped",
+and the gate only runs the agent's own tests.</li>
+<li>Lessons come from <code>remember</code> and from one reflection call after each
+task; they score +1/-1 by task outcome and retire at -3.</li>
+<li>The kernel, not a hook, prepends the 18-line base prompt, so the agent can
+rewrite its prompt builder without being able to delete its rules.</li>
+<li>All state is an append-only <code>journal.jsonl</code>; replaying it rebuilds the
+registry, soak counters and knowledge exactly, and everything else is a cache.</li>
+<li>A shared CLI and a mock provider make the harnesses interchangeable in the
+evals and testable offline; eight required tests define what counts as a cmh.</li>
+</ul>
+</main>
+<footer class="nav"><a href="01-the-idea.html">← The idea</a><a href="index.html">Contents</a><a href="03-prime-agent.html">The reference: Prime Agent →</a></footer>
+</body></html>

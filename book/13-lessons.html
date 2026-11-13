@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13. What we learned and what comes next · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 13</header>
+<main>
+<h1>13. What we learned and what comes next</h1>
+<p class="subtitle">Seven harnesses side by side, how the project got here, what is still open, and the experiments that would settle it</p>
+
+<p>Chapters 3 to 10 went one harness at a time. This one sets them side by side. First we compare all seven flavors against the four yardsticks from the start of the book. Then we look at which language suits which goal, retell the project's history from its git log, check the ROADMAP against what was built after it, and end with the questions and experiments that are still open.</p>
+
+<p>A reminder of the goal, as <code>ROADMAP.md</code> puts it in one sentence: "a substrate the agent can program itself on, which never crashes from the agent's code, answers every mistake with precise feedback, enforces clear rules, and keeps only the changes that make the agent better." No flavor meets all four parts. Each one trades some parts for others, and the trades are the most useful thing the project produced.</p>
+
+<h2>The seven flavors side by side</h2>
+
+<p>The table uses three terms from earlier chapters. <em>Crash safety</em> asks whether agent-written code can kill the harness process. <em>Hang safety</em> asks whether an endless loop in agent code is actually stopped, or only abandoned while its thread keeps burning CPU. <em>Feedback quality</em> describes what the model gets back when its code fails. The eval columns come from two kinds of run. The committed 15-suite runs (Chapter 11) are non-isolated, use 2 trials, and give scores as a percentage of Prime Agent's. The isolated reuse matrix of 12-13 November used one trial on DeepSeek V4.1 Flash and gives passes out of 32.</p>
+
+<table>
+<tr><th>Flavor</th><th>How agent code is loaded</th><th>Crash safety</th><th>Hang safety</th><th>Feedback quality</th><th>Scratchpad</th><th>Eval result</th></tr>
+<tr><td>Clojure</td><td><code>load-string</code> into a fresh namespace per version; the var is looked up by name on every call</td><td>No. Same JVM, no sandbox</td><td>No. <code>future-cancel</code> only interrupts; a busy loop keeps running</td><td>Raw exception text</td><td>No</td><td>DeepSeek 102%, GLM 116% of Prime; reuse matrix 28/32</td></tr>
+<tr><td>Rust</td><td>Each version is a cdylib built by <code>cargo</code> and loaded with <code>libloading</code>; the compiler is part of the gate</td><td>No. Panics are caught, but a segfault or <code>abort</code> kills the host</td><td>No. 15 s timeout, then the thread is abandoned</td><td>Raw compiler and panic text</td><td>No</td><td>102%, 113%; 26/32</td></tr>
+<tr><td>Racket</td><td><code>eval</code> inside a <code>racket/sandbox</code> evaluator per definition</td><td>Yes. <code>exit</code> kills only the evaluator</td><td>Yes. 10 s and 128 MB per evaluation</td><td>Raw exception text, with result types checked</td><td>No</td><td>102%, 118%; 32/32</td></tr>
+<tr><td>Lean 4</td><td>Elaborated in process into its own namespace, then <code>evalConst</code>; theorems must check</td><td>Partly. <code>panic!</code> is not turned into a gate error</td><td>No. 30 s, then the thread is abandoned (elaboration itself is bounded by heartbeats)</td><td>Type checker and proof errors</td><td>No</td><td>98%, 116%; 24/32</td></tr>
+<tr><td>Forth in WASM</td><td>Compiled into a late-bound Forth VM running in Wasmtime, after a trial compile in a brand-new instance</td><td>Yes. Traps become reports, and memory is rolled back from a snapshot</td><td>Yes. Fuel of 100M instructions, a 5 s epoch backstop, a 64 MB cap</td><td>Structured: word, definition, version, stack, input</td><td>Yes, <code>forth_eval</code></td><td>102% without the scratchpad, 114% with it; 25/32</td></tr>
+<tr><td>WASM (whole harness)</td><td>Userspace in the guest's Forth VM; the kernel itself is a replaceable component image (<code>propose_kernel</code>)</td><td>Yes. A trap starts a fresh instance that replays the journal and resumes the task</td><td>Yes. Guest-time limits of 20 s per stretch and 300 s per call, a 512 MB cap</td><td>Forth reports plus kernel trap reports with a hint</td><td>Yes, <code>forth_eval</code></td><td>Reuse matrix 25/32 (isolated pilot: 14/16)</td></tr>
+<tr><td>Roc</td><td>Each call compiles the definition plus the live definitions it references into a fresh program, inside a fork of a warm compiler</td><td>Yes. The parent never runs agent code</td><td>Yes. The child is killed at a 10 s deadline</td><td>Compiler errors and gate reports; host refusals come back as data</td><td>Yes, <code>roc_eval</code>, backed by a checked cheat sheet</td><td>Partial only: 3 passes in 6 finished r1 episodes</td></tr>
+</table>
+
+<p>Prime Agent, the baseline, scored 98% (DeepSeek) and 79% (GLM) on the committed suites, and 32/32 on the reuse matrix with the fewest tokens of anyone (4.54 M).</p>
+
+<div class="warn"><strong>Read the eval column with care.</strong> The reuse matrix ran one trial. Orb pauses hit five of the seven harnesses: every one of the matrix's 9 timeouts overlapped a pause, and 4 of its failures are pause artifacts. Count those four as passes and Forth goes up to 84% (27/32), which clears the 80%-of-Prime bar. Prime and Racket never overlapped a pause, by scheduling luck. Before that, the committed runs showed Prime's own learning-transfer score swinging from 94% to 67% between two runs with the same setup. The differences between flavors are real signals, but they are not rankings.</div>
+
+<p>One column is missing from the table because the answer is almost the same everywhere: <code>bash</code>. Every flavor gives the agent a shell, and in six of them the shell can edit the kernel, the journal and anything else. The ROADMAP's line for this is "In chess terms, the agent can flip the board." Only the WASM flavor runs <code>bash</code> in a mount namespace with the state dir, <code>wasm/</code> and the base prompt read-only, and only when unprivileged user namespaces are available. Roc checks the paths of its file requests against host rules, but its README admits that a <code>Bash</code> request "can break every rule, as in the other flavors".</p>
+
+<h2>Which language suits which goal</h2>
+
+<p>The flavors differ less in how well they solve tasks than in what they make cheap. A rough guide:</p>
+
+<ul>
+<li><strong>You want live redefinition with the least code: Clojure.</strong> <code>load-string</code> plus lookup by name is late binding almost for free, and the kernel is about 1,070 lines. The price is that there is no wall at all: agent code can read any file, any environment variable, or call <code>System/exit</code>.</li>
+<li><strong>You want a real wall without building one: Racket.</strong> <code>racket/sandbox</code> already does time and memory limits, file and network denial, and an <code>exit</code> that only kills the evaluator. It was the only one of the first four flavors whose runaway loops were really stopped, and it tied Prime at 32/32 on the reuse matrix, though with 1.8 times the tokens. If you had to pick one flavor today, this is the strongest case.</li>
+<li><strong>You want the gate to reject wrong code before it runs: Rust or Lean.</strong> In Rust the compiler is part of the gate; in Lean, theorems in the proposal must be proved. Both pay for it at run time: the code runs in process, so neither stops a runaway thread, and Rust cannot survive a segfault. Lean also spent the most tokens in the matrix (16.7 M) and scored lowest (24/32).</li>
+<li><strong>You want safety and precise feedback by construction: Forth in WebAssembly.</strong> A language small enough to write its own VM means every failure can name the word, the stack and the input. Fuel and memory caps make hangs and blow-ups ordinary errors. The price is that the model must write Forth, which it knows far less well than Python.</li>
+<li><strong>You want the agent to change its own loop: the WASM flavor.</strong> It is the only flavor where the agent loop, the reflection prompt and the gate rules are open to change, through <code>propose_kernel</code>. The price is slow image builds (minutes cold), and so far no agent has used it: 48 local eval episodes show 0 <code>propose_kernel</code> calls against 218 <code>forth_eval</code> calls.</li>
+<li><strong>You want every effect to be visible and checkable: Roc.</strong> Pure functions cannot do I/O, so a tool returns a <em>request</em> (read this file, write that one) and the host decides whether to perform it. That makes every effect auditable. The price is a pre-release compiler, a Debug build at about 0.3 s per call round, and syntax the model keeps tripping on ("`then` isn't used in this Roc version").</li>
+</ul>
+
+<p>Under all six choices sits one trade-off the evals made visible: <strong>strength of the wall against how familiar the language is to the model</strong>. In the reuse matrix, the three flavors with unfamiliar languages (Lean, Forth, WASM's Forth) spent 12.9 to 16.7 M tokens and lost the most passes. Turn-limit hits point the same way: WASM 5 and Forth 4, against 2 at most for every other flavor. Racket is the evidence that the trade-off is not forced: a Lisp the model knows reasonably well, inside a sandbox that came with the language.</p>
+
+<div class="note"><strong>The headline finding has not changed.</strong> ROADMAP said in October that "most of the score comes from the shared design (lessons, reflection, the gate), not from self-modification": across about 60 episodes per flavor, agents proposed only 5 to 78 changes. The reuse track was built to change that, and Prime, which does not rewrite a kernel in this sense, still scored 32/32 with the fewest tokens. The evals do not yet show self-modification paying off.</div>
+
+<h2>The project timeline</h2>
+
+<p>All 24 commits fall in under five weeks, in three bursts: five setup commits on 11-12 October; seventeen commits, most of the work, in a little over eight hours, from 17:27 UTC on 29 October to 01:46 UTC on 30 October; and the two Roc commits on the night of 12-13 November. Nearly every commit after the first was written by Amp and co-authored by the project owner.</p>
+
+<h3>Phase 0: setup (11-12 October, 29 October)</h3>
+<ul>
+<li><code>6773f0f</code> 2026-10-11: initial commit.</li>
+<li><code>9d1111a</code>, <code>18f64c2</code>, <code>73bf4ce</code>, <code>2b1a072</code> 2026-10-12: orb setup and resume scripts, then the toolchains (Rust, SBCL, Python, TypeScript, Clojure, Elixir/Erlang).</li>
+<li><code>28dd885</code> 2026-10-29: JDK 27, Racket 9.3 and Lean 4, the toolchains the first flavors needed. Between the two dates is a seventeen-day gap that the repo records nothing about.</li>
+</ul>
+
+<h3>Phase 1: the spec and four flavors (29 October)</h3>
+<ul>
+<li><code>21a6429</code>: SPEC.md, the base prompt, and the Clojure, Rust, Racket and Lean harnesses with their seeds and tests, in one commit of 77 files.</li>
+</ul>
+
+<h3>Phase 2: measuring against Prime (29 October)</h3>
+<ul>
+<li><code>a68e36c</code>: the eval suite (12 coding suites, 3 learning suites, a logging proxy) and the GLM 5.3 Flash results, where the cmh flavors reached 83% learning transfer against Prime's 50%.</li>
+<li><code>c604d00</code>: the DeepSeek V4.1 Flash results, where everything scored 96-100%.</li>
+</ul>
+
+<h3>Phase 3: Forth in WASM and the scratchpad (29 October, evening)</h3>
+<ul>
+<li><code>bc94b10</code>: the Forth flavor, with fuel, a memory cap, snapshots, structured errors and <code>forth_eval</code>.</li>
+<li><code>61fd5c3</code>: eval guards (own session per episode, a 2.5 GB watchdog, resume) after a 5.5 GB process got the whole eval service OOM-killed; the two Forth results files, showing the scratchpad cutting tokens from 7.81 M to 3.67 M.</li>
+<li><code>d398532</code>: ROADMAP.md.</li>
+<li><code>1316885</code>: remove committed Python bytecode.</li>
+</ul>
+
+<h3>Phase 4: the readability pass (29 October, 21:15-21:47)</h3>
+<ul>
+<li><code>53cf221</code>, <code>046d89b</code>, <code>7d5b923</code>, <code>414c5d4</code>, <code>bc2db88</code>, <code>477b76d</code>: one simplification commit each for Clojure, Rust, Racket, Lean, the eval runner and Forth. Each claims no change in behavior, backed by passing tests and identical before/after runs (mock runs for the flavors; checker verdicts and regenerated reports for the runner). Forth admits one exception: addresses in error reports moved by 256 bytes.</li>
+</ul>
+
+<h3>Phase 5: the wall moves outward (30 October, 01:03-01:46)</h3>
+<ul>
+<li><code>f2ae442</code>: the WASM flavor, the whole harness as a sandboxed component with <code>propose_kernel</code>; 27 tests.</li>
+<li><code>d6bce9c</code>: the reuse track (r1-r4), a learning-curve report, and the wasm entry in <code>harnesses.json</code>.</li>
+<li><code>526881e</code>: a mount namespace per episode, after pilot agents were caught reading the suites' <code>setup.py</code>, other episodes' <code>/tmp</code> files and the key directory. The "flip the board" worry turned up in the evals before it turned up in a harness.</li>
+</ul>
+
+<h3>Phase 6: Roc (12-13 November)</h3>
+<ul>
+<li><code>eef63c8</code> 2026-11-12: the Roc prototype, a Zig host that embeds the Roc compiler, built inside a Roc checkout.</li>
+<li><code>7c715d6</code> 2026-11-13: the Roc flavor with <code>roc_eval</code>, 14 tests and a <code>harnesses.json</code> entry. The isolated reuse matrix ran alongside both Roc commits, from 23:09 UTC on 12 November to 02:48 UTC on 13 November; its results live in gitignored local files, so no commit records them.</li>
+</ul>
+
+<div class="diagram"><pre>
+Oct 11-12   Oct 29                                      Oct 30           Nov 12-13
+setup ..... spec+4 flavors -&gt; evals -&gt; Forth -&gt; ROADMAP -&gt; WASM -&gt; reuse -&gt; isolation ..... Roc
+            21a6429          a68e36c  bc94b10  d398532   f2ae442 d6bce9c  526881e        7c715d6
+</pre></div>
+
+<h2>The ROADMAP, then and now</h2>
+
+<p>ROADMAP.md was written on 29 October, before the WASM flavor, the reuse track, isolation and Roc, and it was never updated. Here are its seven gaps and its eval gaps, checked against the repository as it is now.</p>
+
+<table>
+<tr><th>ROADMAP gap</th><th>Proposed fix</th><th>What later work did</th></tr>
+<tr><td>1. Safety wall incomplete</td><td>Out-of-process or WASM userspace; sandboxed <code>bash</code>; periodic reload</td><td>WASM and Roc have a full wall, and WASM sandboxes <code>bash</code>. Clojure, Rust and Lean are unchanged.</td></tr>
+<tr><td>2. Back pressure says "failed", not "why"</td><td>One structured error format; kernel-generated property tests; repeated runtime errors become verdicts</td><td>WASM inherits Forth's reports and adds trap reports; Roc returns refusals as data. The original four still return raw text, and no flavor generates held-out tests.</td></tr>
+<tr><td>3. Kept for not crashing, not for helping</td><td>Per-task fitness, external verifiers, credit lessons by use</td><td>Open everywhere. Even WASM kernel images are kept after 3 tasks that did not fail.</td></tr>
+<tr><td>4. Narrow scope of self-modification</td><td>Agent loop as data; more hooks; chained Lean environments</td><td>Partly realized by WASM's <code>propose_kernel</code>, which can rewrite the whole loop, but agents have not used it in evals.</td></tr>
+<tr><td>5. Missing developer tools</td><td>Scratchpads everywhere; <code>diff_def</code>; <code>history</code>; <code>replay</code></td><td>Roc gained <code>roc_eval</code>. Clojure, Rust, Racket and Lean still have no scratchpad; no flavor has diff, history or replay.</td></tr>
+<tr><td>6. Shallow continual learning</td><td>Consolidation, scopes, reflect only when it matters</td><td>Open.</td></tr>
+<tr><td>7. Operational</td><td>Streaming, token accounting, concurrency, configurable turn limit</td><td>Open. The 40-turn limit caused 4 of the 32 failures in the reuse matrix.</td></tr>
+<tr><td>Evals: no reward for self-modification</td><td>A tool-reuse suite</td><td>Built (<code>d6bce9c</code>), but it still does not show self-modification paying off.</td></tr>
+<tr><td>Evals: small samples, no control, two models</td><td>3+ trials, a <code>--fresh-state</code> control, a model sweep</td><td>Worse on trials: the reuse matrix had 1. A non-isolated control ran in a pilot; the isolated control stopped after e1. All reuse runs used one model.</td></tr>
+</table>
+
+<p>Of the thirteen experiments, experiment 1 (the tool-reuse suite) was done. Experiment 11 (a unikernel per generation) was approximated by the WASM component, because orbs have no KVM, and that also partly covers experiment 6 (agent loop as data). Experiment 2, the fresh-state control, was started twice and never finished under isolation. The rest are untouched.</p>
+
+<h2>Open questions</h2>
+
+<ul>
+<li><strong>Does self-modification help at all, on any task?</strong> Every eval so far can be solved with <code>bash</code> and memory alone. A task where a self-made tool is clearly the cheapest path, and is measured that way, still does not exist.</li>
+<li><strong>Is the model-familiarity cost fixable?</strong> The scratchpad halved Forth's tokens, and Roc's <code>roc_eval</code> caught syntax mistakes before any proposal (19 of 44 probes failed in the first eval episode). Would a stronger model, or a better cheat sheet, close the gap with Racket? Or is "the language the model already knows" a permanent advantage?</li>
+<li><strong>Why do agents build narrow tools?</strong> In the Roc run, the agent built one tool per question and kept solving the next question in Python. It never built the general QLOG parser that lesson #1 told it to keep. Is that a prompt problem, a gate problem (tests cannot exercise a tool's error paths), or a model habit?</li>
+<li><strong>Will an agent ever rewrite its own kernel unprompted?</strong> WASM made it possible and safe. Nobody did it. That might mean the kernel is good enough, or that the payoff is invisible to an agent that thinks one task at a time.</li>
+<li><strong>What should "better" mean?</strong> Success is self-reported today, and a self-report can be gamed. The eval checkers are an independent verdict, but real work rarely has a checker.</li>
+<li><strong>How much of the remaining difference between flavors is noise?</strong> With one trial, pauses and a single model, we do not know yet.</li>
+</ul>
+
+<h2>Next experiments</h2>
+
+<p>Six experiments, ordered roughly by cost. The first two make every other number trustworthy.</p>
+
+<h3>1. An isolated fresh-state control</h3>
+<p>The runner already supports it. With <code>--fresh-state</code>, the state dir is wiped before every episode, so nothing carries over:</p>
+<pre>def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, logs_dir, fresh_state=False,
+              isolate=True):
+    state = pathlib.Path(tempfile.mkdtemp(prefix=f"cmh-eval-state-{hname}-"))
+    rows = []
+    try:
+        for number, ep in enumerate(spec["episodes"], start=1):
+            if fresh_state:  # control: no memory carried between episodes
+                shutil.rmtree(state, ignore_errors=True)
+                state.mkdir()
+            tag = f"{hname}.{suite_dir.name}.t{trial}.e{number}"
+            r = run_episode(h, suite_dir, ep, number, state, model, port, usage, tag, timeout, logs_dir, isolate)
+            r.update({"harness": hname, "suite": suite_dir.name, "track": spec["track"], "trial": trial,
+                      "episode": number, "transfer": bool(ep.get("transfer")), "isolated": isolate})
+            rows.append(r)
+            print(f"[{hname}] {suite_dir.name} t{trial} e{number}: {'PASS' if r['passed'] else 'FAIL'} "
+                  f"({r['seconds']}s, {r['usage']['requests']} req)", flush=True)
+    finally:
+        shutil.rmtree(state, ignore_errors=True)
+    return rows</pre>
+<span class="src">evals/run.py:317-335</span>
+<p>The only fresh-state numbers we have come from the non-isolated pilot: memory took Prime from 41% to 91% and Forth from 41% to 78%. Those fresh scores are inflated, because agents read the suites' <code>setup.py</code> files, so the real memory effect is probably larger. The isolated run (<code>matrix-fresh</code>) stopped after the first episode, and since rows are written per finished suite, it recorded nothing. Running it to completion is the cheapest way to learn how much of every learning number is memory and how much is the model.</p>
+
+<h3>2. More trials, and a fairer clock</h3>
+<p>Run the matrix and the control with three or more trials and report confidence intervals. Fix the instruments at the same time. The timeout uses wall-clock time, so orb pauses count against episodes; it should be monotonic and pause-aware, or the orb should be kept awake. <code>Usage</code> should keep errors that arrive after an episode ends: the matrix's "API errors 0" hides 3 upstream read timeouts. Cache-read tokens should be reported separately, since they dominate the token totals.</p>
+
+<h3>3. Scratchpads everywhere</h3>
+<p>This is the experiment with the largest measured effect per line of code. In Forth, <code>forth_eval</code> cut tokens from 7.81 M to 3.67 M, and ROADMAP reports rejected proposals falling from 69 to 0. In local logs, agents call it about 20 times as often as they propose (692 against 32). Roc's <code>roc_eval</code> caught syntax errors before any proposal. Clojure (a throwaway namespace), Racket (a throwaway evaluator), Lean (a scratch environment) and Rust (a throwaway worker) still make the agent propose a definition just to try code. Add the tool to each, then measure proposals, rejections and tokens before and after.</p>
+
+<h3>4. Tool search for self-made tools</h3>
+<p>Every flavor sends every live userspace tool on every request: "Userspace tools are added to the tool list on every model request, rebuilt from the live registry each time" (SPEC.md). That is fine for a few tools. It is the wrong shape for a harness meant to accumulate them over hundreds of tasks. Chapter 12 showed the alternative several harnesses use: tool search, where most tools are deferred and the model searches a catalog (usually with BM25 ranking) to load only the ones it needs. Anthropic reports gains on MCP evaluations from this, and deferred tools leave the prompt cache intact. Agent-written tools are exactly that long, growing tail. The experiment: defer userspace tools behind a search tool in one flavor, run a long-horizon sequence, and compare tokens and reuse against the eager list. It might also help with the narrow-tool problem, if searching shows the agent the tools it already has.</p>
+
+<h3>5. Fitness-based keeping</h3>
+<p>Today a trial version is kept once it has been used enough times without an error. Here is the whole rule in the Rust kernel:</p>
+<pre>    /// Records one use of a live definition and applies the soak rules.
+    fn record_use(&amp;mut self, name: &amp;str, version: u32, error: Option&lt;&amp;str&gt;, input: &amp;Value) {
+        self.rec("def_use", json!({"name": name, "version": version, "ok": error.is_none(), "error": error}));
+        let Some(def) = self.state.defs.get(name) else { return };
+        let Some(live) = def.live_version().filter(|l| l.version == version &amp;&amp; l.status == "trial") else { return };
+        let desc = live.description.clone();
+        if let Some(err) = error {
+            let verdict = format!("def {name} v{version} ({desc:?}) reverted: {} on input {}", first_line(err, 200), compact(input, 200));
+            let restored = self.revert(name, version, err, verdict);
+            let now = restored.map_or("definition removed".into(), |r| format!("live: v{r}"));
+            trace(&amp;format!("[gate] {name} v{version} reverted: {} ({now})", first_line(err, 100)));
+        } else if def.soak_uses &gt;= self.cfg.soak {
+            let verdict = format!("def {name} v{version} ({desc:?}) kept after {} clean uses", def.soak_uses);
+            self.rec("def_kept", json!({"name": name, "version": version, "verdict": verdict}));
+            trace(&amp;format!("[gate] {name} v{version} kept"));
+        }
+    }</pre>
+<span class="src">rust/src/kernel/mod.rs:323-339</span>
+<p>Nothing in it asks whether the change helped. The ROADMAP's fix is a fitness score per task (success from an independent checker where one exists, plus tokens, wall time and tool errors), with a change kept only if its score over the trial window is not worse than the previous version's. The eval checkers already give an independent success signal, so the evals are a natural first place to try it. The question is whether fewer but better changes stick.</p>
+
+<h3>6. A release build of Roc</h3>
+<p>The Roc flavor ships as a Debug build because a release build "needs more than 6 GB of RAM for the LLVM step and was OOM-killed in a 7.8 GB orb". Every Roc number so far carries that handicap: about 0.3 s per call round, gate runs of 17.7 s and 51.6 s in the eval, and 7 s just for the seed <code>select_lessons</code> in the gate. Building it with more memory (once, then reusing the binary) and rerunning the reuse track would separate the language's cost from the build's cost, and give Roc its first complete eval.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Crash and hang safety are solved in four flavors (Racket, Forth, WASM, Roc) and unsolved in three (Clojure, Rust, Lean). <code>bash</code> is still the hole in all but WASM.</li>
+<li>Only Forth and WASM give structured feedback. Only Forth, WASM and Roc have a scratchpad, and the scratchpad is the cheapest large win measured.</li>
+<li>The main trade-off is wall strength against how familiar the language is to the model. Racket shows that you can have both.</li>
+<li>Most of the score still comes from the shared design (lessons, reflection, the gate). No eval yet shows self-modification paying off, and the one flavor that can rewrite its own kernel has never done so in an eval.</li>
+<li>The results are noisy: one trial, orb pauses, one model. An isolated fresh-state control and more trials come before any ranking.</li>
+<li>The next experiments are concrete and mostly small: finish the control, add trials, add scratchpads everywhere, put self-made tools behind tool search, keep changes by fitness, and build Roc in release mode.</li>
+</ul>
+</main>
+<footer class="nav"><a href="12-other-harnesses.html">← Other self-modifying harnesses</a><a href="index.html">Contents</a><a href="index.html">Back to the start →</a></footer>
+</body></html>

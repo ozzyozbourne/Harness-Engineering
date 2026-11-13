@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8. Forth in WebAssembly: a language built for the agent · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 8</header>
+<main>
+<h1>8. Forth in WebAssembly: a language built for the agent</h1>
+<p class="subtitle">A tiny late-bound Forth, written for the agent and locked inside Wasmtime, so nothing the agent writes can crash or hang the harness</p>
+
+<p>The four flavors before this one each picked an existing language and asked how far its own machinery could be bent toward self-modification. Clojure brought <code>eval</code> and namespaces. Racket brought sandboxed evaluators. Rust brought compiled libraries loaded at runtime. Lean brought proofs. Each also showed the same weak spot: when the agent's code loops forever, corrupts memory or panics, the harness struggles to stop it, and sometimes cannot.</p>
+
+<p>The fifth flavor, in <code>forth/</code>, comes from the other side. It asks what the agent's language would look like if we built it ourselves, around the harness's needs, inside a wall the host fully controls. The result is a small Forth dialect, about 1,800 lines of Rust, compiled to WebAssembly and run inside the Wasmtime runtime. The kernel stays ordinary Rust on the outside.</p>
+
+<h2>A primer on Forth</h2>
+
+<p>Forth is a language from around 1970. It is very small, and almost all of it follows from two ideas: a <strong>stack</strong> and a <strong>dictionary of words</strong>.</p>
+
+<h3>The stack</h3>
+
+<p>Most languages pass values to functions through named parameters: <code>add(2, 3)</code>. Forth has no parameter lists. Instead there is one shared <em>data stack</em>, a pile of numbers. Writing a number pushes it onto the pile. Writing an operation takes its inputs off the top of the pile and pushes its result. So <code>2 3 +</code> means: push 2, push 3, then <code>+</code> pops both and pushes 5. This style is called postfix or "reverse Polish" notation.</p>
+
+<div class="diagram">source:   2      3      +      dup    *
+stack:   [2]   [2 3]   [5]   [5 5]   [25]        (top of stack on the right)</div>
+
+<p>Because there are no names for arguments, Forth programmers document each word with a <em>stack effect comment</em> in parentheses: <code>( a b -- a+b )</code> means "takes two items, leaves one". Everything before <code>--</code> is what the word expects on top of the stack, and everything after it is what it leaves. These are just comments, but the VM keeps the stack effect of every built-in word and quotes it back in its error messages.</p>
+
+<p>A handful of words exist only to rearrange the stack: <code>dup</code> copies the top item, <code>drop</code> discards it, <code>swap</code> exchanges the top two, <code>over</code> copies the second item to the top, and <code>nip</code> drops the second item. Strings are not a separate type here. A string is two numbers on the stack, an address in memory and a length, written <code>( addr len )</code> or <code>( a u )</code>.</p>
+
+<h3>Words and the dictionary</h3>
+
+<p>A Forth "function" is called a <strong>word</strong>. You define a new one with a colon: <code>: square ( n -- n*n ) dup * ;</code>. The colon starts the definition, <code>square</code> is its name, and the semicolon ends it. After that, <code>square</code> is a word like any built-in one, and <code>7 square</code> leaves 49.</p>
+
+<p>Every defined word goes into the <strong>dictionary</strong>, the table that maps names to code. A Forth system is mostly a dictionary plus a loop that reads the next word, looks it up and either runs it or compiles a call to it. That loop has two modes. Outside a definition the system is <em>interpreting</em>: each word runs as soon as it is read. Between <code>:</code> and <code>;</code> it is <em>compiling</em>: each word is appended to the new definition instead of being run.</p>
+
+<p>Here is the seed tool every fresh harness starts with. It counts words in a text. It is the whole file:</p>
+
+<pre><code>\ Seed tool `word_count`: {"text": string} -&gt; number of whitespace-separated words.
+: skip-space ( a u -- a' u' )  begin dup 0&gt; if over c@ bl &lt;= else false then while 1 /string repeat ;
+: skip-word  ( a u -- a' u' )  begin dup 0&gt; if over c@ bl &gt;  else false then while 1 /string repeat ;
+: count-words ( a u -- n )
+  0 &gt;r
+  begin skip-space dup 0&gt; while  r&gt; 1+ &gt;r  skip-word  repeat
+  2drop r&gt; ;
+: run ( json-addr json-len -- out-addr out-len )
+  s" text" json-get count-words n&gt;s ;</code></pre>
+<span class="src">forth/seed/word_count.fs:1-9</span>
+
+<p>Read it from the bottom. <code>run</code> receives the tool's JSON input as a string <code>( json-addr json-len )</code>. <code>s" text"</code> pushes the string <code>text</code>, and <code>json-get</code> looks up that key and leaves the value as a string. <code>count-words</code> turns the string into a number, and <code>n>s</code> turns the number back into a string, which is what <code>run</code> must return. <code>count-words</code> keeps its counter on the <em>return stack</em> (<code>>r</code> pushes there, <code>r></code> pops back), a second stack Forth programmers use as scratch storage. <code>c@</code> fetches the byte at an address, <code>bl</code> is the code of a space, and <code>1 /string</code> moves a string one character forward.</p>
+
+<div class="note">Why Forth at all? It is about the smallest language that still lets a program define new words at runtime, so the whole interpreter fits in one readable file. It has almost no syntax to get wrong, and its single stack gives the error reporter one obvious thing to show. The cost is that Forth is unfamiliar to most models, which is why the kernel ships a 71-line dialect reference in the system prompt (<code>forth/host/src/kernel/forth_reference.md</code>).</div>
+
+<h2>A primer on WebAssembly and Wasmtime</h2>
+
+<p>WebAssembly, usually shortened to WASM, is a portable, low-level bytecode format. Think of it as the instruction set of a virtual CPU. Compilers such as <code>rustc</code> can target it (the target used here is <code>wasm32-unknown-unknown</code>, which means "32-bit WebAssembly, no operating system"). A <em>runtime</em> then runs the bytecode. This project uses <strong>Wasmtime 50.0.1</strong>, which translates WASM into native machine code with the Cranelift compiler.</p>
+
+<p>The property that matters for us is <strong>isolation</strong>. A WASM <em>module</em> can read and write only its own <em>linear memory</em>, one flat array of bytes whose maximum size the host can cap. It has no system calls of its own. Anything else it needs (files, clocks, network, or here, "look up a key in this JSON") must be handed in by the host as an <strong>import</strong>, a function the host implements and the module is allowed to call. In the other direction, the module offers <strong>exports</strong> that the host calls.</p>
+
+<p>When something goes wrong inside the module (an out-of-bounds memory access, a call stack that grows too deep, running out of an instruction budget), the runtime stops it with a <strong>trap</strong>. For the host a trap is just an error value returned from the call. The host process does not crash.</p>
+
+<p>Wasmtime adds two ways to stop code that runs too long:</p>
+<ul>
+<li><strong>Fuel</strong> is a counter that goes down as WASM instructions execute. When it reaches zero, the guest traps. It counts work, not time.</li>
+<li><strong>Epoch interruption</strong> is a cheap deadline. A host thread periodically bumps a global "epoch" number, and generated code checks it at loop heads and function entries. When the epoch passes the store's deadline, the guest traps. It measures wall-clock time.</li>
+</ul>
+
+<div class="diagram">+------------------------------ host process (Rust, cmh) ------------------------------+
+|  kernel: agent loop, gate, journal, kernel tools, provider                            |
+|                                                                                       |
+|   imports it provides:  host_word  host_take  host_pending_len  host_known  host_panic|
+|          |                                                         ^                  |
+|          v                                                         |                  |
+|   +----------------- Wasmtime store (fuel, epoch deadline, 64 MB cap) --------------+ |
+|   |  Forth VM module (wasm32-unknown-unknown)                                       | |
+|   |  linear memory: dictionary, slots, compiled code, data space, strings, stacks  | |
+|   |  exports: cmh_define  cmh_call  cmh_resume  cmh_where  cmh_bind ...             | |
+|   +---------------------------------------------------------------------------------+ |
++---------------------------------------------------------------------------------------+</div>
+
+<h2>Why we built our own small Forth</h2>
+
+<p>The commit that added this flavor states the goal in one sentence: "A Rust host runs our own small, late-bound Forth inside Wasmtime with fuel, a memory cap and memory snapshots, so agent code cannot crash or hang the harness and every failure comes back as a structured error." Each part of that sentence is a reason not to embed an existing language.</p>
+
+<ul>
+<li><strong>Late binding had to be built in.</strong> SPEC.md requires that redefining a tool changes what every existing caller runs on its next call. Here that is the VM's core design, not a hoped-for property of the language.</li>
+<li><strong>The whole image had to live in linear memory.</strong> Then a byte copy of that memory is a complete snapshot, and rolling back is writing the copy back.</li>
+<li><strong>Errors had to be designed for a model to read.</strong> Every failure path can name the word, definition, version, line, token, stack and call chain. A borrowed interpreter would give us whatever messages it already had.</li>
+</ul>
+
+<p>The VM's opening comment states all three:</p>
+
+<pre><code>//! Everything the Forth image consists of lives in this module's linear
+//! memory: the dictionary (words, slots, namespaces), compiled code, the data
+//! space (`HERE`, `VARIABLE`, string literals), the per-call string scratch
+//! space, and the stacks. A copy of linear memory is therefore a complete
+//! snapshot of the image; the host uses that for rollback.
+//!
+//! Late binding: every compiled call goes through a slot (an indirection cell
+//! with a name). Redefining a word rebinds its slot, so every existing caller
+//! uses the new code on its next call. Public slots are named after userspace
+//! definitions; an unbound public slot makes the VM suspend with NEED_LOAD so
+//! the host can compile that definition lazily and resume.
+//!
+//! Errors never panic: they come back to the host as JSON (kind, word, def,
+//! version, line, token, data stack, call trace, console output).</code></pre>
+<span class="src">forth/vm/src/lib.rs:3-16</span>
+
+<p>The dialect is deliberately ordinary: 64-bit integer cells, case-insensitive words, <code>( addr len )</code> strings, the usual stack, arithmetic, memory and control words, plus a string builder (<code>&lt;b b+ bc+ bn+ b&gt;</code>) and six host words for JSON, files and lessons. There is no floating point. The contract for every tool and hook is the one line the reference puts first: <code>: run ( json-addr json-len -- out-addr out-len ) ... ;</code>.</p>
+
+<h2>The VM</h2>
+
+<h3>What lives where</h3>
+
+<p>All VM state is held in Rust <code>static mut</code> variables, which the compiler places in linear memory. There is a 1 MB permanent data space (for <code>HERE</code>, <code>variable</code>, <code>create</code> and string literals) and a 2 MB string scratch space that is reset for every call. Stack limits are fixed constants:</p>
+
+<pre><code>const PERM_SIZE: usize = 1 &lt;&lt; 20;
+const SCRATCH_SIZE: usize = 2 &lt;&lt; 20;
+/// Data stack depth.
+const DS_MAX: usize = 1024;
+/// Call depth (`Exec::frames`).
+const RS_MAX: usize = 512;
+/// Items pushed with `&gt;r` (`Exec::rstack`).
+const US_MAX: usize = 256;
+/// Nested DO loops (`Exec::loops`).
+const LS_MAX: usize = 64;
+const CONSOLE_MAX: usize = 4096;
+const BUILDER_MAX: usize = 1 &lt;&lt; 20;</code></pre>
+<span class="src">forth/vm/src/lib.rs:24-35</span>
+
+<p>Compiled code is a vector of small instructions, not native code. The VM walks it with an explicit instruction pointer:</p>
+
+<pre><code>enum Op {
+    Prim(P),
+    Lit(i64),
+    Call(u32),
+    Branch(u32),
+    ZBranch(u32),
+    Do,
+    QDo(u32),
+    Loop(u32),
+    PLoop(u32),
+    Leave(u32),
+    Exit,
+    Halt,
+}</code></pre>
+<span class="src">forth/vm/src/lib.rs:183-196</span>
+
+<p><code>Prim</code> runs one of 83 built-in primitives. Each primitive is listed in a table together with how many stack items it needs and its stack-effect string, and the error messages reuse that table. <code>Lit</code> pushes a number. <code>Branch</code> and <code>ZBranch</code> (branch if zero) implement <code>if</code> and the loops. <code>Call</code> is where the interesting part starts.</p>
+
+<h3>Slots: late binding in one indirection</h3>
+
+<p>A compiled call never points straight at a word's code. It points at a <strong>slot</strong>, a small named cell that holds "which word does this name mean right now":</p>
+
+<pre><code>struct Slot {
+    name: String,
+    target: Option&lt;u32&gt;,
+    /// For public slots: the definition version currently bound.
+    version: u32,
+}</code></pre>
+<span class="src">forth/vm/src/lib.rs:205-210</span>
+
+<p>The inner interpreter follows the slot every time it executes a call:</p>
+
+<pre><code>                Op::Call(s) =&gt; match self.slots[s as usize].target {
+                    Some(w) =&gt; {
+                        if ex.frames.len() &gt;= RS_MAX {
+                            let name = self.slots[s as usize].name.clone();
+                            return Err(self.fail(
+                                ex,
+                                "return-stack-overflow",
+                                format!("call depth exceeded {RS_MAX} calling `{name}` (unbounded recursion?)"),
+                            ));
+                        }
+                        ex.frames.push(Frame { ret: ip as u32 + 1, word: ex.word, loops_depth: ex.loops.len() as u32 });
+                        ex.set_word(w);
+                        ex.set_ip(self.words[w as usize].start);
+                    }
+                    None =&gt; {
+                        ex.set_ip(ip as u32);
+                        return Err(Fail::Need(s));
+                    }
+                },</code></pre>
+<span class="src">forth/vm/src/lib.rs:760-778</span>
+
+<p>Rebinding the slot changes every caller at once, because they all go through it. This is the SPEC's "late binding" requirement, done with one pointer. When the agent proposes <code>word_count</code> v2, the VM compiles the new code and points the <code>word_count</code> slot at it. A tool written earlier as <code>: run word_count s" !" concat ;</code> uses v2 on its next call without being recompiled. When the gate reverts v2, the slot is pointed back at v1, or left empty.</p>
+
+<div class="diagram">  caller tool                 slot "word_count"            definitions
+  : run word_count ... ;      +-----------------+
+     Op::Call(slot) --------&gt; | target ---------+-------&gt; word_count v1 `run`
+                              | version: 1      |   (x)   word_count v2 `run`   (after a revert)
+                              +-----------------+
+  propose v2: target -&gt; v2      revert v2: target -&gt; v1      no live version: target = None</div>
+
+<p>The <code>None</code> branch is what an empty slot does: instead of failing, it suspends the VM with a request for the host, "I need this definition". That is lazy loading, covered below.</p>
+
+<h3>Namespaces: two tools can both have a helper called <code>skip</code></h3>
+
+<p>Each version of each definition gets its own private namespace, named <code>"def/version"</code> (for example <code>word_count/2</code>). Helper words defined in a source, like <code>skip-space</code> and <code>count-words</code> above, live in private slots in that namespace. Only the definition's <code>run</code> word is bound to the <em>public</em> slot named after the definition. When the compiler meets a name, one function decides what it means:</p>
+
+<pre><code>    /// What `tok` (lowercased) means in namespace `ns`: a private word first,
+    /// then a primitive, then a public (userspace) slot that already exists.
+    fn resolve(&amp;self, ns: &amp;str, tok: &amp;str) -&gt; Option&lt;Op&gt; {
+        if let Some(slot) = self.privs[ns].get(tok) {
+            return Some(Op::Call(*slot));
+        }
+        if let Some((p, _, _)) = prim(tok) {
+            return Some(Op::Prim(p));
+        }
+        self.public.get(tok).map(|slot| Op::Call(*slot))
+    }</code></pre>
+<span class="src">forth/vm/src/lib.rs:540-550</span>
+
+<p>Private words come first, so a definition's own helper may even shadow a primitive of the same name. Two tools can each define <code>skip</code> without clashing. A name that matches neither a helper nor a primitive is looked up as another tool, so tools can call each other by name.</p>
+
+<h3>Compile versus interpret</h3>
+
+<p>The compiler walks the source token by token, in the two modes from the primer. Outside <code>: ... ;</code>, tokens are <em>interpreted</em>: numbers go onto a load-time stack, <code>:</code>, <code>variable</code>, <code>constant</code> and <code>create</code> define names, and any other word runs right away through a temporary two-instruction stub that is removed afterwards. Inside a definition, tokens are <em>compiled</em>. Control words such as <code>if</code>, <code>begin</code> and <code>do</code> emit branches and patch their targets later, using a small control stack. Everything else becomes a literal or a call:</p>
+
+<pre><code>    fn compile_word(&amp;mut self, u: &amp;mut Unit, tk: &amp;Token) {
+        let op = if let Ok(v) = tk.t.parse::&lt;i64&gt;() {
+            Op::Lit(v)
+        } else if let Some(op) = self.resolve(&amp;u.ns, &amp;tk.t) {
+            op
+        } else if unsafe { host_known(tk.t.as_ptr() as usize as i32, tk.t.len() as i32) } == 1 {
+            Op::Call(self.public_slot(&amp;tk.t))
+        } else {
+            let slot = self.private_slot(&amp;u.ns, &amp;tk.t);
+            u.forwards.push(Forward { slot, line: tk.line, token: tk.raw.clone() });
+            Op::Call(slot)
+        };
+        self.emit(op, tk.line, &amp;tk.raw);
+    }</code></pre>
+<span class="src">forth/vm/src/lib.rs:1530-1543</span>
+
+<p>The four cases are, in order: a number; a known helper, primitive or already-loaded tool; a live userspace definition the VM has not compiled yet (the VM asks the host with the <code>host_known</code> import, and binds the call to an empty public slot that will be filled on first use); and otherwise a <em>forward reference</em>, a helper that must be defined later in the same source. When the source ends, the VM checks that no <code>:</code> was left open, that every forward reference got defined (otherwise <code>undefined word</code>, with a "did you mean" suggestion based on edit distance), that top-level code left nothing on the stack, and that a <code>run</code> word exists. Only then is the version recorded and the public slot bound.</p>
+
+<h3>Lazy loading</h3>
+
+<p>When a process starts, it compiles only the seed definitions. Everything else the agent has built stays in the journal as source text until something calls it. A call into an empty public slot suspends the VM with status <code>ST_NEED</code> and the slot's name. The host looks the name up among live definitions, compiles that source into the same VM, and resumes:</p>
+
+<pre><code>                ST_NEED =&gt; {
+                    let need = String::from_utf8_lossy(&amp;out).into_owned();
+                    let ok = match live.get(need.as_str()) {
+                        Some((v, src)) =&gt; {
+                            if let Some(rep) = self.define_inner(&amp;need, *v, src)? {
+                                return Ok(Err(format!(
+                                    "lazy load of `{need}` v{v} failed:\n{}",
+                                    format_report(&amp;rep, b"")
+                                )));
+                            }
+                            loads.push((need.clone(), *v));
+                            1
+                        }
+                        None =&gt; 0,
+                    };
+                    st = self.ex.resume.call(&amp;mut self.store, ok)?;
+                }</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:318-334</span>
+
+<p>Resuming with <code>0</code> means "no such definition", and the VM turns that into an <code>undefined-word</code> report. Each lazy load is printed on stderr as, for example, <code>[forth] lazy-load reverse v1</code>. The test <code>forth_lazy_load_in_fresh_process</code> checks this path.</p>
+
+<h3>The ABI: one file both sides compile</h3>
+
+<p>An ABI (application binary interface) is the set of low-level conventions two pieces of compiled code agree on: which numbers mean what, and how arguments are laid out. Because the host and the VM are compiled separately, for different targets, these numbers could easily drift apart. The fix is to compile one file into both. The VM says <code>mod abi;</code> and the host says <code>#[path = "../../../vm/src/abi.rs"] mod abi;</code>.</p>
+
+<pre><code>/// Status of `cmh_define`, `cmh_call` and `cmh_resume`: done, output is the result.
+pub const ST_OK: i32 = 0;
+/// Failed; the output is a JSON error report.
+pub const ST_ERR: i32 = 1;
+/// Suspended on an unbound public slot; the output is its name. The host
+/// compiles it (or not) and calls `cmh_resume`.
+pub const ST_NEED: i32 = 2;
+
+/// Returned by `host_word` when the host word failed; the error message is pending.
+pub const HOST_ERR: i64 = i64::MIN;
+
+/// Host word op codes passed to `host_word`.
+pub const OP_JSON_GET: i32 = 1;
+pub const OP_JSON_LEN: i32 = 2;
+pub const OP_JSON_STR: i32 = 3;
+pub const OP_FILE_READ: i32 = 4;
+pub const OP_FILE_WRITE: i32 = 5;
+pub const OP_REMEMBER: i32 = 6;</code></pre>
+<span class="src">forth/vm/src/abi.rs:7-24</span>
+
+<p>WASM functions can pass only numbers, so strings travel through memory. To call the VM, the host first asks it for a "mailbox" of N bytes (<code>cmh_mailbox</code>), writes the arguments into it back to back, and then calls the export with only their lengths. Results come back through <code>cmh_out_ptr</code> and <code>cmh_out_len</code>. In the other direction, a host word that returns a string first returns only its length. The VM allocates that much scratch space and calls <code>host_take(addr)</code> to have the host copy the bytes in. This two-phase dance means the host never writes into memory the VM did not allocate itself.</p>
+
+<p>The VM's exports are <code>cmh_init</code>, <code>cmh_mailbox</code>, <code>cmh_out_ptr</code>, <code>cmh_out_len</code>, <code>cmh_define</code>, <code>cmh_call</code>, <code>cmh_resume</code>, <code>cmh_bind</code>, <code>cmh_unbind</code>, <code>cmh_bound</code>, <code>cmh_where</code> and <code>cmh_stats</code>. Its imports, all in a module named <code>"cmh"</code>, are <code>host_word</code>, <code>host_take</code>, <code>host_pending_len</code>, <code>host_known</code> and <code>host_panic</code>. Through <code>host_word</code> the VM gets six host words, its entire view of the outside world. <code>json-get</code>, <code>json-len</code> and <code>json-str</code> work on JSON strings. <code>file-read</code> (capped at 1 MB) and <code>file-write</code> are limited to the working directory: they refuse <code>..</code>, the state directory, the host crate and <code>base-prompt.md</code>. <code>remember</code> records a lesson, at most 10 per entry. There is no network.</p>
+
+<h2>The Wasmtime wall</h2>
+
+<p>Most of the other flavors share one hard problem: once agent code is running inside the host process, stopping it is up to the language. In ROADMAP.md's comparison table, Clojure, Rust and Lean all answer "no" to "runaway loop is actually stopped", because the thread running the loop keeps going after the harness gives up on it. Forth answers "yes (fuel)" and, to "agent code can crash the harness", "no (WASM wall)". Racket is the only other flavor in that table with the same two answers, thanks to its sandbox.</p>
+
+<h3>Limits</h3>
+
+<pre><code>/// Resource limits for one entry into the VM (a call, a definition).
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Wasm instructions (roughly) per entry.
+    pub fuel: u64,
+    /// Wall-clock backstop per entry.
+    pub timeout: Duration,
+    /// Cap on linear memory, bytes.
+    pub memory: usize,
+}
+
+impl Default for Limits {
+    fn default() -&gt; Limits {
+        Limits { fuel: 100_000_000, timeout: Duration::from_secs(5), memory: 64 &lt;&lt; 20 }
+    }
+}</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:33-48</span>
+
+<p>So every entry into the VM, whether a call or a compile, gets 100 million instructions of fuel, 5 seconds of wall-clock time and at most 64 MB of memory. The engine is created once with both metering features on, and a background thread bumps the epoch every 10 ms:</p>
+
+<pre><code>        let mut c = Config::new();
+        c.consume_fuel(true).epoch_interruption(true);
+        let engine = Engine::new(&amp;c).map_err(|e| format!("wasmtime engine: {e:?}"))?;
+        let module = Module::new(&amp;engine, VM_WASM).map_err(|e| format!("compile Forth VM module: {e:?}"))?;
+        let pre = host_functions(&amp;engine)
+            .and_then(|linker| linker.instantiate_pre(&amp;module))
+            .map_err(|e| format!("link Forth VM: {e:?}"))?;
+        // The epoch ticker drives every store's wall-clock deadline.
+        let ticker = engine.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(TICK);
+                ticker.increment_epoch();
+            }
+        });</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:116-130</span>
+
+<p>Before each entry, the host refills both budgets. Five seconds at 10 ms per tick is a deadline of 500 ticks:</p>
+
+<pre><code>    /// Fresh fuel and wall-clock deadline for one entry into the VM.
+    fn budget(&amp;mut self) {
+        let _ = self.store.set_fuel(self.limits.fuel);
+        let ticks = (self.limits.timeout.as_millis() / TICK.as_millis()).max(1) as u64;
+        self.store.set_epoch_deadline(ticks);
+    }</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:237-242</span>
+
+<p>Fuel is the main guard and the wall clock is a backstop. Time spent in host words burns no WASM fuel but does count toward the deadline. Wasmtime's docs note that epochs only affect running WASM code, though, so a single slow host call is not cut short: the trap comes once control is back in WASM. Memory is capped with Wasmtime's <code>ResourceLimiter</code> hook, which the runtime asks before growing memory. Refusing growth also sets a flag, so the report can say <code>memory-limit</code> instead of a vaguer failure:</p>
+
+<pre><code>impl ResourceLimiter for Host {
+    fn memory_growing(&amp;mut self, _current: usize, desired: usize, _maximum: Option&lt;usize&gt;) -&gt; wasmtime::Result&lt;bool&gt; {
+        if desired &gt; self.memory_cap {
+            self.memory_hit = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    fn table_growing(&amp;mut self, _current: usize, desired: usize, _maximum: Option&lt;usize&gt;) -&gt; wasmtime::Result&lt;bool&gt; {
+        Ok(desired &lt;= 10_000)
+    }
+}</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:93-104</span>
+
+<h3>Memory safety inside the sandbox</h3>
+
+<p>Forth lets programs read and write any address, which is exactly what a sandbox is for. The VM adds a finer check of its own, and on purpose leaves addresses past the end of memory to WebAssembly:</p>
+
+<pre><code>    /// Raw cell/byte access. Data space and string scratch are allowed; other
+    /// addresses inside linear memory belong to the VM itself and are refused;
+    /// addresses past the end of linear memory are left to the WebAssembly
+    /// sandbox, which traps.</code></pre>
+<span class="src">forth/vm/src/lib.rs:659-662</span>
+
+<h3>Snapshots and restore</h3>
+
+<p>Since the entire image lives in linear memory, a snapshot is a byte copy, and restore means starting a fresh instance and writing the copy back:</p>
+
+<pre><code>    pub fn snapshot(&amp;self) -&gt; Snapshot {
+        Snapshot(self.mem.data(&amp;self.store).to_vec())
+    }
+
+    /// Replaces this instance with a fresh one whose linear memory is the
+    /// snapshot. Globals (the shadow stack pointer) start at their initial
+    /// values, which are the values between top-level calls.
+    pub fn restore(&amp;mut self, snap: &amp;Snapshot) -&gt; Result&lt;(), String&gt; {
+        let h = self.store.data();
+        let mut fresh = Self::instantiate(self.limits.clone(), h.work_dir.clone(), h.protected.clone())?;
+        let cur = fresh.mem.data_size(&amp;fresh.store);
+        if snap.0.len() &gt; cur {
+            let pages = (snap.0.len() - cur).div_ceil(65536) as u64;
+            fresh.mem.grow(&amp;mut fresh.store, pages).map_err(|e| format!("restore: grow memory: {e:?}"))?;
+        }
+        fresh.mem.data_mut(&amp;mut fresh.store)[..snap.0.len()].copy_from_slice(&amp;snap.0);
+        *self = fresh;
+        Ok(())
+    }</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:375-393</span>
+
+<p>The kernel takes a snapshot before <strong>every</strong> call and decides afterwards whether to use it:</p>
+
+<pre><code>        // Snapshot the whole Forth image (linear memory) before the call.
+        let snap = self.vm.snapshot();
+        let input_text = input.to_string();
+        let out = self.vm.call(name, input_text.as_bytes(), &amp;code);
+        for (n, v) in &amp;out.loads {
+            trace(&amp;format!("[forth] lazy-load {n} v{v}"));
+            self.lazy_loads.push((n.clone(), *v));
+        }
+        let result = out.result.and_then(|s| check_output(name, &amp;s).map(|()| s));
+        // A trap may leave the image inconsistent, and a failing trial must
+        // not keep anything it changed (it is reverted below).
+        if let Err(e) = &amp;result
+            &amp;&amp; (out.trapped || is_trial)
+        {
+            self.restore_vm(&amp;snap, &amp;first_line(e, 60));
+        }</code></pre>
+<span class="src">forth/host/src/kernel/mod.rs:413-428</span>
+
+<p>If the restore itself fails, the kernel builds a fresh VM with the seeds compiled. The test <code>forth_out_of_bounds_trap_restores_snapshot</code> writes over data space and then stores to address <code>4000000000</code>, far past the end of memory, and asserts that the VM's statistics afterwards are identical to before.</p>
+
+<div class="warn">The restore relies on one quiet assumption, spelled out in the doc comment above: WASM globals, notably the shadow stack pointer that rustc's generated code uses, are back at their initial values between top-level calls. A fresh instance starts them there, so writing the memory back is enough. That holds for the code rustc emits today, but no document guarantees it.</div>
+
+<h2>Traps become structured reports</h2>
+
+<p>A trap comes back to the host as a Wasmtime error. <code>trap_report</code> classifies it into a kind with a plain message:</p>
+
+<pre><code>    fn trap_report(&amp;mut self, e: &amp;wasmtime::Error, input: &amp;[u8]) -&gt; String {
+        let h = self.store.data();
+        let (kind, msg) = match e.downcast_ref::&lt;Trap&gt;() {
+            _ if h.memory_hit =&gt; (
+                "memory-limit",
+                format!("linear memory would exceed the {} MB cap", self.limits.memory &gt;&gt; 20),
+            ),
+            Some(Trap::OutOfFuel) =&gt; (
+                "fuel-exhausted",
+                format!(
+                    "ran out of fuel ({} wasm instructions) without finishing: probably an infinite loop",
+                    self.limits.fuel
+                ),
+            ),</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:397-410</span>
+
+<p>The remaining cases are <code>timeout</code>, <code>wasm-out-of-bounds</code>, <code>wasm-stack-overflow</code>, <code>vm-panic</code> (with the panic message, captured by a hook the VM installs at startup), <code>wasm-trap</code> and <code>wasm-error</code>. Then comes the useful trick. The host gives the <em>trapped</em> instance a small fresh budget (20 million fuel, 1 second) and calls its <code>cmh_where</code> export to ask where it was. This works because the VM writes its instruction pointer, current token and current word with volatile writes, which the compiler may not delay or optimize away:</p>
+
+<pre><code>    // Volatile so that after a trap (e.g. out of fuel in a tight loop) the
+    // host can still see where execution was.
+    fn set_ip(&amp;mut self, ip: u32) {
+        unsafe { std::ptr::write_volatile(&amp;raw mut self.ip, ip) }
+    }</code></pre>
+<span class="src">forth/vm/src/lib.rs:243-247</span>
+
+<p>So a trap is reported exactly like an ordinary Forth error, with word, line and stack. If even <code>cmh_where</code> fails, the report falls back to the kind and message. Errors the VM detects itself (<code>stack-underflow</code>, <code>stack-overflow</code>, <code>return-stack-overflow</code>, <code>undefined-word</code>, <code>division-by-zero</code>, <code>bad-address</code>, <code>compile-error</code>, <code>contract</code>, <code>host-error</code>, <code>string-space</code>, <code>data-space</code>, <code>builder</code>, <code>vm-error</code>) come back as JSON with status <code>ST_ERR</code>. The host formats both kinds of failure the same way and adds a hint written for each kind.</p>
+
+<p>The shape is: <code>forth error [kind] in word W of DEF vN, line L, at TOKEN:</code>, then the message, the data stack, the call chain, the top two stack items read as a string, any console output printed before the error, the input and the hint.</p>
+
+<h3>Real reports</h3>
+
+<p>The research notes for this book captured the following reports by running the release binary with the mock provider and five broken snippets sent to <code>forth_eval</code>. These are the exact texts the model would see.</p>
+
+<p><strong>A stack underflow.</strong> The source was <code>: combine ( a b -- a+b ) + ;</code> and <code>: run ( a u -- a u ) s" text" json-get nip dup 3 &gt; if drop combine then n&gt;s ;</code>, called with <code>{"text":"abcdef"}</code>. The <code>drop</code> leaves nothing for <code>+</code>:</p>
+
+<pre><code>error: forth error [stack-underflow] in word `combine` of scratchpad v1, line 1, at `+`:
+  `+` ( a b -- a+b ) needs 2 item(s) but the stack has 0
+  data stack (depth 0, top last): []
+  called from: `run` (scratchpad v1) line 2 at `combine`
+  input: {"text":"abcdef"}
+  hint: check each word's ( before -- after ) effect against what is really on the stack at that point</code></pre>
+
+<p><strong>An infinite loop.</strong> The source was <code>: spin begin false until ;</code> and <code>: run spin ;</code>. The VM never returned on its own. The host caught Wasmtime's out-of-fuel trap and asked the trapped VM where it was:</p>
+
+<pre><code>error: forth error [fuel-exhausted] in word `spin` of scratchpad v1, line 1, at `false`:
+  ran out of fuel (100000000 wasm instructions) without finishing: probably an infinite loop
+  data stack (depth 2, top last): [2118568 2]
+  called from: `run` (scratchpad v1) line 2 at `spin`
+  top two items as a string: "{}"
+  input: {}
+  hint: a loop never terminates: make sure BEGIN ... UNTIL / WHILE conditions eventually change and that /string or counters advance</code></pre>
+
+<p>The <code>[2118568 2]</code> on the stack is the untouched input string <code>{}</code>, an address and a length. The "top two items as a string" line exists for exactly this case: it shows that the pair is a string and what it says.</p>
+
+<p><strong>A bad address.</strong> Reading a byte from address 1000, which is inside linear memory but outside Forth's data space:</p>
+
+<pre><code>error: forth error [bad-address] in word `run` of scratchpad v1, line 1, at `c@`:
+  `c@`: address 1000 is not in Forth data space (data space 1069992..2118568, strings 2118568..4215720); valid addresses come from HERE, VARIABLE, CREATE and strings
+  data stack (depth 3, top last): [2118570 3 1000]
+  input: {}
+  hint: use only addresses from HERE, VARIABLE, CREATE and strings; check that ( addr len ) pairs are not swapped</code></pre>
+
+<p><strong>A broken contract.</strong> <code>run</code> left a single number instead of an <code>( addr len )</code> string:</p>
+
+<pre><code>error: forth error [contract] of scratchpad v1:
+  contract: `run` of scratchpad must consume its input ( json-addr json-len ) and leave exactly ( out-addr out-len ); it left 1 item(s)
+  data stack (depth 1, top last): [5]
+  input: {}
+  hint: `run` receives ( json-addr json-len ) and must leave exactly ( out-addr out-len ), e.g. from S" or B&gt;</code></pre>
+
+<p><strong>A typo.</strong></p>
+
+<pre><code>error: compile failed:
+forth error [compile-error] of scratchpad v1, line 1, at `revrese`:
+  undefined word `revrese`</code></pre>
+
+<p>There is no "did you mean" here, because nothing within edit distance 2 of <code>revrese</code> existed in that VM. The kind is <code>compile-error</code>, because the name was caught at compile time. The runtime kind <code>undefined-word</code> appears only when a lazy load finds no live definition.</p>
+
+<p>Reports like these show up in real eval runs too. One local eval log shows the model hitting <code>[bad-address] in word `fq` of scratchpad v1, line 8, at `c@`</code> and later <code>[fuel-exhausted] in word `fmt-csv` of scratchpad v1, line 20, at `@`</code>, both while experimenting in the scratchpad, not in live tools.</p>
+
+<h2>The <code>forth_eval</code> scratchpad</h2>
+
+<p>In the four earlier flavors, the only way for the agent to try new userspace code inside the harness is to propose it as a definition. That makes each experiment a journaled proposal, and a rejected proposal is a visible failure in the record. The Forth flavor adds one kernel tool that runs code without proposing it:</p>
+
+<pre><code>    /// Scratchpad: compiles and runs a snippet in a throwaway VM. Nothing is
+    /// journaled, so experiments do not count as proposals.
+    fn forth_eval(&amp;self, input: &amp;Value) -&gt; Result&lt;String, String&gt; {
+        let source = str_field(input, "source");
+        if source.trim().is_empty() {
+            return Err("source is empty".into());
+        }
+        let arg = input.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+        let code = live_code(&amp;self.state);
+        let mut vm = self.new_vm()?;
+        vm.define("scratchpad", 1, &amp;source, &amp;code).map_err(|e| format!("compile failed:\n{e}"))?;
+        let out = vm.call("scratchpad", arg.to_string().as_bytes(), &amp;code);
+        out.result.map(|o| format!("output: {}", tools::truncate(&amp;o, 20 * 1024)))
+    }</code></pre>
+<span class="src">forth/host/src/kernel/mod.rs:301-314</span>
+
+<p>The snippet is compiled as <code>scratchpad</code> v1 in a fresh VM, and the result is either <code>output: ...</code> or the same structured report the gate would give. The source has to follow the same <code>run</code> contract as <code>propose_def</code>, "so working code can be proposed unchanged", as the tool description puts it. Live userspace words can be called from the snippet. The test <code>forth_eval_scratchpad_runs_code_without_proposing</code> checks that the journal gets no <code>def_proposed</code> or <code>def_rejected</code> events.</p>
+
+<div class="warn">"Throwaway" covers the VM, not the world. The tool description says it plainly: "Host words with side effects (file-write) still act on the working directory." A scratchpad snippet that writes a file really writes it. Lessons recorded with <code>remember</code> inside a scratchpad are dropped, because <code>forth_eval</code> ignores them (an inference from the code, not a tested behavior).</div>
+
+<h3>The measured effect</h3>
+
+<p>The eval suite (chapter 11) was run twice on this flavor with DeepSeek V4.1 Flash, 15 suites with 2 trials each, both on 2026-10-29: one of the flavor "before the forth_eval scratchpad tool", as its results file puts it, and one with the tool. Each run also ran Prime Agent, the reference harness, as the baseline.</p>
+
+<table>
+<tr><th>Run</th><th>Overall</th><th>vs Prime</th><th>Learning transfer</th><th>Median s/episode</th><th>Tokens</th></tr>
+<tr><td>Forth, no scratchpad</td><td>100%</td><td>102%</td><td>100%</td><td>22.1</td><td>7,805,356</td></tr>
+<tr><td>Forth, with <code>forth_eval</code></td><td>100%</td><td>114%</td><td>100%</td><td>29.5</td><td>3,666,810</td></tr>
+<tr><td>Prime, in the no-scratchpad run</td><td>98%</td><td></td><td>94%</td><td>12.1</td><td>2,434,264</td></tr>
+<tr><td>Prime, in the scratchpad run</td><td>88%</td><td></td><td>67%</td><td>16.4</td><td>2,671,217</td></tr>
+</table>
+<p class="src">Sources: evals/results-forth-no-scratchpad-deepseek-v4.1-flash.md, evals/results-forth-deepseek-v4.1-flash.md</p>
+
+<p>The clearest effect is on tokens: they fell from about 7.8 million to about 3.7 million, less than half, with the same pass rate. ROADMAP.md adds that the scratchpad "cut that flavor's rejected proposals from 69 to 0 and its tokens from 7.8M to 3.7M". In the newer local eval logs, models called <code>forth_eval</code> 692 times and <code>propose_def</code> only 32 times across 128 Forth episodes, and only 3 of those proposals were rejected. Given the choice, models try code roughly 20 times for every time they commit it.</p>
+
+<div class="warn"><strong>Read these numbers with care.</strong>
+<ul>
+<li>The headline "114% vs Prime" is mostly Prime getting worse, not Forth getting better. Forth scored 100% in both runs. Prime dropped from 98% to 88% between them. Two trials per suite is a small sample, and the same model gave the baseline a 10-point swing.</li>
+<li>The scratchpad made episodes slower, not faster: the median rose from 22.1 s to 29.5 s.</li>
+<li>The "69 to 0 rejected proposals" figure appears only in ROADMAP.md. The results files have no rejection column, and both say "Raw logs are not kept in git", so it cannot be checked from the repository.</li>
+<li>The scratchpad run "was interrupted once by an out-of-memory kill of the whole service (traced to a 5.5 GB process started inside an episode)" and resumed, with interrupted episodes rerun. The file does not say whether a Forth or a Prime episode started it.</li>
+<li>The 692-vs-32 counts come from gitignored local logs that no results file describes. They show how the tool gets used, not a published result.</li>
+</ul></div>
+
+<p>With those caveats, the lesson holds: a cheap place to try code changes how the agent works. It debugs in private and proposes only what already runs. When ROADMAP.md was written, no other flavor had such a tool, and it lists adding one elsewhere as a gap. The later WASM and Roc flavors both have one (<code>forth_eval</code> and <code>roc_eval</code>).</p>
+
+<h2>Architecture</h2>
+
+<p>The flavor is a Cargo workspace with one member, the host crate. The VM is a standalone crate outside the workspace, because it builds for a different target. The host's build script builds it for <code>wasm32-unknown-unknown</code>, and the host embeds the resulting <code>.wasm</code> as bytes, so the <code>cmh</code> binary is self-contained:</p>
+
+<pre><code>pub const VM_WASM: &amp;[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmh_forth_vm.wasm"));</code></pre>
+<span class="src">forth/host/src/kernel/forth.rs:28</span>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>Role</th></tr>
+<tr><td><code>forth/vm/src/lib.rs</code></td><td>1773</td><td>the Forth VM, compiled to wasm32</td></tr>
+<tr><td><code>forth/vm/src/abi.rs</code></td><td>24</td><td>status codes and host-word op codes, compiled into both sides</td></tr>
+<tr><td><code>forth/host/src/kernel/mod.rs</code></td><td>865</td><td>kernel: gate, prompting, tool dispatch, agent loop, reflection</td></tr>
+<tr><td><code>forth/host/src/kernel/forth.rs</code></td><td>675</td><td>the Wasmtime wall: limits, imports, snapshot/restore, trap reports, host words, report formatter</td></tr>
+<tr><td><code>forth/host/src/kernel/state.rs</code></td><td>218</td><td>journal replay into the registry and knowledge</td></tr>
+<tr><td><code>forth/host/src/kernel/tools.rs</code></td><td>201</td><td>kernel tool schemas, bash, read/write_file</td></tr>
+<tr><td><code>forth/host/src/kernel/provider.rs</code></td><td>187</td><td>Anthropic Messages API and the scripted mock</td></tr>
+<tr><td><code>forth/host/src/kernel/cli.rs</code></td><td>169</td><td>argument parsing, repl, exit codes</td></tr>
+<tr><td><code>forth/host/src/kernel/journal.rs</code></td><td>85</td><td>append-only <code>journal.jsonl</code></td></tr>
+<tr><td><code>forth/host/src/kernel/forth_reference.md</code></td><td>71</td><td>the dialect reference sent to the model</td></tr>
+<tr><td><code>forth/host/build.rs</code></td><td>39</td><td>builds <code>../vm</code> for wasm32</td></tr>
+<tr><td><code>forth/host/tests/spec.rs</code></td><td>451</td><td>15 integration tests</td></tr>
+<tr><td><code>forth/seed/*.fs</code></td><td>69 + 15 + 9</td><td>seed hooks <code>select_lessons</code>, <code>compose_system</code>, seed tool <code>word_count</code></td></tr>
+</table>
+
+<p>The host depends on <code>wasmtime</code> 50.0.1 (only the <code>cranelift</code>, <code>runtime</code> and <code>std</code> features, no component model), <code>serde</code>, <code>serde_json</code> and <code>ureq</code> for HTTP. The VM has no dependencies at all.</p>
+
+<p>The kernel follows SPEC.md like the other flavors. It has 10 kernel tools: <code>bash</code>, <code>read_file</code>, <code>write_file</code>, <code>list_defs</code>, <code>show_def</code>, <code>forth_eval</code>, <code>propose_def</code>, <code>rollback_def</code>, <code>remember</code> and <code>recall</code>. The system prompt has three blocks: the immutable <code>base-prompt.md</code>, the Forth reference, and the supplemental prompt that the agent's own <code>compose_system</code> hook builds. The system prompt is recomposed on every turn, up to 40 turns per task. Both hooks are themselves Forth: the seed <code>select_lessons.fs</code> implements the SPEC's default lesson selection in 69 lines of Forth.</p>
+
+<h2>The gate</h2>
+
+<p>The gate is SPEC.md's path for every change: validate, trial, soak, then keep or revert. This flavor adds one twist at each step: a fresh WASM instance.</p>
+
+<div class="diagram">propose_def
+   |
+   v
+validate: name [a-z][a-z0-9_]* (max 48), not a kernel tool, kind tool/note/hook,
+          kind unchanged across versions, schema + tests present
+   |
+   v
+brand-new wasm instance: compile source, run every test (expect = substring of output)
+   |  fail -&gt; def_rejected (structured report back to the model)
+   v
+compile into the LIVE vm as trial (an older soaking trial is reverted as "superseded")
+   |
+   v
+soak: every call journals def_use;  snapshot before each call
+   |                                       |
+   | 3 clean uses (default soak)           | any error while in trial
+   v                                       v
+def_kept                         restore snapshot, def_reverted,
+                                 slot -&gt; last kept version (or unbound)</div>
+
+<p>Validation compiles and tests the source in a brand-new instance with its own store and fuel, so a broken proposal never touches the live image. The trace line looks like <code>[gate] scratch vm: house_fmt v1 compiled, 10 test(s) passed in 0 ms</code>. A <code>select_lessons</code> hook's output must also parse as a JSON array of integers.</p>
+
+<p>The test <code>forth_infinite_loop_stopped_by_fuel</code> shows the whole loop working against the hardest failure. It proposes a <code>word_count</code> v2 that spins forever when the text is <code>spin</code>:</p>
+
+<pre><code>    let src = r#"
+: spin ( -- ) begin false until ;
+: run ( a u -- a u ) s" text" json-get 2dup s" spin" s= if spin then nip n&gt;s ;"#;
+    k.propose_def(&amp;word_count_v2(src, "3")).unwrap();
+    assert_eq!(wc(&amp;mut k, "abcd").unwrap(), "4");
+    let t0 = std::time::Instant::now();
+    let err = wc(&amp;mut k, "spin").unwrap_err();
+    assert!(t0.elapsed() &lt; std::time::Duration::from_secs(10));
+    assert!(err.contains("[fuel-exhausted]") &amp;&amp; err.contains("in word `spin` of word_count v2"), "{err}");
+    assert!(err.contains("called from: `run`"), "{err}");
+    assert_eq!(status(&amp;k, "word_count"), (Some(1), "kept".into()));
+    assert!(k.state.verdicts.iter().any(|v| v.version == 2 &amp;&amp; v.text.contains("fuel-exhausted")));
+    // The host and the VM keep working.
+    assert_eq!(wc(&amp;mut k, "a b").unwrap(), "2");</code></pre>
+<span class="src">forth/host/tests/spec.rs:340-353</span>
+
+<p>The trial passes its own test, then hangs on a real input. Fuel stops it within the test's ten-second bound, the report names <code>spin</code> in <code>word_count v2</code>, the slot goes back to v1, a verdict mentioning <code>fuel-exhausted</code> is recorded, and the very next call works. This is the test the Clojure, Rust and Lean flavors cannot pass in this form.</p>
+
+<p>Verdicts (the text <code>def NAME vN ("desc") reverted: &lt;first error line&gt; on input {...}</code> or its "kept" counterpart) are shown to the model: the last 20 are appended to the supplemental prompt, bypassing <code>select_lessons</code>. <code>rollback_def</code> re-proposes an old version's source as a new trial version through the same gate.</p>
+
+<h2>The journal</h2>
+
+<p>The journal is SPEC.md's append-only <code>journal.jsonl</code> (chapter 2). When it is empty, the three seeds are installed as <code>def_trial</code> plus <code>def_kept</code> v1 events marked <code>"seed": true</code>, which produce no verdict.</p>
+
+<p>The journal holds source text, not compiled code. No Forth image is ever written to disk. Each process rebuilds its image from the journal: seeds eagerly, everything else lazily through the <code>ST_NEED</code> path. This keeps the journal the single source of truth, at the cost of recompiling on first use.</p>
+
+<h2>CLI</h2>
+
+<p>The command line, commands and exit codes are the shared ones from chapter 2:</p>
+
+<pre><code>cmh [--state DIR] [--provider anthropic|mock] [--script FILE] [--model M] [--soak N] [--no-reflect] &lt;command&gt;</code></pre>
+
+<p>The state directory defaults to <code>.cmh/</code>, and the model to <code>CMH_MODEL</code> or <code>claude-sonnet-5-5</code>. The mock provider logs every request it receives to <code>STATE/mock-requests.jsonl</code>, which is how the real reports above were captured.</p>
+
+<h2>Build and test</h2>
+
+<pre><code>cd forth
+cargo build --release      # host/build.rs builds vm/ for wasm32 and embeds it
+cargo test                 # 8 SPEC tests + Forth wall tests, offline (mock provider)
+./target/release/cmh run "reverse the string 'stressed' with a userspace tool"
+./target/release/cmh defs
+./target/release/cmh knowledge
+./target/release/cmh repl</code></pre>
+<span class="src">forth/README.md:98-104</span>
+
+<p>The build needs the <code>wasm32-unknown-unknown</code> target (<code>rustup target add wasm32-unknown-unknown</code>), and <code>.cargo/config.toml</code> limits builds to 2 jobs. When the research notes were written, <code>cargo test</code> ran <strong>18 tests, all passing</strong>: 3 provider unit tests and 15 integration tests in <code>host/tests/spec.rs</code>, which took 11.3 s. The 15 are a check that the seeds pass their own tests, the 8 tests SPEC.md requires of every flavor (<code>t1_late_binding</code> through <code>t8_end_to_end_run</code>), and 6 Forth-specific tests:</p>
+
+<table>
+<tr><th>Test</th><th>What it proves</th></tr>
+<tr><td><code>forth_late_binding_existing_caller</code></td><td>a caller compiled earlier picks up a redefinition through its slot</td></tr>
+<tr><td><code>forth_infinite_loop_stopped_by_fuel</code></td><td>a runaway trial is stopped, reported, reverted, and the VM keeps working</td></tr>
+<tr><td><code>forth_out_of_bounds_trap_restores_snapshot</code></td><td>after a WASM trap the restored image is identical to before</td></tr>
+<tr><td><code>forth_stack_underflow_is_structured</code></td><td>reports name word, definition, version, line, token, caller and input</td></tr>
+<tr><td><code>forth_lazy_load_in_fresh_process</code></td><td>a new process compiles a journaled definition on first call</td></tr>
+<tr><td><code>forth_eval_scratchpad_runs_code_without_proposing</code></td><td>the scratchpad leaves no proposal in the journal</td></tr>
+</table>
+
+<h2>Limitations</h2>
+
+<ul>
+<li><strong><code>bash</code> is outside the wall.</strong> The WASM sandbox holds the agent's Forth, but the <code>bash</code> kernel tool runs commands directly in the working directory with no filesystem sandbox. <code>write_file</code> refuses the kernel and the journal, but <code>bash</code> can edit anything. In ROADMAP.md's chess terms, "the agent can flip the board". The next chapter's flavor closes this gap with a namespaced sandbox.</li>
+<li><strong>Old versions leak.</strong> Every compiled version stays in the live VM's code and data space until the process exits. <code>cmh_stats</code> exposes how much data space is used and how many words exist, but nothing reclaims it.</li>
+<li><strong>A small language.</strong> No floating point, and <code>lower</code> and <code>trim</code> handle only ASCII. <code>json-get</code> re-parses the whole JSON string on every access, which likely makes repeated lookups slow on large inputs.</li>
+<li><strong>Limits are fixed.</strong> The per-entry fuel and time budgets are not configurable from the CLI, and they also bound the gate's test runs, so a tool that needs more cannot pass.</li>
+<li><strong>Snapshots copy everything.</strong> The whole linear memory (at least the 3 MB of static buffers plus the heap) is copied before every call, including the hook calls on every turn. That is probably cheap at today's sizes (not measured), but the cost grows with memory.</li>
+<li><strong>The gate's limits are shared with every flavor.</strong> It checks only the agent's own tests, it keeps a change after it survives 3 uses without crashing, which is not proof that it works, and task success is self-reported.</li>
+</ul>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Building our own language let us design three properties into the VM: late binding through slots, an image entirely in linear memory, and errors written for a model to read.</li>
+<li>WebAssembly makes the wall real: fuel stops infinite loops, an epoch deadline caps wall time, a resource limiter caps memory, and every trap comes back as an ordinary error. In ROADMAP.md's table only this flavor and Racket both stop runaway loops and keep agent code from crashing the harness.</li>
+<li>Because the image is just bytes, rollback is a memory copy: snapshot before every call, restore after a trap or a failing trial.</li>
+<li>Asking the trapped VM "where were you?" turns a bare trap into a report with word, version, line, token, stack, caller, input and a hint.</li>
+<li>The <code>forth_eval</code> scratchpad halved token use (7.8M to 3.7M) at the same pass rate and is used far more than <code>propose_def</code>. The "114% vs Prime" headline mostly reflects the baseline's drop, and episodes got slower.</li>
+<li>The wall covers Forth, not <code>bash</code>. Closing that hole, and letting the agent change the kernel itself, is the subject of the next chapter.</li>
+</ul>
+</main>
+<footer class="nav"><a href="07-lean.html">← Lean 4: proofs at the gate</a><a href="index.html">Contents</a><a href="09-wasm.html">The whole harness in WebAssembly →</a></footer>
+</body></html>

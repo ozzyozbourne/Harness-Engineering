@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11. Measuring it: the eval suite and the results · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 11</header>
+<main>
+<h1>11. Measuring it: the eval suite and the results</h1>
+<p class="subtitle">How one Python script runs every harness on the same tasks with the same model, what it measured, and what it could not</p>
+
+<p>Passing its own unit tests says nothing about whether an agent running on a harness solves real tasks, or whether its memory and self-modification help. To measure that against Prime Agent, the reference, the project has an eval suite: <code>evals/run.py</code> (504 lines), a list of harnesses in <code>evals/harnesses.json</code>, and 19 task suites under <code>evals/suites/</code>.</p>
+
+<p>The short version: the results are useful but noisy. They come from one model and few trials, and the largest run was distorted by the machine pausing.</p>
+
+<h2>What an eval is here</h2>
+
+<p>A <em>suite</em> is a directory with a <code>suite.json</code> that names a <em>track</em> and a list of <em>episodes</em>. An episode is one task: a prompt, optionally a fixture directory and a setup script that create the input files, and a check script that decides pass or fail.</p>
+
+<pre><code>A suite is a directory under evals/suites/ with suite.json:
+  {"track": "coding" | "learning" | "reuse",
+   "episodes": [{"prompt": str, "fixture": dir?, "setup": file?, "check": file,
+                 "transfer": bool?}]}
+Episodes of one suite run in order, each in a fresh working directory and a fresh
+process, sharing one harness state directory. A check script runs afterwards with
+cwd = the working directory: `python3 check.py &lt;suite_dir&gt; &lt;answer_file&gt;`; exit 0
+means pass. Fixtures, setup and checks are hidden from the agent: each harness run is
+isolated (see ISOLATE_SH) with a private /tmp and evals/, .git and the key hidden.</code></pre>
+<span class="src">evals/run.py:4-12</span>
+
+<p>The important part is the shared state directory, where every harness keeps its tools, notes, lessons and journal (chapter 2). That state is the agent's <em>memory</em>: anything learned in episode 1 can only reach episode 4 through it, and it lasts exactly one suite run. Episodes marked <code>transfer: true</code> depend on something taught earlier; they are the ones that test learning.</p>
+
+<h2>How run.py works</h2>
+
+<div class="diagram">  run.py
+    │  ThreadPoolExecutor (--jobs, default 6): one job per (harness, suite, trial)
+    ▼
+  run_suite ── state dir (memory) ─────────────────────────────┐
+    │ for each episode:                                        │
+    │   mkdtemp work dir + private /tmp                        │
+    │   copy fixture, run setup.py      (outside isolation)    │
+    │   unshare: harness process  ─── HTTP ───▶ logging proxy ─┼──▶ upstream
+    │      ▲ watchdog: 900 s, 2500 MB      /t/&lt;tag&gt;/v1/messages │   (OpenCode Go
+    │   run check.py → passed?          (outside isolation)    │    or OpenRouter)
+    │   row: passed, exit, seconds, usage                      │
+    ▼                                                          │
+  results.jsonl (one append per finished suite) ◀──────────────┘
+    ▼
+  summary.md / summary.json  (main table + learning curves)</div>
+
+<h3>The logging proxy</h3>
+
+<p>To give every harness the same model, key and token accounting, the runner starts a small HTTP proxy on localhost. Each harness is told that the Anthropic API lives at <code>http://127.0.0.1:&lt;port&gt;/t/&lt;tag&gt;/v1/messages</code>, where the tag is <code>harness.suite.tTRIAL.eEPISODE</code>. The proxy strips the tag, forwards the request upstream, and adds the response's token usage to that tag.</p>
+
+<pre><code>    def upstream_headers(incoming, tag):
+        # Every harness authenticates to the proxy with a placeholder API key; the proxy
+        # swaps in the real upstream key, so no harness ever sees it.
+        headers = {k: v for k, v in incoming.items() if k.lower() not in DROP_REQUEST_HEADERS}
+        headers["x-api-key"] = key
+        session = str(uuid.uuid5(uuid.NAMESPACE_URL, "cmh-eval/" + tag))
+        for name, template in up["extra_headers"].items():
+            headers[name] = template.format(key=key, session=session)
+        return headers</code></pre>
+<span class="src">evals/run.py:123-131</span>
+
+<p>Harnesses get <code>ANTHROPIC_API_KEY=via-eval-proxy</code>, a placeholder; the real key comes from an environment variable or a file under <code>~/.config/cmh/</code>, and credential variables are removed from the harness's environment. The proxy drops the client's auth headers and <code>anthropic-beta</code> flags, relays streaming responses (server-sent events, SSE) chunk by chunk, and sums usage from a JSON body or the SSE <code>message_start</code> and <code>message_delta</code> events. Any non-200 response is counted as an error and written to <code>proxy-errors.jsonl</code>.</p>
+
+<p>There are two upstreams that speak the Anthropic Messages API: <code>opencode</code> (OpenCode Go, the default, which rejects requests without a session id, hence the <code>uuid5</code> line) and <code>openrouter</code>. Every result in this chapter used DeepSeek V4.1 Flash through OpenCode Go, except one run of GLM 5.3 Flash through OpenRouter.</p>
+
+<p><code>harnesses.json</code> has eight entries: prime, clojure, rust, racket, lean, forth, wasm and roc. Prime Agent runs as <code>prime-agent -p --provider anthropic --model {model} {prompt}</code> with its agent directory set to the state dir, where a generated <code>models.json</code> points it at the proxy. Every cmh flavor runs as <code>&lt;binary&gt; --state {state} --model {model} run {prompt}</code> with <code>ANTHROPIC_BASE_URL</code> set to the proxy.</p>
+
+<h3>The watchdog</h3>
+
+<p>Each episode runs in its own process session (a Unix group of processes that can be signalled together). The runner polls every 2 seconds and kills the whole session with SIGKILL if the episode runs too long or uses too much memory.</p>
+
+<pre><code>def run_watched(cmd, cwd, env, out_f, err_f, timeout):
+    """Run cmd in its own session; return its exit code, "timeout" or "memory-limit"."""
+    t0 = time.time()
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out_f, stderr=err_f,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    rc = None
+    while rc is None:
+        try:
+            # Poll rather than wait out the whole timeout, so memory is checked every 2 s.
+            rc = p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            if time.time() - t0 &gt; timeout:
+                rc = "timeout"
+            elif session_rss_mb(p.pid) &gt; EPISODE_MEM_MB:
+                rc = "memory-limit"
+            if rc is not None:
+                kill_session(p)</code></pre>
+<span class="src">evals/run.py:230-246</span>
+
+<p>The default timeout is 900 seconds. The memory limit, <code>EPISODE_MEM_MB = 2500</code>, is the summed resident memory (RSS) of every process in the session, read from <code>/proc</code>. It was added after one episode during the Forth run started a 5.5 GB process and got the whole eval service killed by the kernel's out-of-memory killer (commit 61fd5c3). Two caveats: the clock is <code>time.time()</code>, wall time, so time the machine spends suspended counts against the episode; and a process that calls <code>setsid</code> to start its own session escapes both the memory accounting and the kill.</p>
+
+<h3>Episodes, resume and the report</h3>
+
+<p>Each episode gets a work dir (<code>cmh-eval-work-*</code>) and a private /tmp (<code>cmh-eval-tmp-*</code>). The setup script runs with <code>EVAL_EPISODE=n</code>, and the harness's stdout, <code>logs/&lt;tag&gt;.stdout.txt</code>, is the "answer file". The row records <code>passed</code>, the tail of the check output, <code>exit</code>, wall-clock <code>seconds</code>, <code>usage</code> and <code>isolated</code>. <code>--fresh-state</code> wipes the state directory before every episode: the control condition, the same tasks with no memory.</p>
+
+<p>A suite run's rows are appended to <code>results.jsonl</code> only once all its episodes finish, so a stopped run keeps nothing from unfinished suites. That detail decides the fate of the fresh-state control later in this chapter.</p>
+
+<p>The runner can resume: it keeps the first recorded row per (harness, suite, trial, episode) and reruns any suite not fully recorded. It refuses an output directory that already contains <code>summary.md</code>, because a supervised service reruns its command when it exits. There is a latent bug: a partly recorded suite reruns from episode 1 while its old rows stay in the in-memory list, so the summary would double-count them. The only run known to have resumed is the committed Forth-with-scratchpad run (below), made with an earlier runner; the later runs did not resume, and none of their results files has duplicate keys.</p>
+
+<p>The report (<code>summarize</code>) gives, per harness: the overall pass rate, the coding-track rate, the rate on learning-track transfer episodes, the median seconds per episode, total tokens, API errors, the ratio to Prime and whether the harness meets the bar of 80% of Prime's overall rate. Total tokens are input + output + cache read + cache write, unweighted, so cheap cache reads dominate. On a reuse-only run the "Coding" and "Learning transfer" columns read 0% (an empty selection rates as 0.0); those zeros are left out below. For the learning and reuse tracks it also gives a <em>learning curve</em>: pass rate, mean tokens, seconds and requests by episode position. A position mixes unrelated tasks, so one bad suite can dominate a point.</p>
+
+<h2>The 19 suites</h2>
+
+<p>Nine checks recompute the expected answer by importing the suite's own <code>setup.py</code> generator; the others run hidden test cases, recompute from the fixture, check the output against the stated rules, or (c10) compare with a fixed list.</p>
+
+<h3>Coding track: 12 suites, one episode each</h3>
+<table>
+<tr><th>Suite</th><th>Task</th></tr>
+<tr><td>c01-stats-bugs</td><td>Fix bugs in <code>stats.py</code> without changing its tests; hidden cases include median of one item, mode ties and population variance.</td></tr>
+<tr><td>c02-roman</td><td>Implement <code>to_roman</code>/<code>from_roman</code>; the check round-trips 1-3999 and requires errors on inputs such as 0, 4000, 2.5, <code>True</code>, "IIII", "IC".</td></tr>
+<tr><td>c03-csv-report</td><td>Turn 400 messy <code>sales.csv</code> rows into a <code>report.json</code> of totals, per-region revenue and the top product.</td></tr>
+<tr><td>c04-log-5xx</td><td>Find the top 3 IPs by 5xx count in a 6,000-line access log, where some request lines contain a quoted <code>" 500 "</code> to trip naive splitting.</td></tr>
+<tr><td>c05-rename</td><td>Rename <code>calc_total</code> to <code>compute_total</code> across a small package and its tests, including re-exports.</td></tr>
+<tr><td>c06-inventory</td><td>Fix <code>inventory.py</code> without touching its tests; hidden cases cover removing to zero and over-removal.</td></tr>
+<tr><td>c07-backup-sh</td><td>Write a shell script that copies only regular <code>*.txt</code> files, keeping structure, surviving spaces, hidden dirs, a directory named <code>dir.txt</code> and bad arguments.</td></tr>
+<tr><td>c08-flatten-json</td><td>Flatten <code>config.json</code> to dotted paths, with list indices, empty containers as leaves and dotted keys in brackets.</td></tr>
+<tr><td>c09-dijkstra</td><td>Implement <code>shortest_path</code> from its docstring (parallel edges, unreachable gives None, ties prefer fewest edges), checked by a 52-line property test.</td></tr>
+<tr><td>c10-emails</td><td>Extract the 8 valid addresses from a messy <code>contacts.txt</code> under a precise grammar.</td></tr>
+<tr><td>c11-sqlite</td><td>Query <code>shop.db</code> for customers whose 2025 non-refunded totals exceed 500 and write a sorted CSV.</td></tr>
+<tr><td>c12-config-conflict</td><td>Find the one key defined twice in the same section with different values in a 60-section, 3,125-line INI file full of decoys.</td></tr>
+</table>
+
+<h3>Learning track: 3 suites, 4 episodes each (episodes 2-4 are transfer)</h3>
+<table>
+<tr><th>Suite</th><th>Task</th></tr>
+<tr><td>l1-house-style</td><td>Episode 1 states a rule (first line <code># owner: team-orion</code>, a docstring on every function); episodes 2-4 ask for new modules without repeating it.</td></tr>
+<tr><td>l2-qrx-checksum</td><td>Episode 1 defines an invented checksum; later episodes just say "QRX checksum of data_b.bin", and the last asks for all files.</td></tr>
+<tr><td>l3-report-prefs</td><td>Episode 1 sets report preferences (ISO dates, a fixed sign-off line, never the word "very"); episodes 2-4 bring new CSVs with US-format dates.</td></tr>
+</table>
+
+<h3>Reuse track: 4 suites, 8 episodes each (episodes 2-8 are transfer)</h3>
+<table>
+<tr><th>Suite</th><th>Task</th></tr>
+<tr><td>r1-qlog</td><td>Episode 1 specifies an invented binary log format (variable-length integers, a growing string table, checksummed records, delta-encoded times); seven later questions say only "same QLOG format as before". The clearest "build a parser once, reuse it" suite.</td></tr>
+<tr><td>r2-house-rules</td><td>JSON-to-CSV exports under house rules that accumulate: rules 1-3 in episode 1, rules 4-6 added in episode 3, rule 3 replaced and rule 7 added in episode 5. Other episodes restate nothing.</td></tr>
+<tr><td>r3-corrections</td><td>Sensor-reading answers where a "reviewer" issues corrections at episodes 3, 5 and 7 that apply to every later episode, chosen so a careful agent cannot guess them.</td></tr>
+<tr><td>r4-vault-cli</td><td>Data reachable only through a quirky stateful CLI (tokens that expire after 6 commands, pages fetched in order with acknowledgement hashes, every 4th fetch failing with 503, cursors that must be closed). The check also inspects the vault's state file.</td></tr>
+</table>
+
+<p>Here is r2's rule change in episode 3; episode 4 does not mention it:</p>
+
+<pre><code>New house rules, in addition to the existing ones, from now on:
+4. Leave out records marked "test": true.
+5. Sort data rows by their first column (plain string order).
+6. End the file with the line `# rows: N`, where N is the number of data rows.</code></pre>
+<span class="src">evals/suites/r2-house-rules/suite.json:4 (episode 3 prompt, excerpt; the JSON escapes are unescaped here)</span>
+
+<p>Episode 4's whole prompt is "payments.json holds payments. Export them to payments.csv with the columns id, date, method, amount (one row per payment)." A harness that does not carry rules 4-6 forward writes the rows in input order and fails.</p>
+
+<h2>Why the reuse track was added</h2>
+
+<p>The committed results (next section) showed that the first 15 suites barely separate the harnesses: coding is near 100% everywhere, and a learning suite with one fact to remember can be passed by writing one note. The ROADMAP's first eval gap is that they "do not reward self-modification": a harness that can write itself a tool should win when the same hard work recurs, and nothing in c01-l3 recurs.</p>
+
+<p>The reuse track (commit d6bce9c) was built for that: eight episodes per suite that lean on something expensive to rebuild. The commit says every episode fails on the untouched work dir and passes with the reference solution, <code>reference/solve.py</code>, which the runner never copies.</p>
+
+<h2>Per-episode isolation and the leaks it closed</h2>
+
+<p>The first reuse pilots ran without isolation, and the agents looked around. The isolation commit (526881e) says: "Agents could read other episodes' scratch files in the shared /tmp, the prompts, fixtures and checkers under evals/ (and in git history), and the upstream key in ~/.config/cmh, which inflated the fresh-state controls." The pilot logs contain every case:</p>
+
+<ul>
+<li><strong>Reading the suite source.</strong> In the fresh-state pilot, Prime on r1 episode 8 wrote that it "found the layout documented in the local eval suite at <code>.../evals/suites/r1-qlog/setup.py</code> and implemented it", and passed. Forth on r1 episode 3 ran <code>sed</code> inside <code>evals/suites/r1-qlog</code> and passed; on episode 5 it ran the generator itself with <code>EVAL_EPISODE=5</code> and passed.</li>
+<li><strong>Reading other episodes' /tmp.</strong> In the memory pilot, Forth on r1 episode 7 listed <code>/tmp</code>, read other agents' scratch files (<code>/tmp/qlog_parse.py</code>, <code>/tmp/d.md</code>) and grepped another run's harness journal. It passed.</li>
+<li><strong>Looking for the key and other answers.</strong> Forth on r3 episode 6 (fresh) listed <code>~/.config/cmh</code>, ran a <code>find /</code>, then looped over other episodes' <code>answer.txt</code> files. It failed anyway.</li>
+</ul>
+
+<p>The effect on the control was visible in the scores. Without memory, "same QLOG format as before" should be close to unsolvable, yet r1 scored 6/8 for both Prime and Forth in fresh-state mode.</p>
+
+<h3>How isolation works</h3>
+
+<p>Linux lets an unprivileged process create a <em>user namespace</em>, in which it appears to be root, and a <em>mount namespace</em>, a private copy of the filesystem layout that it can rearrange without affecting anyone else. The runner wraps each harness command in both.</p>
+
+<pre><code>HIDDEN_PATHS = [ROOT, REPO / ".git", pathlib.Path.home() / ".config" / "cmh"]
+ISOLATE_SH = r"""
+set -e
+priv=$1 work=$2 state=$3 nhide=$4; shift 4
+mount --bind "$work" "$priv/${work##*/}"
+mount --bind "$state" "$priv/${state##*/}"
+mount --rbind "$priv" /tmp
+while [ "$nhide" -gt 0 ]; do mount -t tmpfs -o size=1m,mode=755 tmpfs "$1"; shift; nhide=$((nhide - 1)); done
+cd "$work"
+exec unshare --map-user="$UID_OUT" --map-group="$GID_OUT" "$@"
+"""</code></pre>
+<span class="src">evals/run.py:259-269</span>
+
+<p>The episode's work and state dirs are bind-mounted (made visible at a second path) inside a private directory, which is then mounted over <code>/tmp</code>, so /tmp holds only this episode's two directories. An empty 1 MB in-memory filesystem (tmpfs) then covers each hidden path: <code>evals/</code>, the repository's <code>.git</code> (so <code>git show</code> cannot recover the suites) and <code>~/.config/cmh</code>. A nested user namespace maps back to the real user id, so harnesses that start their own sandboxes still work. The outer call is <code>unshare -r -m</code>; <code>--no-isolate</code> turns it off.</p>
+
+<div class="warn">Isolation is partial. The network is shared, so the agent can reach the internet and the proxy port. <code>$HOME</code> and the rest of the repository stay visible, including other harnesses' source, SPEC.md and ROADMAP.md. Setup and check scripts run outside the namespace. In the isolated runs, agents that looked in /tmp saw only their own directories, and no isolated log references <code>evals/suites</code>.</div>
+
+<h2>The committed results (October 29, no isolation, 2 trials)</h2>
+
+<p>Four results files are committed under <code>evals/</code>. All use the 15 original suites with 2 trials: 48 episodes per harness, 24 coding and 24 learning, 18 of them transfer episodes. Raw logs are not kept in git. These runs predate isolation.</p>
+
+<h3>DeepSeek V4.1 Flash through OpenCode Go</h3>
+<table>
+<tr><th>Harness</th><th>Overall</th><th>vs prime</th><th>Coding</th><th>Learning transfer</th><th>Median s/ep</th><th>Tokens</th><th>API errors</th><th>Meets bar</th></tr>
+<tr><td>prime</td><td>98%</td><td>100%</td><td>100%</td><td>94%</td><td>13.6</td><td>2,740,579</td><td>0</td><td>yes</td></tr>
+<tr><td>clojure</td><td>100%</td><td>102%</td><td>100%</td><td>100%</td><td>27.6</td><td>2,671,200</td><td>0</td><td>yes</td></tr>
+<tr><td>lean</td><td>96%</td><td>98%</td><td>100%</td><td>89%</td><td>30.1</td><td>4,023,027</td><td>0</td><td>yes</td></tr>
+<tr><td>racket</td><td>100%</td><td>102%</td><td>100%</td><td>100%</td><td>29.0</td><td>4,014,249</td><td>0</td><td>yes</td></tr>
+<tr><td>rust</td><td>100%</td><td>102%</td><td>100%</td><td>100%</td><td>28.1</td><td>2,349,490</td><td>0</td><td>yes</td></tr>
+</table>
+<span class="src">evals/results-deepseek-v4.1-flash.md</span>
+
+<p>As counts: Prime 47/48 (17/18 transfer), Lean 46/48 (16/18), the rest 48/48. Prime is about twice as fast per episode.</p>
+
+<h3>GLM 5.3 Flash through OpenRouter</h3>
+<table>
+<tr><th>Harness</th><th>Overall</th><th>vs prime</th><th>Coding</th><th>Learning transfer</th><th>Median s/ep</th><th>Tokens</th><th>API errors</th><th>Meets bar</th></tr>
+<tr><td>prime</td><td>79%</td><td>100%</td><td>96%</td><td>50%</td><td>6.9</td><td>2,548,442</td><td>0</td><td>yes</td></tr>
+<tr><td>clojure</td><td>92%</td><td>116%</td><td>96%</td><td>83%</td><td>24.6</td><td>880,669</td><td>0</td><td>yes</td></tr>
+<tr><td>lean</td><td>92%</td><td>116%</td><td>96%</td><td>83%</td><td>21.0</td><td>1,204,741</td><td>0</td><td>yes</td></tr>
+<tr><td>racket</td><td>94%</td><td>118%</td><td>100%</td><td>83%</td><td>25.0</td><td>2,320,845</td><td>0</td><td>yes</td></tr>
+<tr><td>rust</td><td>90%</td><td>113%</td><td>92%</td><td>83%</td><td>23.8</td><td>837,109</td><td>0</td><td>yes</td></tr>
+</table>
+<span class="src">evals/results-glm-5.3-flash.md (model z-ai/glm-5.3-flash)</span>
+
+<p>This is the largest learning gap in any committed run: Prime passed 9/18 transfer episodes, each cmh flavor 15/18. Prime was again about three times faster per episode, but used about three times the tokens of Clojure and Rust.</p>
+
+<h3>Forth, with and without its scratchpad tool</h3>
+
+<p>Forth was run twice against Prime: once before it had <code>forth_eval</code>, a tool for trying Forth code without installing it (chapter 8), and once after.</p>
+<table>
+<tr><th>Run</th><th>Harness</th><th>Overall</th><th>vs prime</th><th>Coding</th><th>Learning transfer</th><th>Median s/ep</th><th>Tokens</th><th>Meets bar</th></tr>
+<tr><td>no scratchpad</td><td>prime</td><td>98%</td><td>100%</td><td>100%</td><td>94%</td><td>12.1</td><td>2,434,264</td><td>yes</td></tr>
+<tr><td>no scratchpad</td><td>forth</td><td>100%</td><td>102%</td><td>100%</td><td>100%</td><td>22.1</td><td>7,805,356</td><td>yes</td></tr>
+<tr><td>with forth_eval</td><td>prime</td><td>88%</td><td>100%</td><td>100%</td><td>67%</td><td>16.4</td><td>2,671,217</td><td>yes</td></tr>
+<tr><td>with forth_eval</td><td>forth</td><td>100%</td><td>114%</td><td>100%</td><td>100%</td><td>29.5</td><td>3,666,810</td><td>yes</td></tr>
+</table>
+<span class="src">evals/results-forth-no-scratchpad-deepseek-v4.1-flash.md, evals/results-forth-deepseek-v4.1-flash.md (API errors 0 in both)</span>
+
+<p>The scratchpad cut Forth's tokens by 53%, from 7.81 M to 3.67 M, while its median time rose from 22.1 to 29.5 s and its pass rate stayed at 100%. The more telling number is Prime's: with the same setup, its learning transfer was 94% (17/18) in one run and 67% (12/18) in the other, run-to-run noise as large as most differences between harnesses. The with-scratchpad run is the one its results file says was interrupted by the 5.5 GB out-of-memory kill and resumed.</p>
+
+<h2>The reuse pilots (October 30, 1 trial, Prime vs Forth)</h2>
+
+<h3>Memory against fresh state, before isolation</h3>
+
+<p>The first reuse runs pitted Prime against Forth on r1-r4 with memory and, concurrently, with <code>--fresh-state</code>, before isolation existed. Their r3 rows were invalid: Forth's memory episodes 2-8 and all 16 fresh r3 episodes were killed by SIGTERM within 3 seconds (the cause is not recorded), and Prime's memory r3 ran against an earlier version of the suite. r3 was revised and rerun alone, and the rerun rows were spliced into <code>pilot-memory-valid.jsonl</code> and <code>pilot-fresh-valid.jsonl</code>.</p>
+
+<table>
+<tr><th>Condition</th><th>Harness</th><th>Overall</th><th>r1</th><th>r2</th><th>r3</th><th>r4</th><th>Median s</th><th>Tokens</th></tr>
+<tr><td>memory</td><td>prime</td><td>91% (29/32)</td><td>8/8</td><td>8/8</td><td>5/8</td><td>8/8</td><td>19.0</td><td>4,173,413</td></tr>
+<tr><td>memory</td><td>forth</td><td>78% (25/32)</td><td>6/8</td><td>8/8</td><td>3/8</td><td>8/8</td><td>50.9</td><td>16,559,457</td></tr>
+<tr><td>fresh</td><td>prime</td><td>41% (13/32)</td><td>6/8</td><td>2/8</td><td>4/8</td><td>1/8</td><td>55.8</td><td>14,493,104</td></tr>
+<tr><td>fresh</td><td>forth</td><td>41% (13/32)</td><td>6/8</td><td>1/8</td><td>2/8</td><td>4/8</td><td>107.8</td><td>22,243,169</td></tr>
+</table>
+<span class="src">evals/results/pilot-memory-valid.jsonl, evals/results/pilot-fresh-valid.jsonl (gitignored run outputs)</span>
+
+<p>Memory was worth about 50 points for Prime (91% against 41%) and 37 for Forth (78% against 41%), and it cut tokens 3.5x for Prime and 1.3x for Forth. Because the fresh-state numbers include episodes that read <code>setup.py</code>, the real memory effect is probably larger.</p>
+
+<p>The r3 rerun exposed a failure common to both harnesses: both failed episodes 4-6 even with memory. In episodes 4 and 5 they produced identical wrong numbers (for example <code>2026-04-11 37.9</code> where <code>37.6</code> was expected): neither applied the h-sensor offset of −1.5 from correction A when the prompt said only "apart from rows our reviewer has ruled out". In fresh mode, Prime's episode 7 alone took 4.09 M tokens and 615 seconds.</p>
+
+<h3>The isolated pilot</h3>
+
+<p>The first isolated run covered only r2 and r4, with memory, for Prime, Forth and the WASM harness. All 48 rows have <code>isolated: true</code>.</p>
+<table>
+<tr><th>Harness</th><th>Overall</th><th>vs prime</th><th>r2</th><th>r4</th><th>Median s/ep</th><th>Tokens</th><th>Meets bar</th></tr>
+<tr><td>prime</td><td>94% (15/16)</td><td>100%</td><td>8/8 (568,453 tok)</td><td>7/8 (712,295)</td><td>23.4</td><td>1,280,748</td><td>yes</td></tr>
+<tr><td>forth</td><td>100% (16/16)</td><td>107%</td><td>8/8 (5,148,611)</td><td>8/8 (579,055)</td><td>38.9</td><td>5,727,666</td><td>yes</td></tr>
+<tr><td>wasm</td><td>88% (14/16)</td><td>93%</td><td>7/8 (3,015,211)</td><td>7/8 (826,480)</td><td>50.3</td><td>3,841,691</td><td>yes</td></tr>
+</table>
+<span class="src">evals/results/iso-pilot/summary.md (API errors 0)</span>
+
+<p>The failures were Prime leaving a vault cursor open in r4 episode 1, WASM missing <code>refunds.csv</code> after hitting its 40-turn limit in r2 episode 2, and WASM leaving five cursors open in r4 episode 5. Forth hit the turn limit in r2 episodes 3 and 6 and passed both, at about 2 M tokens each; Prime stayed at 56-101 k per position.</p>
+
+<h2>The isolated matrix (November 12-13)</h2>
+
+<p>The largest run put seven harnesses on all four reuse suites, with memory and isolation, one trial, DeepSeek V4.1 Flash. It ran for 3 h 39 m (23:09:45 to 02:48:36 UTC) and produced 224 rows, all isolated, with no duplicates and no resume. Exits: 200 normal, 15 with exit code 1, 9 timeouts. At most 4 episodes ran at once, which suggests <code>--jobs 4</code>; the command line was not logged.</p>
+
+<div class="warn"><strong>One trial.</strong> Every harness ran each of the 32 episodes exactly once, so the numbers in this section are indications, not measurements: one episode flipping moves a harness by 3 points, and there is nothing to compute a confidence interval from.</div>
+
+<table>
+<tr><th>Harness</th><th>Overall</th><th>vs prime</th><th>Median s/ep</th><th>Tokens</th><th>API errors</th><th>Meets bar</th></tr>
+<tr><td>prime</td><td>100% (32/32)</td><td>100%</td><td>33.1</td><td>4,540,669</td><td>0</td><td>yes</td></tr>
+<tr><td>clojure</td><td>88% (28/32)</td><td>88%</td><td>87.2</td><td>6,239,795</td><td>0</td><td>yes</td></tr>
+<tr><td>forth</td><td>78% (25/32)</td><td>78%</td><td>80.7</td><td>14,118,430</td><td>0</td><td>NO</td></tr>
+<tr><td>lean</td><td>75% (24/32)</td><td>75%</td><td>122.0</td><td>16,735,211</td><td>0</td><td>NO</td></tr>
+<tr><td>racket</td><td>100% (32/32)</td><td>100%</td><td>98.1</td><td>8,176,046</td><td>0</td><td>yes</td></tr>
+<tr><td>rust</td><td>81% (26/32)</td><td>81%</td><td>79.1</td><td>5,853,934</td><td>0</td><td>yes</td></tr>
+<tr><td>wasm</td><td>78% (25/32)</td><td>78%</td><td>74.2</td><td>12,922,131</td><td>0</td><td>NO</td></tr>
+</table>
+<span class="src">evals/results/matrix-memory/summary.md (Coding and Learning transfer columns omitted: they read 0% on a reuse-only run)</span>
+
+<h3>By suite</h3>
+<table>
+<tr><th>Harness</th><th>r1-qlog</th><th>r2-house-rules</th><th>r3-corrections</th><th>r4-vault-cli</th><th>Requests</th><th>Wall s (sum)</th></tr>
+<tr><td>prime</td><td>8/8 · 1,409,287</td><td>8/8 · 493,381</td><td>8/8 · 1,928,003</td><td>8/8 · 709,998</td><td>334</td><td>1,338</td></tr>
+<tr><td>clojure</td><td>8/8 · 2,526,888</td><td>8/8 · 949,708</td><td>6/8 · 734,124</td><td>6/8 · 2,029,075</td><td>501</td><td>4,806</td></tr>
+<tr><td>rust</td><td>8/8 · 1,334,129</td><td>5/8 · 727,375</td><td>7/8 · 1,370,343</td><td>6/8 · 2,422,087</td><td>416</td><td>4,272</td></tr>
+<tr><td>racket</td><td>8/8 · 5,216,907</td><td>8/8 · 847,630</td><td>8/8 · 1,663,035</td><td>8/8 · 448,474</td><td>553</td><td>3,990</td></tr>
+<tr><td>lean</td><td>8/8 · 7,264,877</td><td>4/8 · 2,302,670</td><td>4/8 · 4,151,780</td><td>8/8 · 3,015,884</td><td>657</td><td>7,678</td></tr>
+<tr><td>forth</td><td>8/8 · 1,477,008</td><td>3/8 · 9,963,213</td><td>8/8 · 2,024,635</td><td>6/8 · 653,574</td><td>568</td><td>8,844</td></tr>
+<tr><td>wasm</td><td>8/8 · 1,623,063</td><td>2/8 · 3,109,687</td><td>7/8 · 7,421,486</td><td>8/8 · 767,895</td><td>570</td><td>7,825</td></tr>
+</table>
+<span class="src">computed from evals/results/matrix-memory/results.jsonl (passes · tokens)</span>
+
+<p>Most of every total is cache reads, from 73% (Rust) to 87% (Prime and WASM); cache writes were 0 everywhere.</p>
+
+<h3>Episode by episode</h3>
+<p>P is a pass, F a fail, and * marks an episode that overlapped an orb pause (next section).</p>
+<table>
+<tr><th>Harness</th><th>r1</th><th>r2</th><th>r3</th><th>r4</th></tr>
+<tr><td>prime</td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td></tr>
+<tr><td>clojure</td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td><td><code>PP P* F* P F P P</code></td><td><code>P F P F PPPP</code></td></tr>
+<tr><td>rust</td><td><code>PPPPPPPP</code></td><td><code>PPP F PP F F</code></td><td><code>P P* F* PPPPP</code></td><td><code>F F PPPPPP</code></td></tr>
+<tr><td>racket</td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td><td><code>PPPPPPPP</code></td></tr>
+<tr><td>lean</td><td><code>PPPPPPPP</code></td><td><code>PPP F F F P F</code></td><td><code>PPP F F F F P</code></td><td><code>PPPPP P* P P*</code></td></tr>
+<tr><td>forth</td><td><code>PPPPPPPP</code></td><td><code>PP P* F* F F F F</code></td><td><code>PPPPPPPP</code></td><td><code>PPPPPP F* F*</code></td></tr>
+<tr><td>wasm</td><td><code>PPPPPPPP</code></td><td><code>PP F F F F F F</code></td><td><code>PPP F PP P* P*</code></td><td><code>PPP P* P* PPP</code></td></tr>
+</table>
+
+<h3>Why episodes failed</h3>
+
+<p><strong>r2, the house rules.</strong> Episode 4 failed the same way for Rust, Lean, Forth and WASM: rows in input order (<code>P-7012</code> first where <code>P-1202</code> was expected). They had forgotten rules 4-6, given one episode earlier: a genuine memory failure. Later, Lean, WASM and Forth got episode 5's changes (integer cents, upper-case header) right but still wrote rows that should have been left out, or misordered them. Rust applied episode 5's change in episodes 5 and 6, then fell back to currency units and lowercase headers in episodes 7 and 8. WASM (episode 3) and Forth (6 and 8) also hit the 40-turn limit.</p>
+
+<p><strong>r3, the corrections.</strong> Lean failed episodes 4-6 by not applying the −1.5 h-sensor offset, the same mistake Prime and Forth made in the pilot, and got the resend rule wrong in episode 7. Clojure's episode 6 wrote the template word into the data (<code>h005 MIN -12.6</code>), a formatting slip. WASM's episode 4 produced no answer after the turn limit. Clojure's episode 4 and Rust's episode 3 timed out with no answer; both overlapped the first pause.</p>
+
+<p><strong>r4, the vault.</strong> Rust's episode 1 never created the vault's state file, so it never used the CLI. Rust's episode 2 and Clojure's episodes 2 and 4 left cursors open. Forth's episodes 7 and 8 timed out during pauses.</p>
+
+<p>Episodes that ran into the 40-turn limit (41 requests; Lean's limit is 60, so its 42- and 44-request episodes are not hits): WASM 5, Forth 4, Clojure 2, Racket 2, Rust 0. Several still passed.</p>
+
+<h3>The learning curve</h3>
+
+<p>The report's per-position table shows no steady trend; its later dips in pass rate are the failures above. Comparing the first episode with the mean of the rest:</p>
+
+<table>
+<tr><th>Mean tokens</th><th>prime</th><th>clojure</th><th>rust</th><th>racket</th><th>lean</th><th>forth</th><th>wasm</th></tr>
+<tr><td>e1</td><td>128.8 k</td><td>247.2 k</td><td>128.6 k</td><td>305.0 k</td><td>843.3 k</td><td>704.4 k</td><td>515.0 k</td></tr>
+<tr><td>e2-e8</td><td>143.8 k</td><td>187.5 k</td><td>190.7 k</td><td>248.4 k</td><td>477.2 k</td><td>403.6 k</td><td>387.9 k</td></tr>
+</table>
+
+<span class="src">computed from evals/results/matrix-memory/results.jsonl (mean tokens per episode over the 4 suites)</span>
+
+<p>Lean and Forth, the heaviest first-episode spenders, use about 43% less per later episode, and Clojure, Racket and WASM 19-25% less; Prime and Rust use more. Lean, Forth and WASM are also the ones that lose the most passes later. Prime is cheap from the first episode and stays roughly flat.</p>
+
+<h2>The orb-pause problem</h2>
+
+<p>The eval ran inside an orb, a cloud sandbox that is suspended when idle and resumed later. A separate script sampled memory every 30 seconds into <code>memwatch.log</code> (364 lines, 23:12:26 to 03:21:24). No log records the pauses directly; they are inferred from the gaps in that file, since a 30-second sampler only stops for minutes when the whole machine is suspended:</p>
+
+<table>
+<tr><th>Gap</th><th>Duration</th></tr>
+<tr><td>00:28:29 → 00:39:11</td><td>10 m 42 s</td></tr>
+<tr><td>02:04:15 → 02:13:51</td><td>9 m 36 s</td></tr>
+<tr><td>02:18:51 → 02:43:56</td><td>25 m 05 s</td></tr>
+<tr><td>02:49:56 → 03:13:54</td><td>23 m 58 s (after the matrix; hit the fresh-state run and roc)</td></tr>
+</table>
+
+<p>The first three gaps, about 45 m 23 s, fall inside the matrix, and the wall-clock watchdog counted them against episodes. Taking each episode's start from the creation time of its stdout log and its end from start plus <code>seconds</code> (accurate to about ±30 s), 14 of the 224 episodes overlapped a pause. Five touch a gap by only 2-21 s, within that error, and finished normally (Clojure r3 e3, Rust r3 e2, Forth r2 e4, WASM r3 e8 and r4 e5). The other nine:</p>
+
+<table>
+<tr><th>Episode</th><th>Passed</th><th>Exit</th><th>Seconds</th><th>Paused s</th><th>Window</th></tr>
+<tr><td>forth r2 e3</td><td>yes</td><td>timeout</td><td>1374.0</td><td>638</td><td>00:16:13-00:39:07</td></tr>
+<tr><td>clojure r3 e4</td><td><strong>no</strong></td><td>timeout</td><td>901.9</td><td>639</td><td>00:28:32-00:43:33</td></tr>
+<tr><td>rust r3 e3</td><td><strong>no</strong></td><td>timeout</td><td>900.8</td><td>624</td><td>00:28:47-00:43:47</td></tr>
+<tr><td>wasm r3 e7</td><td>yes</td><td>timeout</td><td>998.1</td><td>556</td><td>01:56:53-02:13:31</td></tr>
+<tr><td>lean r4 e6</td><td>yes</td><td>timeout</td><td>901.7</td><td>576</td><td>01:59:06-02:14:07</td></tr>
+<tr><td>forth r4 e7</td><td><strong>no</strong></td><td>timeout</td><td>900.8</td><td>576</td><td>02:03:27-02:18:27</td></tr>
+<tr><td>lean r4 e8</td><td>yes</td><td>timeout</td><td>1706.4</td><td>1481</td><td>02:15:06-02:43:32</td></tr>
+<tr><td>wasm r4 e4</td><td>yes</td><td>timeout</td><td>1531.5</td><td>1482</td><td>02:18:01-02:43:32</td></tr>
+<tr><td>forth r4 e8</td><td><strong>no</strong></td><td>timeout</td><td>1504.4</td><td>1481</td><td>02:18:28-02:43:32</td></tr>
+</table>
+
+<p>All 9 timeouts overlapped a pause. Some ran well past 900 s because the watchdog only checks again after the orb resumes. Five passed anyway: the answer was already written when they were killed. Four failures look like pause artifacts, each a timeout with no answer after very few requests: Clojure r3 e4 (4 requests), Rust r3 e3 (2), Forth r4 e7 (7) and Forth r4 e8 (6).</p>
+
+<p>Excluding those four, Clojure is 28/31, Rust 26/31 and Forth 25/30; counting them as passes, Clojure reaches 29/32 (91%), Rust 27/32 (84%) and Forth 27/32 (84%). Either way Forth would clear the 80% bar. Lean and WASM are unchanged, since their paused episodes passed. Effects on later episodes cannot be known: Rust's r3 e3 was the episode that announced correction A, and it timed out, yet Rust still passed r3 e4-e8.</p>
+
+<p>Prime and Racket never overlapped a pause, by scheduling luck. For the others, pause took this share of summed wall time: Clojure 13% (643 of 4,806 s), Rust 15% (642 of 4,272 s), Lean 27% (2,057 of 7,678 s), WASM 27% (2,076 of 7,825 s) and Forth 30% (2,697 of 8,844 s). Total and mean times are therefore biased against those five; medians hold up better.</p>
+
+<div class="warn"><strong>"API errors 0" is an undercount.</strong> <code>matrix-memory/proxy-errors.jsonl</code> has 3 rows, all status 502 "The read operation timed out", for clojure r3 e4, rust r3 e3 and forth r2 e3: the three episodes in flight through the first pause. Yet every row shows <code>errors: 0</code>. The proxy counts an error just before logging it, so these must have arrived after the runner had read and reset the episode's tag (an inference: the file was last written at 00:54:05, after all three episodes had ended). The roc-only run logged one more error of the same kind.</div>
+
+<p>One more event was unrelated to pauses. At about 00:10:45 the kernel's out-of-memory killer killed 5 processes; the largest was <code>zig</code> at 5.9 GB, most likely a concurrent Roc build outside the eval (an inference: the Roc flavor was committed at 00:22, and no matrix episode log mentions zig). The three episodes running at that moment all passed.</p>
+
+<h2>No isolated fresh-state control</h2>
+
+<p>The plan was to follow the memory matrix with the same matrix under <code>--fresh-state</code>. It started at 02:48:37 with Prime, Clojure and Rust on r1. The orb paused at 02:49:56, and all three first episodes were reported after about 1490 s: Clojure PASS (6 requests), Prime PASS (12), Rust FAIL (6). Episode 2 logs were created at 03:13:28, and then the run was stopped. Since rows are written per finished suite, its <code>results.jsonl</code> is empty.</p>
+
+<p>So <strong>there is no isolated fresh-state control</strong>. The only memory-against-no-memory comparison is the non-isolated pilot, with its leaky control. The ROADMAP's "No control run yet" is half stale: a control ran, but not the one that would count.</p>
+
+<p>A roc-only memory run on r1 (started 01:23:57) logged six finished episodes, 3 passes, with e4-e6 each spanning a pause (chapter 10). It was stopped too, and its <code>results.jsonl</code> is empty, so Roc has no recorded result.</p>
+
+<h2>What the results say, honestly</h2>
+
+<ol>
+<li><strong>The 15 original suites do not separate the harnesses.</strong> Coding is 92-100% everywhere. On transfer, the cmh flavors beat Prime clearly only on GLM (83% against 50%), and Prime's own DeepSeek transfer score moved from 94% to 67% between two identical setups.</li>
+<li><strong>Memory matters a great deal on the reuse track.</strong> In the unisolated pilot it took Prime from 41% to 91% and Forth from 41% to 78%, against a leaky control. It has not been measured under isolation.</li>
+<li><strong>In the isolated matrix, the reference harness won.</strong> Prime and Racket passed 32/32, and Prime was cheapest and fastest. Lean, Forth and WASM spent the most tokens and lost the most passes, half or more of them on r2. r1, the parser suite, was 8/8 for everyone.</li>
+<li><strong>The evals do not yet show self-modification paying off.</strong> Prime, which does not rewrite its own kernel, scored 32/32 with the fewest tokens on the track built to reward self-modification. The ROADMAP's first gap is still open.</li>
+<li><strong>The matrix is one trial, and pauses distort it.</strong> One model, no confidence intervals, and pauses behind every timeout and 4 of the 32 failures. A one- or two-episode difference between harnesses is within the noise of Prime's own 94%/67% swing, and timing should not be compared across harnesses for this run.</li>
+</ol>
+
+<p>The fixes follow from the failures: rerun the matrix and an isolated <code>--fresh-state</code> control with three or more trials; use a pause-aware timeout or keep the orb awake; make the usage counter keep errors that arrive late; and weight cache-read tokens separately from fresh input.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li><code>run.py</code> runs every harness through one logging proxy, so model, key and token accounting are identical; a watchdog kills episodes at 900 s or 2,500 MB.</li>
+<li>Memory is the state directory shared by one suite's episodes; <code>--fresh-state</code> wipes it to make a control.</li>
+<li>The reuse track (r1-r4) was added because the original suites could not tell the harnesses apart or reward self-modification.</li>
+<li>Unisolated agents read the eval's own source and other episodes' /tmp; per-episode user and mount namespaces now hide <code>evals/</code>, <code>.git</code>, the key and other episodes.</li>
+<li>Isolated with memory, one trial: Prime and Racket 32/32, Clojure 28, Rust 26, Forth 25, WASM 25, Lean 24; Prime cheapest and fastest. Treat these as indications.</li>
+<li>Orb pauses, inferred from gaps in a memory log, line up with all 9 timeouts and 4 failures, skewed wall times and hid 3 API errors.</li>
+<li>There is no isolated fresh-state control and no Roc result; every conclusion rests on one trial and one model.</li>
+</ul>
+</main>
+<footer class="nav"><a href="10-roc.html">← Roc on Zig: pure code and requests as data</a><a href="index.html">Contents</a><a href="12-other-harnesses.html">Other self-modifying harnesses we studied →</a></footer>
+</body></html>

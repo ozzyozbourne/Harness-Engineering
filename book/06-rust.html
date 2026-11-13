@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6. Rust: a compiled library per definition · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 6</header>
+<main>
+<h1>6. Rust: a compiled library per definition</h1>
+<p class="subtitle">No eval, so the compiler becomes a subprocess and the dynamic loader becomes the hot-swap button</p>
+
+<p>The Clojure and Racket flavors had it easy. Both languages can take a string of source code at run time and turn it into a working function, so "the agent proposes a new tool" becomes "the kernel evaluates the text". Rust has no such thing. A Rust program is compiled ahead of time into machine code, and once it is running there is no compiler inside it to call.</p>
+
+<p>The Rust flavor of <code>cmh</code> (the shared harness design from <a href="02-shared-design.html">chapter 2</a>) still lets the agent write new Rust and use it a moment later, without restarting. It does this with two ordinary pieces of the Rust toolchain: <code>cargo</code>, run as a child process, and the operating system's dynamic loader, reached through the <code>libloading</code> crate. Each version of each definition becomes its own tiny shared library. This chapter walks through how that works, what it costs, and where it falls short.</p>
+
+<h2>Why Rust cannot just eval</h2>
+
+<p>An <em>eval</em> function takes program text and runs it inside the current process. Lisps have one because their compiler or interpreter is part of the runtime. In Rust, the compiler (<code>rustc</code>) is a separate, very large program. The binary you ship contains only machine code; the type checker and code generator stayed on the build machine.</p>
+
+<p>So the question for this flavor was not "how do we eval Rust" but "what is the cheapest way to get new machine code into a running process". The answer most native programs use for plugins is a <em>shared library</em>: a file of compiled code (<code>.so</code> on Linux, <code>.dylib</code> on macOS, <code>.dll</code> on Windows) that a running program can open and call into. Rust can produce one if a crate is declared with <code>crate-type = ["cdylib"]</code>, which means "a C-compatible dynamic library".</p>
+
+<p>SPEC.md describes the Rust flavor in one line: userspace is "compiled by <code>cargo</code> into a cdylib and hot-loaded with <code>libloading</code>; the Rust compiler is part of the gate". The rest of the chapter unpacks that sentence.</p>
+
+<div class="diagram">  agent: propose_def word_count v2 (Rust source)
+                 |
+                 v
+  kernel writes  &lt;state&gt;/build/word_count_v2/
+                   Cargo.toml     (generated, cdylib, depends on serde_json)
+                   src/lib.rs     (generated wrapper: C ABI + catch_unwind)
+                   src/user.rs    (the agent's source, verbatim)
+                 |
+                 v
+  cargo build --offline   ---- compile error? ----&gt; trimmed rustc output
+                 |                                   back to the model
+                 v
+  libcmh_us_word_count_&lt;hash&gt;.so
+                 |
+                 v
+  libloading: dlopen, look up cmh_abi / cmh_call / cmh_free
+                 |
+                 v
+  run the tests on a worker thread (15 s timeout)
+                 |
+                 v
+  trial goes live; the next call by name uses it</div>
+
+<h2>The approach: one generated crate per definition version</h2>
+
+<p>The design is stated at the top of <code>userspace.rs</code>, the file that does all the compiling and loading:</p>
+
+<pre><code>//! Userspace code: each definition version becomes a tiny generated cdylib
+//! crate, compiled by `cargo` and hot-loaded with `libloading`.
+//!
+//! Generated crate (`&lt;state&gt;/build/&lt;name&gt;_v&lt;N&gt;/`):
+//! - `src/user.rs`: the agent's source, verbatim (compiler errors point here).
+//! - `src/lib.rs`: a kernel-written wrapper that exports C-ABI functions taking
+//!   and returning JSON strings, frees its own allocations, and runs the user
+//!   function under `catch_unwind` so panics become errors.
+//!
+//! Why one cdylib per version: a new version is a new library file with its
+//! own symbols, so loading it never touches code an older version may still
+//! be running, and replacing a definition needs no restart.
+//!
+//! Libraries are never unloaded (old versions are leaked on purpose), so
+//! function pointers stay valid for the life of the process.</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:1-15</span>
+
+<p>A <em>crate</em> is Rust's unit of compilation, roughly a package. For every proposed version the kernel writes a fresh one on disk. The agent only ever supplies <code>src/user.rs</code>. Everything around it is written by the kernel, so the agent cannot change how its code is called.</p>
+
+<h3>The generated Cargo.toml</h3>
+
+<pre><code>        r#"# Generated by the cmh kernel. Do not edit.
+[package]
+name = "{pkg}"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.dev]
+debug = false
+incremental = false
+
+[workspace]
+"#</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:253-272</span>
+
+<p>A few details matter here. The only dependency is <code>serde_json</code>, because every call passes JSON in and out. Debug info and incremental compilation are turned off to keep builds small and fast. The empty <code>[workspace]</code> table at the end detaches the crate from any surrounding Cargo workspace, so cargo does not go looking for a parent project. The package name <code>{pkg}</code> contains a content hash, explained below.</p>
+
+<h3>The contracts</h3>
+
+<p>Userspace code must provide one function with a fixed signature. Which one depends on what kind of definition it is (README.md lists them):</p>
+
+<pre><code>pub fn run(input: &amp;serde_json::Value) -&gt; Result&lt;String, String&gt;                // tool
+pub fn compose_system(notes: &amp;[String], lessons: &amp;[String]) -&gt; String           // hook
+pub fn select_lessons(task: &amp;str, lessons: &amp;[serde_json::Value]) -&gt; Vec&lt;i64&gt;    // hook</code></pre>
+<span class="src">rust/README.md:21-23</span>
+
+<p>The kernel does not parse the agent's Rust to check this. It writes a wrapper that <em>calls</em> <code>user::run(&amp;input)</code> (or the hook function), and lets <code>rustc</code> complain if the signature is wrong. A type mismatch is a compile error, and a compile error rejects the proposal. The language's type system becomes a free static check. One of the spec tests proposes a tool whose body is just <code>42</code> and checks exactly that:</p>
+
+<pre><code>    let bad_compile = word_count_v2("pub fn run(input: &amp;serde_json::Value) -&gt; Result&lt;String, String&gt; { 42 }", "2");
+    let err = k.propose_def(&amp;bad_compile).unwrap_err();
+    assert!(err.contains("compile error") &amp;&amp; err.contains("mismatched types"), "{err}");</code></pre>
+<span class="src">rust/tests/spec.rs:95-97</span>
+
+<h3>The C-ABI wrapper and catch_unwind</h3>
+
+<p>Rust does not have a stable binary interface between separately compiled Rust libraries, but it can export functions that follow the C calling convention, which every loader understands. The wrapper exports three such functions: <code>cmh_abi()</code> returns a version number for the wrapper itself, <code>cmh_call(input)</code> takes a C string of JSON and returns a C string of JSON, and <code>cmh_free(p)</code> frees a string that <code>cmh_call</code> returned. The library allocated the result, so the library must free it; mixing allocators across a library boundary is a classic source of crashes.</p>
+
+<p>Agent code panics sometimes. A Rust <em>panic</em> is the language's way of aborting the current operation on a bug, such as an <code>unwrap()</code> on a missing value; by default it <em>unwinds</em> the stack, running cleanup code as it goes. Unwinding across an <code>extern "C"</code> boundary is not allowed, so the wrapper catches panics inside the library with <code>std::panic::catch_unwind</code> and turns them into ordinary errors. Because the wrapper is itself generated by a Rust <code>format!</code> string, its braces are doubled:</p>
+
+<pre><code>pub extern "C" fn cmh_call(input: *const c_char) -&gt; *mut c_char {{
+    static QUIET: std::sync::Once = std::sync::Once::new();
+    QUIET.call_once(|| std::panic::set_hook(Box::new(|info| {{
+        let at = info.location().map(|l| format!(" at {{}}:{{}}", l.file(), l.line())).unwrap_or_default();
+        PANIC_AT.with(|p| *p.borrow_mut() = at);
+    }})));
+    let raw = unsafe {{ CStr::from_ptr(input) }}.to_string_lossy().into_owned();
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry(&amp;raw))) {{
+        Ok(r) =&gt; r,
+        Err(p) =&gt; {{
+            let msg = p.downcast_ref::&lt;&amp;str&gt;().map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::&lt;String&gt;().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            Err(format!("panic: {{msg}}{{}}", PANIC_AT.with(|p| p.borrow().clone())))
+        }}
+    }};</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:320-335</span>
+
+<p>The panic hook, installed once, records the file and line of the panic in a thread-local variable, so the error that reaches the model reads <code>panic: empty text at FILE:LINE</code> (spec test 3 checks for the <code>panic: empty text</code> part). The result goes back as <code>{"ok": ...}</code> or <code>{"err": ...}</code>.</p>
+
+<h3>Running cargo</h3>
+
+<p>The build is an ordinary <code>cargo build</code> subprocess. It runs offline first, because the usual case is that <code>serde_json</code> is already in the local cache and touching the network would only slow things down. Only if the failure mentions being offline does it try once more online:</p>
+
+<pre><code>    fn cargo_fetching_once(&amp;self, dir: &amp;Path) -&gt; Result&lt;std::process::Output, String&gt; {
+        let out = self.cargo(dir, true)?;
+        // `--offline` fails with a message that mentions "offline" (for example
+        // "you're using offline mode" or "--offline was specified") when a
+        // dependency is not in the local registry cache yet, as on a fresh
+        // machine. Fetch once then. Any other failure is a real compile error
+        // and is reported as is (a compile error that happens to contain the
+        // word only costs one redundant retry).
+        if !out.status.success() &amp;&amp; String::from_utf8_lossy(&amp;out.stderr).contains("offline") {
+            return self.cargo(dir, false);
+        }
+        Ok(out)
+    }</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:141-153</span>
+
+<p>The <code>cargo</code> call honors <code>$CARGO</code>, sets <code>CARGO_TARGET_DIR</code> to a shared directory, removes <code>CARGO_BUILD_TARGET_DIR</code> and <code>CARGO_MANIFEST_DIR</code> so the kernel's own environment does not leak into the child build, and turns colors off (userspace.rs:155-169). When the build fails, <code>trim_compiler_output</code> drops cargo's progress lines ("Compiling", "Downloading" and so on) and the generic "could not compile" line, caps the text at 4,000 bytes and prefixes it with <code>compile error:</code>. What remains is rustc's own diagnostic, pointing at lines in <code>src/user.rs</code>, which is exactly the agent's source. That is the back pressure: the model gets the same error a human would.</p>
+
+<h3>The content-hash cache</h3>
+
+<p>There is a subtle trap in loading shared libraries. If you ask the loader to open a file path it has already opened, it hands back the library it already has, not whatever is on disk now. If version 2 and version 3 of a tool were both built to <code>libword_count.so</code>, version 3 would silently run version 2's code. The kernel avoids this by naming every library after a hash of everything that goes into it:</p>
+
+<pre><code>/// Content hash of everything that goes into a library. It names the package
+/// and the library file, so different code never shares a file name (the
+/// dynamic loader would hand back the already-loaded one) and identical code
+/// is compiled only once.
+fn fnv1a(parts: &amp;[&amp;str]) -&gt; u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in parts {
+        for b in p.bytes().chain(std::iter::once(0)) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:57-70</span>
+
+<pre><code>        let hash = fnv1a(&amp;[&amp;WRAPPER_ABI.to_string(), entry, name, source]);
+        let pkg = format!("cmh_us_{name}_{hash:016x}");
+        let file = format!("{}{pkg}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+        let dir = self.build_root.join(format!("{name}_v{version}"));
+        let lib_path = dir.join(&amp;file);
+        if let Some(l) = self.loaded.get(&amp;lib_path) {
+            return (None, Ok(*l));
+        }
+        let mut build_time = None;
+        if !lib_path.exists() {
+            let (time, built) = self.build(&amp;dir, &amp;pkg, &amp;file, entry, source);
+            build_time = time;
+            if let Err(e) = built {
+                return (build_time, Err(e));
+            }
+        }</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:84-99</span>
+
+<p>FNV-1a is a small, fast, non-cryptographic hash. It covers the wrapper version, the entry kind, the name and the source, so different code always gets a different file name, and identical code (a rollback, or the same seed in a new state directory) is compiled only once.</p>
+
+<p>There are three levels of cache:</p>
+<table>
+<tr><th>Level</th><th>Where</th><th>What it saves</th></tr>
+<tr><td>In-process map</td><td><code>loaded: HashMap&lt;PathBuf, Loaded&gt;</code></td><td>Re-opening a library already loaded in this process</td></tr>
+<tr><td>Per state dir</td><td><code>&lt;state&gt;/build/&lt;name&gt;_v&lt;N&gt;/&lt;file&gt;</code></td><td>Rebuilding a version this agent already built</td></tr>
+<tr><td>Shared</td><td><code>&lt;target&gt;/cmh-libs/&lt;file&gt;</code></td><td>Rebuilding identical code from any state dir</td></tr>
+</table>
+
+<p>Copies between levels never overwrite a file in place, because a library that is already mapped into memory must not change underneath the process:</p>
+
+<pre><code>fn atomic_copy(from: &amp;Path, to: &amp;Path) -&gt; Result&lt;(), String&gt; {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Copy to a fresh inode and rename over, so an already-mapped library is
+    // never rewritten in place.
+    let tmp = to.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::copy(from, &amp;tmp).map_err(|e| format!("copy {} -&gt; {}: {e}", from.display(), tmp.display()))?;
+    std::fs::rename(&amp;tmp, to).map_err(|e| format!("rename {}: {e}", to.display()))
+}</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:172-181</span>
+
+<p>All generated crates share one cargo target directory (<code>&lt;state&gt;/target</code> by default, or <code>$CMH_TARGET_DIR</code>), so <code>serde_json</code> is compiled once. After that, according to the README, "a typical proposal builds in about 0.1–0.3 s". The gate prints the cargo wall time of every build it triggers as <code>[gate] cargo build NAME vN: X.Xs</code>. The build directory is only a cache: if it is deleted, the kernel rebuilds each library from the source stored in the journal (spec test 5 does exactly this).</p>
+
+<h3>Loading with libloading</h3>
+
+<p><code>libloading</code> is a thin, cross-platform wrapper over <code>dlopen</code>/<code>dlsym</code> (and their Windows equivalents). Opening a library and looking up its symbols is <code>unsafe</code> in Rust, because the compiler cannot check that the function in the file really has the signature you claim. The kernel's justification is that it wrote the wrapper itself and checks a version marker before trusting anything else:</p>
+
+<pre><code>    let lib = unsafe { Library::new(path) }.map_err(|e| format!("load {}: {e}", path.display()))?;
+    let lib: &amp;'static Library = Box::leak(Box::new(lib));
+    // SAFETY: the symbols are exported by the generated wrapper with exactly
+    // these signatures; the ABI marker guards against stale wrappers.
+    unsafe {
+        let abi: libloading::Symbol&lt;unsafe extern "C" fn() -&gt; u32&gt; =
+            lib.get(b"cmh_abi\0").map_err(|e| format!("missing cmh_abi: {e}"))?;
+        if abi() != WRAPPER_ABI {
+            return Err("stale userspace library (wrapper ABI mismatch)".into());
+        }
+        let call: libloading::Symbol&lt;CallFn&gt; = lib.get(b"cmh_call\0").map_err(|e| e.to_string())?;
+        let free: libloading::Symbol&lt;FreeFn&gt; = lib.get(b"cmh_free\0").map_err(|e| e.to_string())?;
+        Ok(Loaded { call: *call, free: *free })</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:186-198</span>
+
+<p>Note <code>Box::leak</code>. It turns the library handle into a <code>&amp;'static</code> reference that lives until the process exits, which means libraries are never unloaded. This is deliberate. Unloading a library while a function pointer into it still exists, or while an abandoned thread is still running inside it, would be a use-after-free in machine code. Leaking one library per version (the ones the tests built in <code>rust/target</code> are 840 KB to 1 MB each) is the safe trade. <code>WRAPPER_ABI</code> (currently 1) is part of the hash and is checked at load time, so changing the wrapper code invalidates every cached library.</p>
+
+<h3>Calling with a timeout</h3>
+
+<p>A model can write a loop that never ends. To keep that from freezing the whole agent, each call runs on a fresh worker thread with a 64 MB stack, and the kernel waits on a channel with a deadline. The call timeout is 15 seconds (<code>call_timeout: Duration::from_secs(15)</code> in mod.rs:98):</p>
+
+<pre><code>        let raw = match rx.recv_timeout(timeout) {
+            Ok(r) =&gt; r?,
+            Err(mpsc::RecvTimeoutError::Timeout) =&gt; {
+                return Err(format!("timeout: no result after {:.1}s", timeout.as_secs_f64()));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) =&gt; return Err("userspace worker died".into()),
+        };</code></pre>
+<span class="src">rust/src/kernel/userspace.rs:235-241</span>
+
+<p>Both a caught panic and a timeout come back as an <code>Err</code>, and the gate counts an error as a failed use, so a bad trial is reverted. But read the timeout branch closely: it returns an error and walks away. Rust has no safe way to kill a thread, so the runaway thread is abandoned and keeps running (and burning CPU) until the process exits. The doc comment says so plainly: "the runaway thread is abandoned".</p>
+
+<div class="note"><strong>Why a library per version, not one library rebuilt each time?</strong> The comment in userspace.rs gives the reason: "a new version is a new library file with its own symbols, so loading it never touches code an older version may still be running, and replacing a definition needs no restart." Old and new versions coexist in memory, which is also what makes instant revert cheap: the kept version is still loaded.</div>
+
+<h2>Architecture by file</h2>
+
+<p>The kernel source under <code>src/</code> is 1,936 lines. The seeds are 58 lines and the tests 266.</p>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>What it does</th></tr>
+<tr><td><code>src/main.rs</code></td><td>4</td><td>Calls <code>cmh::kernel::cli::main(args)</code> and exits with its code.</td></tr>
+<tr><td><code>src/lib.rs</code></td><td>8</td><td>Crate doc ("Everything under <code>src/kernel/</code> is the immutable kernel ring") and re-exports.</td></tr>
+<tr><td><code>src/kernel/mod.rs</code></td><td>677</td><td>The <code>Kernel</code>: config, seeds, opening and replay, the gate, late-bound calls, prompt assembly, tool dispatch, the agent loop, lessons and reflection.</td></tr>
+<tr><td><code>src/kernel/userspace.rs</code></td><td>365</td><td>Crate generation, cargo build, the hash cache, loading, the timed call.</td></tr>
+<tr><td><code>src/kernel/state.rs</code></td><td>232</td><td>Plain data types (<code>Def</code>, <code>DefVersion</code>, <code>Lesson</code>, <code>Verdict</code>, <code>TaskRecord</code>, <code>State</code>) and <code>State::apply</code>, the single reducer over journal events.</td></tr>
+<tr><td><code>src/kernel/provider.rs</code></td><td>189</td><td>The <code>Provider</code> trait, the Anthropic client over <code>ureq</code>, and the scripted <code>Mock</code>.</td></tr>
+<tr><td><code>src/kernel/cli.rs</code></td><td>179</td><td>Hand-rolled argument parser, provider factory, command dispatch, REPL.</td></tr>
+<tr><td><code>src/kernel/tools.rs</code></td><td>168</td><td>The nine kernel tool names and schemas, <code>bash</code>, path resolution, <code>read_file</code>, <code>write_file</code>.</td></tr>
+<tr><td><code>src/kernel/journal.rs</code></td><td>85</td><td>Append-only <code>journal.jsonl</code>, tolerant reading, hand-rolled ISO-8601 timestamps.</td></tr>
+<tr><td><code>src/kernel/provider_tests.rs</code></td><td>29</td><td>Unit tests for the request body and base URL.</td></tr>
+<tr><td><code>seed/*.rs</code></td><td>58</td><td>The three seed definitions: <code>compose_system</code>, <code>select_lessons</code>, <code>word_count</code>.</td></tr>
+<tr><td><code>tests/spec.rs</code></td><td>266</td><td>The eight required spec tests.</td></tr>
+</table>
+
+<p>The dependency list in <code>Cargo.toml</code> is short: <code>libloading</code> 0.8, <code>serde</code> with derive, <code>serde_json</code> and <code>ureq</code> 2. There is no async runtime, no CLI framework and no date library. The crate uses edition 2024 and some recent standard-library features (let-chains, <code>std::io::pipe</code>, <code>floor_char_boundary</code>), so it needs a recent stable compiler. It was verified with rustc 1.99.1.</p>
+
+<h2>The agent loop</h2>
+
+<p><code>Kernel::run_task</code> (mod.rs:499-556) is the loop from chapter 2, written out plainly:</p>
+
+<ol>
+<li>Journal <code>task_started</code> and call the <code>select_lessons</code> hook to pick which lessons go in the prompt.</li>
+<li>For up to 40 turns (<code>max_turns: 40</code>): rebuild the system prompt and the tool list from scratch, call the model, and collect any text.</li>
+<li>If the model did not stop to use a tool, the loop ends. Otherwise run every <code>tool_use</code> block and send the results back, each with an <code>is_error</code> flag.</li>
+<li>Decide success, update notes, score lessons, journal <code>task_finished</code>, and reflect.</li>
+</ol>
+
+<p>Rebuilding the prompt and tool list on every turn is what makes changes take effect mid-task. The end of the loop is worth reading because it shows how "success" is defined:</p>
+
+<pre><code>        let tail_ok = tool_errors.iter().rev().take(2).all(|e| !e);
+        let success = kernel_error.is_none() &amp;&amp; stop == "end_turn" &amp;&amp; tail_ok;
+
+        self.soak_trial_notes(task_id, task, success);
+        self.score_lessons(task_id, &amp;selected, success);
+        let summary = first_line(&amp;answer, 200);
+        self.rec("task_finished", json!({"task_id": task_id, "success": success, "error": kernel_error, "summary": summary}));
+        trace(&amp;format!("[task] {task_id} {}", if success { "succeeded" } else { "failed" }));
+        transcript.push(format!("OUTCOME: {}", if success { "success" } else { "failure" }));
+        if self.cfg.reflect {
+            self.reflect(&amp;transcript.join("\n"));
+        }
+        TaskOutcome { success, answer, error: kernel_error }
+    }</code></pre>
+<span class="src">rust/src/kernel/mod.rs:543-556</span>
+
+<p>A task succeeds only if the kernel saw no error (such as the turn limit or a failed model request), the model ended its turn normally, and neither of the last two tool results was an error. That last rule catches the common failure where a model's final command fails and it declares victory anyway.</p>
+
+<h3>Prompt assembly</h3>
+
+<p>The system prompt is two blocks. The first is the immutable base prompt from <code>base-prompt.md</code>, read from the repository at startup with a copy embedded at compile time as a fallback. The second is the supplemental prompt: the output of the live <code>compose_system</code> hook, fed the live notes and the selected lessons. Then the kernel appends the last 20 verdicts itself, after the hook has run, so a hook cannot hide them:</p>
+
+<pre><code>        let verdicts: Vec&lt;&amp;str&gt; = self.state.verdicts.iter().rev().take(20).map(|v| v.text.as_str()).collect();
+        if !verdicts.is_empty() {
+            supplemental.push_str("\n\n## Verdicts on past userspace changes\n");
+            for v in verdicts.iter().rev() {
+                supplemental.push_str(&amp;format!("- {v}\n"));
+            }
+        }
+        vec![self.base_prompt.clone(), supplemental.trim().to_string()]</code></pre>
+<span class="src">rust/src/kernel/mod.rs:387-394</span>
+
+<p>If the hook fails, the kernel falls back to the seed version of the same function, which is compiled into the kernel as well (see "Seeds" below). The tool list is the nine kernel tool schemas followed by every live userspace tool's name, description and input schema.</p>
+
+<h3>Late binding</h3>
+
+<p><em>Late binding</em> means a name is looked up when it is used, not when the calling code was written. Every userspace call goes through one function that looks up the live version by name, loads it (a hash-map hit after the first time), calls it and records the use:</p>
+
+<pre><code>    pub fn call_def(&amp;mut self, name: &amp;str, input: &amp;Value) -&gt; Result&lt;String, String&gt; {
+        let Some(live) = self.state.live(name) else {
+            return Err(format!("no live definition `{name}`"));
+        };
+        let version = live.version;
+        let (_, lib) = self.userspace.load(name, version, &amp;live.kind, &amp;live.source);
+        let result = lib.and_then(|lib| lib.call(input, self.cfg.call_timeout));
+        self.record_use(name, version, result.as_ref().err().map(String::as_str), input);
+        result
+    }</code></pre>
+<span class="src">rust/src/kernel/mod.rs:344-353</span>
+
+<p>That is the whole hot-swap mechanism: keeping, reverting or rolling back only changes which version is live, and the next <code>call_def</code> picks it up.</p>
+
+<h2>Tools</h2>
+
+<p>The nine kernel tools are the same as in every flavor: <code>bash</code>, <code>read_file</code>, <code>write_file</code>, <code>list_defs</code>, <code>show_def</code>, <code>propose_def</code>, <code>rollback_def</code>, <code>remember</code> and <code>recall</code>. A few Rust-specific details:</p>
+
+<ul>
+<li><strong><code>bash</code></strong> runs <code>bash -c</code> in its own process group with stdin closed and stdout and stderr merged into one pipe. The timeout defaults to 60 s and is clamped to 1–3600 s. On timeout the whole process group is killed with <code>kill -9</code>, so background children die too. After the command exits, the kernel waits at most 2 seconds for the pipe to close. Output is truncated to 20 KB.</li>
+<li><strong>A nonzero exit is a tool error.</strong> That matters for the success rule above:</li>
+</ul>
+
+<pre><code>    match status {
+        Some(st) if st.success() =&gt; Ok(format!("{out}\n[exit code: 0]")),
+        Some(st) =&gt; Err(format!("{out}\n[exit code: {}]", st.code().map_or("signal".into(), |c| c.to_string()))),
+        None =&gt; Err(format!("{out}\n[timed out after {timeout}s]")),
+    }</code></pre>
+<span class="src">rust/src/kernel/tools.rs:113-117</span>
+
+<ul>
+<li><strong><code>read_file</code></strong> truncates at 50 KB. <strong><code>write_file</code></strong> refuses paths under the state directory, the whole kernel source <code>rust/src</code>, and <code>base-prompt.md</code>. Paths are normalized and their existing prefix resolved through symlinks before the check, so <code>..</code> tricks and symlinked parents do not slip past.</li>
+<li><strong><code>list_defs</code></strong> shows soak progress as "(k/N clean uses)".</li>
+<li><strong><code>remember</code></strong> ignores a lesson whose trimmed, lowercased text is already stored. <strong><code>recall</code></strong> matches words of three or more characters across active lessons and verdicts.</li>
+</ul>
+
+<p>The <code>propose_def</code> tool description tells the model it may use "std and serde_json only" (tools.rs:28). That is a hard limit: the generated <code>Cargo.toml</code> has no other dependencies, and the agent cannot edit it.</p>
+
+<h2>The gate: validate, trial, soak, keep or revert</h2>
+
+<p>The gate is where the Rust compiler earns its place. <code>validate</code> runs two stages.</p>
+
+<p><strong>Shape checks</strong> need no compiler (mod.rs:208-244): a lowercase name of at most 48 characters that is not a kernel tool, a known kind that never changes between versions, non-empty source, an object <code>input_schema</code> for tools, and at least one test with an object <code>input</code> and a string <code>expect</code>. Notes skip everything after the source check.</p>
+
+<p><strong>Build and test</strong> come next. The proposed version is compiled into its own library and loaded, without touching the live registry, and each test is run with the same timeout. A test passes if the output <em>contains</em> the expected string:</p>
+
+<pre><code>    fn run_gate_tests(&amp;mut self, name: &amp;str, rec: &amp;DefVersion) -&gt; Result&lt;(), String&gt; {
+        let version = rec.version;
+        let (build_time, lib) = self.userspace.load(name, version, &amp;rec.kind, &amp;rec.source);
+        if let Some(t) = build_time {
+            trace(&amp;format!("[gate] cargo build {name} v{version}: {:.1}s", t.as_secs_f64()));
+        }
+        let lib = lib?;
+        let tests = rec.tests.as_array().map(Vec::as_slice).unwrap_or_default();
+        for (i, t) in tests.iter().enumerate() {
+            let expect = t["expect"].as_str().unwrap_or_default();
+            match lib.call(&amp;t["input"], self.cfg.call_timeout) {
+                Ok(out) if out.contains(expect) =&gt; {}</code></pre>
+<span class="src">rust/src/kernel/mod.rs:248-259</span>
+
+<p>If anything fails, the kernel journals <code>def_rejected</code> and returns "rejected: … The live version is unchanged." to the model, with the compiler or test output attached. If it passes, the version becomes a <em>trial</em>: it is live right away, but on probation. If another trial of the same name was still soaking, that one is reverted first with a verdict saying it was "superseded by vN before its soak finished".</p>
+
+<p>The soak rules live in <code>record_use</code>, which runs after every call:</p>
+
+<pre><code>    fn record_use(&amp;mut self, name: &amp;str, version: u32, error: Option&lt;&amp;str&gt;, input: &amp;Value) {
+        self.rec("def_use", json!({"name": name, "version": version, "ok": error.is_none(), "error": error}));
+        let Some(def) = self.state.defs.get(name) else { return };
+        let Some(live) = def.live_version().filter(|l| l.version == version &amp;&amp; l.status == "trial") else { return };
+        let desc = live.description.clone();
+        if let Some(err) = error {
+            let verdict = format!("def {name} v{version} ({desc:?}) reverted: {} on input {}", first_line(err, 200), compact(input, 200));
+            let restored = self.revert(name, version, err, verdict);
+            let now = restored.map_or("definition removed".into(), |r| format!("live: v{r}"));
+            trace(&amp;format!("[gate] {name} v{version} reverted: {} ({now})", first_line(err, 100)));
+        } else if def.soak_uses &gt;= self.cfg.soak {
+            let verdict = format!("def {name} v{version} ({desc:?}) kept after {} clean uses", def.soak_uses);
+            self.rec("def_kept", json!({"name": name, "version": version, "verdict": verdict}));
+            trace(&amp;format!("[gate] {name} v{version} kept"));
+        }
+    }</code></pre>
+<span class="src">rust/src/kernel/mod.rs:324-339</span>
+
+<p>Any error during the trial reverts it to the last kept version (or removes the definition if there was none) and writes a verdict naming the error and the input that caused it. After three clean uses (the default <code>soak: 3</code>) the trial is kept. Errors from a version that is already kept do not revert it; spec test 4 checks that. Notes cannot be "called", so they soak over tasks instead: each finished task counts as one use of every trial note, and a failed task counts as an error.</p>
+
+<p><code>rollback_def</code> does not just flip a pointer. It copies an old version's record under a new version number and sends it through the whole gate again, compile and tests included.</p>
+
+<h2>The journal and replay</h2>
+
+<p>Every change of state is an event appended to <code>&lt;state&gt;/journal.jsonl</code>, one JSON object per line, stamped with <code>type</code> and <code>ts</code>. The kernel never changes state any other way. The live process appends an event and then feeds it to <code>State::apply</code>; startup reads the journal and feeds every event to the same function. The file header of state.rs says this is "so replay reproduces exactly the state the process had".</p>
+
+<p><code>State::apply</code> is a <em>reducer</em>: a function that takes the current state and one event and produces the next state. Here is the arm that counts soak uses:</p>
+
+<pre><code>            "def_use" =&gt; {
+                if let Some(def) = self.defs.get_mut(&amp;name) {
+                    let ok = ev.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let trial = def.live_version().is_some_and(|v| v.status == "trial");
+                    if ok &amp;&amp; trial &amp;&amp; def.live == Some(u(ev, "version")) {
+                        def.soak_uses += 1;
+                    }
+                }
+            }</code></pre>
+<span class="src">rust/src/kernel/state.rs:126-134</span>
+
+<p>A few properties fall out of this design:</p>
+<ul>
+<li>On an empty journal, <code>open</code> writes a <code>def_trial</code> and a <code>def_kept</code> (marked <code>"seed": true</code>) for each seed. Seed keeps produce no verdict.</li>
+<li>Verdicts are stored as a <code>verdict</code> field on <code>def_kept</code> and <code>def_reverted</code> events and rebuilt into <code>State.verdicts</code> on replay.</li>
+<li><code>def_proposed</code> and <code>def_rejected</code> are "history only": they change nothing in the state.</li>
+<li><code>read_all</code> skips lines it cannot parse, so a line torn by a crash mid-write does not stop startup.</li>
+</ul>
+
+<p>Spec test 5 shows that compiled code is only a cache. It deletes <code>&lt;state&gt;/build</code>, reopens the kernel, asserts the replayed state equals the state before, and checks that the rebuilt library still answers and the soak counter continues from 1 to 2.</p>
+
+<h2>Lessons, reflection and refine</h2>
+
+<p>Lessons are the knowledge ring from chapter 2. After each task, every lesson that was in the prompt gets +1 if the task succeeded and −1 if it failed; a lesson that falls to −3 is retired (mod.rs:595-606).</p>
+
+<p>Reflection is one extra model call after each task, with only the base prompt as system and no tools. The prompt carries a compact transcript of TASK, ASSISTANT, TOOL and OUTCOME lines, capped at 12,000 bytes, and asks for "only a JSON array of 0 to 3 short, reusable lessons". The parser is forgiving on purpose: it takes the text between the first <code>[</code> and the last <code>]</code>, so a model that wraps the array in prose still counts:</p>
+
+<pre><code>        let text: String = resp.content.iter().filter_map(|b| b["text"].as_str()).collect();
+        let parsed = text
+            .find('[')
+            .zip(text.rfind(']'))
+            .and_then(|(a, b)| serde_json::from_str::&lt;Vec&lt;String&gt;&gt;(&amp;text[a..=b]).ok());
+        let Some(lessons) = parsed else {
+            trace("[reflect] no JSON array in reply");
+            return;
+        };
+        let mut added = 0;
+        for l in lessons.iter().take(3) {
+            if matches!(self.remember(l, "reflection"), Ok(m) if m.starts_with("lesson")) {
+                added += 1;
+            }
+        }
+        trace(&amp;format!("[reflect] +{added} lesson(s)"));</code></pre>
+<span class="src">rust/src/kernel/mod.rs:622-637</span>
+
+<p><code>refine</code> runs one ordinary task whose prompt is a fixed "Refine yourself" instruction plus the outcomes of the last 10 tasks. The instruction asks for at most 3 changes and tells the agent to "give every tool or hook real tests".</p>
+
+<h2>Hooks and seeds</h2>
+
+<p>Two hooks let the agent change how its own prompt is built: <code>compose_system</code> (turn notes and lessons into the supplemental prompt) and <code>select_lessons</code> (pick lesson ids for a task). They are ordinary userspace definitions with fixed names, compiled and gated like any tool.</p>
+
+<p>A fresh state directory starts with three kept seeds: the two hooks and one example tool. The example tool is the smallest possible userspace program:</p>
+
+<pre><code>// Seed tool `word_count`: {"text": string} -&gt; number of whitespace-separated words.
+pub fn run(input: &amp;serde_json::Value) -&gt; Result&lt;String, String&gt; {
+    let text = input
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or("missing string field `text`")?;
+    Ok(text.split_whitespace().count().to_string())
+}</code></pre>
+<span class="src">rust/seed/word_count.rs:1-8</span>
+
+<p>The seed <code>compose_system</code> writes a "## Notes" section (each note trimmed, as a paragraph) and a "## Lessons" section of "- " bullets. The seed <code>select_lessons</code> keeps words of four or more alphanumeric characters, sorts lessons by score (highest first, then by id), and returns up to 8 lessons that share a word with the task, or else the top 3.</p>
+
+<p>The neat trick is that each seed hook file is compiled twice. It is embedded as text with <code>include_str!</code> and installed as userspace version 1, and it is also compiled straight into the kernel as a module:</p>
+
+<pre><code>// The seed hooks double as the kernel's fallbacks when a hook fails, so the
+// default behavior exists in exactly one place.
+#[path = "../../seed/compose_system.rs"]
+mod seed_compose_system;
+#[path = "../../seed/select_lessons.rs"]
+mod seed_select_lessons;</code></pre>
+<span class="src">rust/src/kernel/mod.rs:13-18</span>
+
+<p>So when the agent's own hook fails (it panics, times out or fails to load), the kernel calls the same seed code natively, and "the default behavior exists in exactly one place". Even a broken hook cannot leave the agent without a working prompt.</p>
+
+<h2>The provider</h2>
+
+<p>The model client is about 80 lines over <code>ureq</code> 2, a small blocking HTTP client, built with only its <code>tls</code> and <code>json</code> features (which bring in rustls and ring for TLS). No async runtime is needed because the agent does one thing at a time. The HTTP timeout is 600 seconds.</p>
+
+<p>Credentials come from the environment. A non-empty <code>ANTHROPIC_API_KEY</code> is sent as <code>x-api-key</code>. Otherwise a non-empty <code>CLAUDE_CODE_OAUTH_TOKEN</code> is sent as <code>authorization: Bearer …</code> together with the header <code>anthropic-beta: oauth-2025-04-20</code>. With neither, every request fails with "no credentials".</p>
+
+<p>OAuth tokens come with one extra rule from the shared spec: the first system block must be the Claude Code identity line. Empty system blocks are dropped:</p>
+
+<pre><code>fn system_blocks(texts: &amp;[String], oauth: bool) -&gt; Vec&lt;Value&gt; {
+    let mut blocks = Vec::new();
+    if oauth {
+        blocks.push(json!({"type": "text", "text": CLAUDE_CODE_IDENTITY}));
+    }
+    blocks.extend(texts.iter().filter(|t| !t.trim().is_empty()).map(|t| json!({"type": "text", "text": t})));
+    blocks
+}</code></pre>
+<span class="src">rust/src/kernel/provider.rs:26-33</span>
+
+<p>The request body always sets <code>max_tokens: 32000</code> and includes <code>tools</code> only when there are any. The endpoint is built from <code>ANTHROPIC_BASE_URL</code>, which defaults to <code>https://api.anthropic.com</code>; a plain <code>http://</code> URL works too, which is how the evals point the harness at a local proxy for other models:</p>
+
+<pre><code>/// `$ANTHROPIC_BASE_URL/v1/messages`; plain `http://` bases are allowed.
+pub fn messages_url(base: &amp;str) -&gt; String {
+    format!("{}/v1/messages", base.trim().trim_end_matches('/'))
+}</code></pre>
+<span class="src">rust/src/kernel/provider.rs:76-79</span>
+
+<p>Status codes 429, 500, 502, 503, 504 and 529 are retried with sleeps of 2, 4 and 8 seconds, for four attempts in total; transport errors get three attempts with 2-second sleeps. Error bodies are cut to 1,000 characters. The model defaults to <code>claude-sonnet-5-5</code>, overridden by <code>CMH_MODEL</code> or <code>--model</code>.</p>
+
+<p>For tests there is a <code>Mock</code> provider. It replays a JSON array of scripted responses, records every request body it receives (from the CLI, also to <code>&lt;state&gt;/mock-requests.jsonl</code>), and returns an error when the script runs out.</p>
+
+<h2>The CLI</h2>
+
+<pre><code>cmh [--state DIR] [--provider anthropic|mock] [--script FILE] [--model M]
+    [--soak N] [--no-reflect] &lt;command&gt;
+
+  repl            interactive; slash commands /defs /show NAME [V] /knowledge
+                  /refine /rollback NAME V /quit
+  run "TASK"      one task; stdout is only the final answer; exit 0 on success, 1 on failure
+  refine          one refine task
+  defs            print the registry
+  knowledge       print lessons and verdicts</code></pre>
+<span class="src">rust/README.md:49-57</span>
+
+<p>The state directory defaults to <code>.cmh</code>. A usage error or a failure to open the state exits with code 2. For <code>run</code>, stdout carries only the final answer; everything else, including a trace of every tool call and gate decision, goes to stderr with tags such as <code>[tool]</code>, <code>[gate]</code>, <code>[hook]</code>, <code>[reflect]</code>, <code>[learn]</code>, <code>[task]</code> and <code>[kernel]</code>. A successful proposal is traced as <code>[tool] propose_def reverse -&gt; trial v1</code>.</p>
+
+<h2>Building and testing</h2>
+
+<pre><code>cargo build --release          # binary: target/release/cmh
+cargo test                     # 8 spec tests + provider unit tests (mock provider, offline)
+cargo clippy --all-targets</code></pre>
+<span class="src">rust/README.md:43-45</span>
+
+<p><code>cargo test</code> runs 11 tests: the 8 spec tests required by SPEC.md and 3 provider unit tests (OAuth block order with <code>max_tokens</code>, API-key block order, and the base URL). When the research for this book reran them in an orb, all 11 passed, and the 8 spec tests took 3.25 seconds, which included the first build of <code>serde_json</code> into the shared userspace target directory. The tests use one warm target directory, <code>rust/target/cmh-userspace</code>, and turn reflection off.</p>
+
+<table>
+<tr><th>Test</th><th>What it proves</th></tr>
+<tr><td>t1_late_binding</td><td>A new <code>word_count</code> version answers on the very next call within the same task.</td></tr>
+<tr><td>t2_gate_rejection</td><td>A compile error ("mismatched types"), a failing test and a missing test list are all rejected; v1 still answers.</td></tr>
+<tr><td>t3_soak_revert</td><td>A trial that panics on empty input is reverted, v1 is live again, and the verdict quotes the panic.</td></tr>
+<tr><td>t4_soak_keep</td><td>Three clean uses keep a trial; a later error from the kept version does not revert it.</td></tr>
+<tr><td>t5_persistence</td><td>Deleting the build cache and reopening gives the same state and a working library.</td></tr>
+<tr><td>t6_hook_redefinition</td><td>A new <code>compose_system</code> hook changes the next system prompt.</td></tr>
+<tr><td>t7_lesson_scoring</td><td>A lesson goes +1 on success, then down to −3 and is retired.</td></tr>
+<tr><td>t8_end_to_end_run</td><td>The real binary, with the mock provider, prints only <code>olleh</code> on stdout, logs requests, and exits 1 on a failing run.</td></tr>
+</table>
+
+<h2>How it did in the evals</h2>
+
+<p>Chapter 11 explains the eval suite. In short, the Rust flavor matched or beat the reference harness, Prime, on the default suites and trailed it on the reuse suites, where Prime passed 32/32:</p>
+
+<table>
+<tr><th>Run</th><th>Overall</th><th>vs Prime</th><th>Median s/episode</th><th>Tokens</th></tr>
+<tr><td>DeepSeek V4.1 Flash, default suites</td><td>100%</td><td>102%</td><td>28.1</td><td>2,349,490</td></tr>
+<tr><td>GLM 5.3 Flash, default suites</td><td>90%</td><td>113%</td><td>23.8</td><td>837,109</td></tr>
+<tr><td>DeepSeek V4.1 Flash, reuse suites r1-r4 (1 trial)</td><td>81% (26/32)</td><td>81%</td><td>79.1</td><td>5,853,934</td></tr>
+</table>
+
+<p>Read these numbers with care. Each run had only one or two trials (and one of Rust's six reuse failures, r3 e3, was a timeout during an orb pause; see chapter 11), and ROADMAP.md notes that "most of the score comes from the shared design (lessons, reflection, the gate), not from self-modification": across about 60 episodes per flavor, the agents proposed only 5 to 78 changes. A good Rust score says the harness works; it does not yet say that compiled self-modification helps.</p>
+
+<h2>Limitations</h2>
+
+<div class="warn"><strong>The wall is thin.</strong> Userspace is native machine code running inside the kernel's own process. <code>catch_unwind</code> catches panics and the timeout bounds hangs, but nothing stops code that crashes the process outright.</div>
+
+<table>
+<tr><th>Failure in agent code</th><th>What happens</th></tr>
+<tr><td>Panic (<code>unwrap</code> on <code>None</code>, index out of range, <code>panic!</code>)</td><td>Caught in the wrapper, returned as an error, reverts a trial.</td></tr>
+<tr><td>Infinite loop or very slow code</td><td>Timed out after 15 s and reverts a trial, but the thread is abandoned and keeps running.</td></tr>
+<tr><td>Segfault, <code>std::process::abort</code>, <code>std::process::exit</code></td><td>Kills the whole agent. ROADMAP: "a segfault or <code>abort</code> kills everything".</td></tr>
+<tr><td>Stack overflow past the guard page, memory exhaustion</td><td>Not caught (inferred); the process dies.</td></tr>
+<tr><td>File or network access through <code>std</code></td><td>Allowed. No source filter exists, and <code>unsafe</code> is not banned either (inferred).</td></tr>
+</table>
+
+<p>Other limits, all recorded in ROADMAP.md or visible in the code:</p>
+<ul>
+<li><strong>Old libraries leak.</strong> Every superseded <code>.so</code> stays mapped until exit, by design.</li>
+<li><strong><code>bash</code> can break every rule.</strong> <code>write_file</code> protects the kernel source and the journal, but <code>bash</code> can edit anything. Only its process-group kill on timeout limits it.</li>
+<li><strong>Only <code>std</code> and <code>serde_json</code>.</strong> Userspace cannot add crates, and one definition cannot use code from another; each crate is built alone.</li>
+<li><strong>Every proposal is a full cargo build.</strong> Fast once warm (0.1–0.3 s), but the first build in a fresh target directory compiles <code>serde_json</code>, and a cold, offline machine needs one online fetch.</li>
+<li><strong>No scratchpad.</strong> To try a snippet, the agent must propose a definition. ROADMAP suggests a Rust scratchpad that "compile[s] and run[s] in a throwaway worker".</li>
+</ul>
+
+<p>The fix ROADMAP proposes for the first limit is to stop loading native code in-process: "Rust can compile userspace to <code>wasm32</code> and reuse the Forth host's Wasmtime wall instead of loading <code>.so</code> files." WebAssembly would turn a segfault into a trapped error and a runaway loop into a fuel limit, at the cost of a different build target. <a href="08-forth.html">Chapter 8</a> describes that wall.</p>
+
+<h2>Aside: the compile-time idea (not built)</h2>
+
+<div class="note"><strong>Not built.</strong> Nothing in this section exists in the repository. It describes an alternative design. Only the <code>build.rs</code> form is recorded, as a proposed experiment in ROADMAP.md; the proc-macro variant appears nowhere in the repository.</div>
+
+<p>Hot-loading shared libraries is one way to get new Rust into a running agent. The other is to stop trying to change the running process at all, and instead build a <em>new</em> one. Rust already has machinery that runs code at compile time: a <code>build.rs</code> build script runs before a crate compiles and can generate source files, and a <em>procedural macro</em> (proc macro) is a Rust function the compiler calls while compiling, which reads code and emits more code. Either one could read the agent's journal and splice every kept definition directly into the kernel binary, as ordinary functions checked by the same compiler pass as the kernel.</p>
+
+<p>ROADMAP.md lists the <code>build.rs</code> form as experiment 9, "Compile-time Rust generations": "Each kept change triggers a rebuild whose <code>build.rs</code> reads the journal; the core then execs into the new binary. Compare the cost and safety with in-process hot loading." A proc-macro version, which ROADMAP.md does not mention, would differ only in where the generated code is produced, inside the compiler rather than in a script before it.</p>
+
+<p>The trade-offs follow from the design (these are inferences, not measurements):</p>
+<ul>
+<li><strong>Gains:</strong> no <code>unsafe</code> symbol lookup, no C ABI, no JSON round trip for each call, no leaked libraries, and definitions could call each other and use richer types. Because the journal already rebuilds all state on startup, an <code>exec</code> into the new binary would lose nothing but in-flight work.</li>
+<li><strong>Costs:</strong> each generation is a rebuild of the whole kernel crate, much slower than the 0.1–0.3 s cdylib builds. Trials would need a binary of their own or a way to switch back, since one binary holds one set of definitions.</li>
+<li><strong>Safety:</strong> unchanged inside a generation, because agent code is still native code in the same process. The gain is at the edges: a supervisor could keep the last good binary and fall back to it if a new generation crashes on start.</li>
+</ul>
+
+<p>It stays on the list of things to try. The cdylib approach fits the shared spec better: one process keeps running and swaps definitions one at a time.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Rust has no eval, so the Rust flavor runs <code>cargo</code> as a subprocess and loads each definition version as its own <code>cdylib</code> with <code>libloading</code>.</li>
+<li>The agent writes only <code>src/user.rs</code>. A kernel-written wrapper fixes the C ABI, frees its own memory and turns panics into errors with <code>catch_unwind</code>.</li>
+<li>The Rust compiler is part of the gate. Wrong types, wrong signatures and borrow errors reject a proposal, and the trimmed rustc output goes back to the model.</li>
+<li>Libraries are named by a content hash, so the loader never confuses versions and identical code is built once. A shared target directory keeps warm builds to about 0.1–0.3 s.</li>
+<li>Libraries are leaked on purpose and calls run on a worker thread with a 15 s timeout. Hangs are bounded but not stopped.</li>
+<li>The journal plus one reducer, <code>State::apply</code>, is the source of truth. Build output is a cache that can be deleted.</li>
+<li>Seed hooks are compiled into the kernel too, so a broken agent-written hook falls back to the same code.</li>
+<li>The weak point is the wall: native code in-process means a segfault or <code>abort</code> kills the agent. Compiling userspace to WebAssembly is the proposed fix, and compile-time generations are an unbuilt alternative.</li>
+</ul>
+</main>
+<footer class="nav"><a href="05-racket.html">← Racket: sandboxed evaluators</a><a href="index.html">Contents</a><a href="07-lean.html">Lean 4: proofs at the gate →</a></footer>
+</body></html>

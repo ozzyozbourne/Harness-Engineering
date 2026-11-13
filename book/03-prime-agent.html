@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3. The reference: Prime Agent · Harness Engineering</title>
+<link rel="stylesheet" href="style.css"></head><body>
+<header class="book"><a href="index.html">Harness Engineering</a> · Chapter 3</header>
+<main>
+<h1>3. The reference: Prime Agent</h1>
+<p class="subtitle">The harness every flavor in this book is measured against, and how it learns without rewriting its own code</p>
+
+<p>Each harness in this book is scored against one baseline: Prime Agent. When the eval suite reports "98% overall, 100% vs prime", the second number is a ratio to this harness. The pass bar for a flavor is 80% of Prime Agent's overall pass rate. So before we look at Clojure namespaces or Forth words, we need to know the baseline.</p>
+
+<p>Prime Agent also learns over time, but in a different way from the cmh flavors. Seeing that difference clearly is the main goal of this chapter.</p>
+
+<p>Everything below comes from reading the source at <code>github.com/PrimeIntellect-ai/prime-agent</code>, HEAD <code>ea9d9602e release: v0.10.2</code> (2026-10-28), without running it. Where I am guessing rather than reading, I say so.</p>
+
+<h2>What it is</h2>
+
+<p>The README calls it <em>"Prime Agent: A Self-Improving RLM Harness"</em>, an "open-source coding and research agent for general and long-running work". Two ideas carry the design:</p>
+
+<ul>
+<li><strong>Recursive Language Model (RLM).</strong> In the README's words, it "treats context as variables (<em>prompt-as-a-variable</em>) and tools like recursive subagents as function calls (<em>programmatic tool /sub-agent calling</em>) inside a persistent REPL."</li>
+<li><strong>Continual Harness.</strong> It "stores supplemental prompts, memories, skill descriptions, and reusable subagent specifications as durable state that Prime Agent can refine through small, evidence-backed updates, local to the session by default."</li>
+</ul>
+
+<p>Around those two ideas sits a full product: a daemon that keeps sessions alive, a TUI, agent-to-agent messaging, schedules, <code>/goal</code> and <code>/autonomous</code> modes, automatic compaction, and MCP support.</p>
+
+<h3>Who made it, and where it came from</h3>
+
+<p>Prime Intellect builds it, the company behind PRIME-RL and verifiers. The licence is MIT. A paper with the same title (arXiv 2608.23552) and a launch blog post (2026-08-05) describe it. The paper claims, among other results, an ARC-AGI-3 RHAE Best@1 rising from 30% to 95.5%. We did not reproduce any of its results. RLM comes from Alex L. Zhang (arXiv 2512.24601). Continual Harness is arXiv 2605.09998, by Seth Karten and colleagues, mostly at Princeton, and it grew out of the "Gemini Plays Pokémon" harness.</p>
+
+<p>The first commit in the git history is <code>a74c5da11 2025-08-09 Mario Zechner "Initial monorepo setup…"</code>, the start of Zechner's <code>pi</code> coding agent, and he is the largest contributor by far (3063 commits). AGENTS.md says "we are not a pi fork" and asks for pi names to be scrubbed from user-visible surfaces, with an exception for wire identifiers, and names like <code>PI_CODING_AGENT_DIR</code> survive in the code. My reading: historically it is a fork, and the project rebrands it on purpose. Version 0.9.8 was the last TypeScript release. The current 0.10.x line is a Rust rewrite, and its merge gate is parity with the old TypeScript binary.</p>
+
+<h3>Size and shape</h3>
+
+<p>The Rust host is a 10-crate workspace (a crate is Rust's unit of compilation, roughly a library). It forbids <code>unsafe</code> code and runs clippy pedantic with warnings as errors. Together that is about 617k lines of <code>.rs</code>, tests included. Next to it sits a Python package, <code>prime-agent-runtime/</code>, named <code>rlm</code>. It has about 13k lines of source and 19k lines of tests. A <code>skills/</code> directory ships 13 bundled skills.</p>
+
+<table>
+<tr><th>Crate</th><th>What it owns</th><th>~LOC</th></tr>
+<tr><td><code>pa-agent</code></td><td>The provider-independent turn loop: stream, dispatch tool calls, steering, stop hooks, abort</td><td>6k</td></tr>
+<tr><td><code>pa-ai</code></td><td>Provider layer: per-API streaming clients, model registry, cost, retry, JSON repair</td><td>40k</td></tr>
+<tr><td><code>pa-core</code></td><td>Session engine: <code>python_repl</code>, kernel lifecycle, skills, prompt assembly, compaction, harness refinement, MCP host side</td><td>136k</td></tr>
+<tr><td><code>pa-daemon</code></td><td>Supervisor, one worker process per session, session store, auto-refine scheduling</td><td>179k</td></tr>
+<tr><td><code>pa-tui</code></td><td>Terminal UI; talks to the daemon only</td><td>150k</td></tr>
+<tr><td><code>pa-cli</code></td><td>The <code>prime-agent</code> binary; headless print mode; inline subagents</td><td>78k</td></tr>
+<tr><td>others</td><td><code>pa-types</code> (13k), <code>pa-telemetry</code> (5k), <code>pa-models</code> (5k), <code>pa-perf</code> (5k)</td><td></td></tr>
+</table>
+
+<p>The cmh flavors in later chapters are far smaller: Prime Agent is a product, cmh a research substrate.</p>
+
+<p>The process model has four layers in interactive use, and collapses to one in the mode our evals use:</p>
+
+<div class="diagram">Interactive:   TUI ──► daemon (supervisor) ──► worker (one per session) ──► Python kernel
+                                                     │
+                                                     └─ Rust session engine, turn loop, refine
+
+Print mode (-p, used by our evals):
+               prime-agent -p ──► session engine in-process ──► Python kernel
+                                  (no daemon; subagents run inline; exit after "RLM quiescence")</div>
+
+<p>Sessions are stored as append-only JSONL files (one JSON object per line) under the agent directory.</p>
+
+<h2>One tool: <code>python_repl</code></h2>
+
+<p>Most coding agents give the model a list of tools: read file, write file, run shell, search. Prime Agent gives it one. The base system prompt opens with this:</p>
+
+<pre><code># prime-agent harness
+
+The prime-agent harness has one tool: `python_repl`, a persistent CPython REPL. All other tools are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/prompts/layers/core.md:1-3</span>
+
+<p>A <em>REPL</em> (read-eval-print loop) is an interactive interpreter: you send it code, it runs it, and, when persistent, it keeps the variables for the next call. If the model loads a 50 MB log into a variable <code>log</code> in one call, it can filter <code>log</code> in the next call without the log ever entering the model's context window. This is "prompt-as-a-variable": the data the model works on lives in program variables, and only what the model chooses to print comes back as text.</p>
+
+<p>The tool's schema is just <code>{code: string}</code>. Here is how the Rust host defines it:</p>
+
+<pre><code>    ToolDefinition {
+        name: pa_types::ai::PYTHON_TOOL_NAME.to_string(),
+        label: pa_types::ai::PYTHON_TOOL_NAME.to_string(),
+        description: ipython_tool_description().to_string(),
+        prompt_snippet:
+            "python_repl - persistent Python REPL for code, state, and bash() orchestration"
+                .to_string(),
+        // The kernel is single-threaded; calls must not run in parallel.
+        execution_mode: Some(ExecutionMode::Sequential),
+        parameters: ipython_tool_schema(),
+        prepare_arguments: None,</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/tools/ipython.rs:520-530</span>
+
+<p>The <code>Sequential</code> line matters: there is one Python process per session, and it runs one thing at a time. The "kernel" here is that Python subprocess (<code>python -m rlm.repl</code>), which talks to the Rust host over a line-based JSON protocol. The cmh flavors use "kernel" for their own fixed core, so watch for the two meanings.</p>
+
+<p>The host builds the kernel's virtual environment with <code>uv</code> and pre-imports the bundled skills. Variables are snapshotted and revived after restarts, best-effort: objects that cannot be serialized are dropped.</p>
+
+<div class="warn">The README is direct about safety: "Prime Agent executes model-generated Python and project commands with your user permissions. Its worker and kernel processes improve lifecycle isolation and recovery; they are <strong>not</strong> a security sandbox."</div>
+
+<h3>The tools inside the REPL</h3>
+
+<p>Everything else the model can do is a Python function it calls from inside <code>python_repl</code>. The prompt lists them:</p>
+
+<table>
+<tr><th>Group</th><th>Functions</th></tr>
+<tr><td>Shell and files</td><td><code>bash(cmd, persistent=False)</code> returns a handle immediately; <code>edit.run(path, old_str, new_str)</code> does an exact, unique-match replace; <code>attach_image(*paths)</code></td></tr>
+<tr><td>Subagents</td><td><code>rlm.spawn</code>, <code>rlm.list_subagents</code>, <code>rlm.delete_subagent</code>, <code>rlm.rename</code>, <code>rlm.collect</code>, <code>rlm.find_models</code>, <code>rlm.progress_note</code></td></tr>
+<tr><td>Messaging</td><td><code>agent_message.send(…, receiver_role="parent"|"child"|…)</code>, <code>agent_observe</code></td></tr>
+<tr><td>Harness</td><td><code>refine.run()</code>, <code>refine.status()</code>, <code>rlm.harness.{create,update,delete}_{memory,prompt_note,skill,subagent}</code>, <code>rlm.get_harness_state</code></td></tr>
+<tr><td>Session control</td><td><code>compact.run()</code>, <code>goal.create/get/complete</code>, <code>rlm_heartbeat.*</code></td></tr>
+<tr><td>MCP</td><td><code>mcp.search_tools</code>, <code>describe_tool</code>, <code>call_tool</code>, <code>list_plugins</code>, …</td></tr>
+<tr><td>Factory (opt-in)</td><td><code>rlm.factory.run/status/stop/resume</code>: declarative state machines of subagents, off unless <code>/factory on</code></td></tr>
+</table>
+
+<p>The usage prompt layer sets house rules for this style, for example:</p>
+
+<blockquote>Agents do not keep the turn open by polling with `time.sleep()`, shell `sleep`, or repeated awaits of a still-running handle; they end the turn and collect the result on the done notification.</blockquote>
+<span class="src">prime-agent: crates/pa-core/src/prompts/layers/usage.md:17</span>
+
+<p>So <code>bash()</code> starts a background process and returns at once. When the command finishes after the calling <code>python_repl</code> block has returned, the harness sends the agent a <code>[bash-done]</code> notice as a new message.</p>
+
+<h3>Recursion: subagents as function calls</h3>
+
+<p>The "recursive" in RLM means a model can start another model as easily as it calls a function:</p>
+
+<blockquote>prime-agent is a recursive harness. Each session builds a tree of agents, starting at depth 0. Each agent up to a user-configured limit can launch subagents. These subagents are persistent, just like the root session. Each agent can communicate with its nuclear family: its singular parent (except for depth 0 sessions which have no parent), its siblings (other subagents under the same parent), and its children (its own subagents).</blockquote>
+<span class="src">prime-agent: crates/pa-core/src/prompts/layers/core.md:29</span>
+
+<p>Each child is a full session with its own kernel. <code>await rlm.spawn(prompt, name=...)</code> returns immediately with a handle, never with the child's answer. Answers come back only as <code>agent_message</code> replies or as files. <code>/rlm-max-depth</code> caps the depth of the tree.</p>
+
+<div class="diagram">depth 0   root session ── kernel
+            │  await rlm.spawn("summarise logs", name="logs")
+            ▼
+depth 1   "logs" ── kernel ──► agent_message.send(result, receiver_role="parent")
+            │
+depth 2   … (up to /rlm-max-depth)</div>
+
+<h3>MCP tools are found by search, not listed</h3>
+
+<p>MCP (Model Context Protocol) is a standard way to plug external services into an agent as tools. Many harnesses add every MCP tool to the model's tool list, which can mean hundreds of schemas in every request. Prime Agent registers none with the model. The MCP client runs inside the Python kernel, where the model searches for a tool, reads its schema and calls it. The search is deliberately simple:</p>
+
+<pre><code>def _match_tools(generation: _Generation, query: str, limit: int) -&gt; list[dict[str, Any]]:
+    needle = query.lower()
+    matches: list[dict[str, Any]] = []
+    for name, tool in generation.tools.items():
+        if not generation.allows(name):
+            continue
+        haystack = f"{name}\n{tool.get('description') or ''}".lower()
+        if needle not in haystack:
+            continue
+        matches.append(
+            {"connectionId": generation.server, "name": name, "description": tool.get("description") or ""}
+        )
+        if len(matches) &gt;= limit:
+            break
+    return matches</code></pre>
+<span class="src">prime-agent: prime-agent-runtime/src/rlm/mcp.py:820-834</span>
+
+<p>It is a case-insensitive substring test on name plus description, with no embeddings or ranking, over at most 8 servers per search. Chapter 12 shows how other harnesses do "tool search".</p>
+
+<h2>The turn loop</h2>
+
+<p>Under all this sits a conventional agent loop: ask the model, run the tool calls it asked for, append the results, ask again. Prime Agent's loop is a port of the TypeScript one, and its core is short:</p>
+
+<pre><code>            let tool_calls = message
+                .tool_calls()
+                .into_iter()
+                .cloned()
+                .collect::&lt;Vec&lt;ToolCall&gt;&gt;();
+
+            let mut tool_results: Vec&lt;ToolResultMessage&gt; = Vec::new();
+            has_more_tool_calls = false;
+            if !tool_calls.is_empty() {
+                let executed_tool_batch =
+                    execute_tool_calls(current_context, &amp;message, config, signal, emit).await?;
+                tool_results.extend(executed_tool_batch.messages);
+                has_more_tool_calls = !executed_tool_batch.terminate;
+
+                for result in &amp;tool_results {
+                    current_context
+                        .messages
+                        .push(AgentMessage::from(result.clone()));
+                    new_messages.push(AgentMessage::from(result.clone()));
+                }
+            }</code></pre>
+<span class="src">prime-agent: crates/pa-agent/src/agent_loop/run.rs:91-111</span>
+
+<p>The loop does not know which tools exist; they arrive through a dispatcher. Its hook points (<code>convert_to_llm</code> before every request, <code>should_stop_after_turn</code>, steering polls for <code>/goal</code> and <code>/autonomous</code>) are fixed Rust code that the agent cannot replace. Between turns the engine checks the compaction threshold (95% of the context window by default), queued messages, and any refine the model asked for. Providers are keyed by API dialect (anthropic, openai-completions, google, bedrock, …), not by vendor, which matters for our evals.</p>
+
+<h2>How it learns: the Continual Harness</h2>
+
+<p>The prompt draws a clean line between the two halves of the design:</p>
+
+<blockquote>Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.</blockquote>
+<span class="src">prime-agent: crates/pa-core/src/prompts/layers/usage.md:26</span>
+
+<p>RLM is the machine. The continual harness is the data the machine learns. Here are the kinds of data:</p>
+
+<pre><code>pub const REFINEMENT_KINDS: [&amp;str; 5] = ["prompt", "memory", "skill", "subagent", "factory"];</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/refinement/mod.rs:10</span>
+
+<ul>
+<li><strong>prompt</strong>: supplemental prompt notes, narrow behavioural rules.</li>
+<li><strong>memory</strong>: facts, decisions, failures, preferences.</li>
+<li><strong>skill</strong>: a description plus a pointer (<code>reference: {"type":"python", import, callable}</code>) to a Python function that is already installed.</li>
+<li><strong>subagent</strong>: a reusable delegation spec: purpose, instructions, when to spawn.</li>
+<li><strong>factory</strong>: a state-machine workflow of subagents (only when factory mode is on).</li>
+</ul>
+
+<h3>Where the state lives</h3>
+
+<p>All of it is one JSON file, <code>harness_state.json</code>, holding entries by kind plus a list of refinement events. There are two copies with different scopes:</p>
+
+<table>
+<tr><th>Scope</th><th>File</th><th>Seen by</th></tr>
+<tr><td>local (default)</td><td><code>&lt;session_dir&gt;/harness/harness_state.json</code></td><td>this session only</td></tr>
+<tr><td>global</td><td><code>&lt;agent_dir&gt;/harness/harness_state.json</code></td><td>every future session using this agent dir</td></tr>
+</table>
+
+<p>The two are merged when read. Entries are versioned, <code>refinement_history.jsonl</code> records every change, and snapshots support rollback.</p>
+
+<h3>How the state reaches the model</h3>
+
+<p>The base system prompt is never edited. Instead, the engine renders a short, ranked digest of the harness state and sends it as a separate user message, so the static system prompt can stay cached by the provider:</p>
+
+<pre><code>pub const HARNESS_DIGEST_PREFIX: &amp;str = "[harness-digest]\n\nThe persistent memories produced across this session so far:\n\n&lt;harness_state&gt;\n";</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/session_engine/messages.rs:16</span>
+
+<p>The digest is small on purpose. <code>format_harness_state_for_prompt</code> (<code>refinement/ranking.rs:195</code>) takes the top 3 entries of each kind, cuts each to 140 characters, and adds the last 10 refinements (<code>refinement/mod.rs:17-19</code>). Entries are ranked by an IDF-weighted term score against the current goal and recent messages. IDF (inverse document frequency) means rare words count for more than common ones. The digest tells the model these are "compact summaries, not full descriptions", and the model can read full entries through <code>rlm.harness</code> when it needs them.</p>
+
+<h3>Three ways the state changes</h3>
+
+<p><strong>1. The agent edits it directly.</strong> From Python, the model calls functions like this one:</p>
+
+<pre><code>    def create_memory(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "general",
+        metadata: dict[str, Any] | None = None,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -&gt; HarnessEntry:
+        return self.create("memory", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs)</code></pre>
+<span class="src">prime-agent: prime-agent-runtime/src/rlm/harness.py:932-943</span>
+
+<p>The call is synchronous, and the kernel writes the file under a lock. Note <code>global_: bool = False</code>: unless the model asks for global, the memory dies with the session.</p>
+
+<p><strong>2. Refine: a second model call reviews the trajectory.</strong> The user types <code>/refine</code>, or the agent calls <code>await refine.run()</code>. When the current turn ends, a separate LLM call runs with its own system prompt. It sees the trajectory, the current harness overview and the refinement history, and returns JSON edits. The prompt describes the job well:</p>
+
+<blockquote>This is similar in spirit to context compaction, but instead of summarizing the conversation you emit precise Create, Update, or Delete edits to reusable state. … prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten. … Prefer small evidence-backed edits. If prior refinements caused issues, rollback or replace the faulty editable entries. Never edit source files directly.</blockquote>
+<span class="src">prime-agent: crates/pa-core/src/refinement/planner.rs:10 (excerpts from <code>REFINEMENT_SYSTEM_PROMPT</code>)</span>
+
+<p>The output is <code>{summary, rationale, expectedOutcome, edits:[…]}</code>, with a budget of 32,000 output tokens. Each edit must pass <code>validate_edit</code>, which enforces the immutability rule in code, not only in prose:</p>
+
+<pre><code>    if kind == RefinementKind::Prompt
+        &amp;&amp; (edit.id.as_deref() == Some("base_system_prompt")
+            || computed_id == Some("base_system_prompt"))
+    {
+        return Some("base system prompt is not editable".to_string());
+    }</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/refinement/planner.rs:210-215</span>
+
+<p>Skill edits must also include <code>arguments</code> and a Python <code>reference</code>, and <code>harnessRefinements: false</code> in settings switches the whole system off. <code>/refine --global</code> or <code>refine.run(global_=True)</code> writes the global store.</p>
+
+<p><strong>3. Auto-refine after compaction.</strong> Compaction means replacing old conversation with a summary when the context window fills up. After a successful compaction, at the next quiet turn boundary, a cheap review call (4,096 output tokens) decides whether a refine is worth running. Its prompt says to "Reject one-off noise, unsupported hypotheses, and transient tool outputs." If the reviewer approves, a normal refine runs, and its scope is hard-coded to local:</p>
+
+<pre><code>        let options = RefineOptions {
+            global: false,
+            instructions: Some(auto_refine_instructions(AUTO_REFINE_COMPACT_REASON, review)),
+            rollback_id: None,
+        };
+        self.refine(
+            &amp;options,
+            RefinementSource::Auto,
+            model,</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/session_engine/refine.rs:622-630</span>
+
+<p>The defaults:</p>
+
+<pre><code>impl Default for AutoRefineGates {
+    fn default() -&gt; Self {
+        Self {
+            enabled: true,
+            turn_interval: 25,
+            compact: true,
+            cooldown_ms: 20 * 60 * 1000,
+        }
+    }
+}</code></pre>
+<span class="src">prime-agent: crates/pa-core/src/session_engine/refine.rs:39-48</span>
+
+<div class="note"><code>turn_interval: 25</code> suggests a refine every 25 turns, but in this Rust tree I found no code outside tests that reads it (it is only parsed and clamped to at least 1). The only trigger I found wired up is the compaction one, which returns early unless both <code>gates.enabled</code> and <code>gates.compact</code> are set. A turn-count trigger may exist in the TypeScript version; I did not check.</div>
+
+<h3>Skills as code, after the next bootstrap</h3>
+
+<p>New <em>executable</em> behaviour enters another way. The bundled <code>skill-creator</code> skill scaffolds a Python package under <code>.prime/agent/skills/&lt;name&gt;/</code>, and the host installs it into the kernel venv on the next bootstrap: a new session, or <code>/reload</code> in an interactive one. A harness <code>skill</code> entry only points at such a package.</p>
+
+<h2>How our evals run it</h2>
+
+<p>Our eval runner (chapter 11) treats each harness as a command line. Prime Agent's entry:</p>
+
+<pre><code>  "prime": {
+    "cmd": [
+      "~/.local/bin/prime-agent",
+      "-p",
+      "--provider",
+      "anthropic",
+      "--model",
+      "{model}",
+      "{prompt}"
+    ],
+    "env": {
+      "PRIME_AGENT_CODING_AGENT_DIR": "{state}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy",
+      "DO_NOT_TRACK": "1"
+    },
+    "models_json": true
+  },</code></pre>
+<span class="src">evals/harnesses.json:2-18</span>
+
+<ul>
+<li><code>-p</code> is print mode (the in-process engine shown above); the final answer goes to stdout, which the runner saves to <code>logs/&lt;tag&gt;.stdout.txt</code> for the suite's check script to grade.</li>
+<li><code>PRIME_AGENT_CODING_AGENT_DIR</code> is Prime Agent's whole state root: settings, sessions, personal skills, and the <strong>global</strong> <code>harness/harness_state.json</code>. Pointing it at <code>{state}</code> gives each run a clean, private agent dir.</li>
+<li><code>ANTHROPIC_API_KEY</code> is a placeholder. The real key never reaches the harness; a local proxy adds it and counts tokens.</li>
+<li><code>DO_NOT_TRACK=1</code> turns off telemetry delivery.</li>
+</ul>
+
+<p>The cmh harnesses get the proxy address through <code>ANTHROPIC_BASE_URL</code>. Prime Agent needs it in a different place: a <code>models.json</code> file in its agent dir that overrides the built-in <code>anthropic</code> provider's endpoint. That is what <code>models_json: true</code> triggers:</p>
+
+<pre><code>        if h.get("models_json"):  # Prime Agent: base URL override through its models.json
+            (state / "models.json").write_text(json.dumps({"providers": {"anthropic": {"baseUrl": base}}}))</code></pre>
+<span class="src">evals/run.py:294-295</span>
+
+<p>Here <code>base</code> is <code>http://127.0.0.1:{proxy_port}/t/{tag}</code>, and the tag names the harness, suite, trial and episode, so the proxy can bill each episode separately.</p>
+
+<h3>State carries over between episodes</h3>
+
+<p>A suite is a sequence of episodes. The learning suites (<code>l*</code>) and reuse suites (<code>r*</code>) teach something in the first episode and check in later ones whether it stuck. For example, <code>l1-house-style</code> first asks for <code>text_utils.py</code> and states a project rule "for every future task": each file starts with <code># owner: team-orion</code> and each function has a docstring. Episodes 2 to 4 ask for other files and do not mention the rule. The runner makes this possible by reusing one state dir for a whole suite:</p>
+
+<pre><code>def run_suite(hname, h, suite_dir, spec, trial, model, port, usage, timeout, logs_dir, fresh_state=False,
+              isolate=True):
+    state = pathlib.Path(tempfile.mkdtemp(prefix=f"cmh-eval-state-{hname}-"))
+    rows = []
+    try:
+        for number, ep in enumerate(spec["episodes"], start=1):
+            if fresh_state:  # control: no memory carried between episodes
+                shutil.rmtree(state, ignore_errors=True)
+                state.mkdir()</code></pre>
+<span class="src">evals/run.py:317-325</span>
+
+<p>For Prime Agent, the global harness, personal skills, settings and old sessions all survive between episodes.</p>
+
+<div class="warn">My reading of the code, which I have not confirmed from logs: each <code>-p</code> episode is a new session, so <em>local</em> harness entries from episode 1 are invisible in episode 2. Transfer only works if the model writes <em>global</em> entries (<code>global_=True</code>, <code>/refine --global</code>) or leaves files on disk. Auto-refine is local-only and fires only after compaction, which short eval episodes rarely reach. To check, look for <code>harness/harness_state.json</code> in a kept state dir, or <code>refinement_outcome</code> rows in session JSONL.</div>
+
+<h3>The baseline numbers</h3>
+
+<p>Prime Agent's own rows from the result files, all with 15 suites and 2 trials:</p>
+
+<table>
+<tr><th>Run</th><th>Overall</th><th>Coding</th><th>Learning transfer</th><th>Median s/episode</th></tr>
+<tr><td><code>deepseek-v4.1-flash</code></td><td>98%</td><td>100%</td><td>94%</td><td>13.6</td></tr>
+<tr><td><code>z-ai/glm-5.3-flash</code></td><td>79%</td><td>96%</td><td>50%</td><td>6.9</td></tr>
+<tr><td>forth run (with <code>forth_eval</code>), deepseek</td><td>88%</td><td>100%</td><td>67%</td><td>16.4</td></tr>
+<tr><td>forth run (no scratchpad), deepseek</td><td>98%</td><td>100%</td><td>94%</td><td>12.1</td></tr>
+</table>
+<span class="src">evals/results-deepseek-v4.1-flash.md:9, results-glm-5.3-flash.md:9, results-forth-deepseek-v4.1-flash.md:9, results-forth-no-scratchpad-deepseek-v4.1-flash.md:9</span>
+
+<p>Two things stand out. First, Prime Agent is fast: its median episode takes about half the time of the cmh flavors in the same runs, or less (13.6 s against 27.6–30.1 s on deepseek, 6.9 s against 21.0–25.0 s on GLM). Second, its transfer score moves a lot. On deepseek-v4.1-flash, with the same suites, it was 94% in two runs and 67% in the Forth run with <code>forth_eval</code>; on GLM it was 50%. Transfer is scored on only 18 episodes (9 per trial), so each one is worth about 6 points: 94% is 17 of 18, 67% is 12. Read the "vs prime" column in later chapters with that noise in mind. Later, on the isolated one-trial reuse matrix (suites <code>r1</code>–<code>r4</code>), Prime Agent passed 32/32 with a 33.1 s median, against 74.2–122.0 s for the flavors (<span class="src">evals/results/matrix-memory/summary.md</span>). Chapter 11 has the details.</p>
+
+<h2>How it differs from cmh</h2>
+
+<p>Both projects say "self-improving", but they mean different things.</p>
+
+<p>cmh (chapter 2) lets the agent rewrite its own <em>userspace</em> while it runs: tools, prompt notes, and the hooks that assemble its own prompt (<code>compose_system</code>, <code>select_lessons</code>). Every change goes through <code>propose_def</code>: it is validated against its tests in a scratch environment, goes live as a trial, and is kept only after a few clean uses. If it fails during that soak, it is reverted automatically and the verdict is written down so the model does not retry the idea blindly.</p>
+
+<p>Prime Agent learns <em>data</em>, not <em>code</em>:</p>
+
+<table>
+<tr><th></th><th>Prime Agent</th><th>cmh flavors</th></tr>
+<tr><td>What the agent can change</td><td>Prompt notes, memories, skill and subagent descriptions (JSON entries)</td><td>Tools, notes and hooks as live code in the host language</td></tr>
+<tr><td>Prompt assembly</td><td>Fixed Rust; layer order is a "surface contract (must not change)"; digest ranking is fixed</td><td>The <code>compose_system</code> and <code>select_lessons</code> hooks are userspace and can be rewritten</td></tr>
+<tr><td>Tool surface</td><td>Fixed: one tool, <code>python_repl</code>; new abilities are Python functions inside it</td><td>New model-level tools can be defined at runtime</td></tr>
+<tr><td>When new code goes live</td><td>Skill packages load on the next bootstrap (next session or <code>/reload</code>)</td><td>Right away, as a trial version</td></tr>
+<tr><td>Gate on changes</td><td>Schema validation (<code>validate_edit</code>), plus the model's own <code>expectedOutcome</code> and an optional review LLM; no tests, no trial run</td><td>Validate with tests → trial → soak → keep or revert</td></tr>
+<tr><td>Rollback</td><td>Manual or chosen by the model (<code>rollback_id</code>)</td><td>Automatic on a soak failure, and recorded as a verdict</td></tr>
+<tr><td>Default scope</td><td>Local to the session; global only on request</td><td>Persistent across tasks through the state dir</td></tr>
+<tr><td>Fixed core</td><td>~617k lines of Rust plus static prompt layers</td><td>A small kernel per flavor</td></tr>
+</table>
+
+<p>The usage prompt does ask the model to check its own refinements:</p>
+
+<blockquote>they diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome.</blockquote>
+<span class="src">prime-agent: crates/pa-core/src/prompts/layers/usage.md:27 (excerpt)</span>
+
+<p>But that "validate" is a request to the model, not a gate in the harness. I found no code in <code>refinement/</code> or <code>session_engine/refine.rs</code> that tests or replays a change before keeping it, though I did not search the whole 617k lines.</p>
+
+<p>Prime Agent can change code informally: REPL helpers survive in the session snapshot, and with <code>bash()</code> it could edit any file, even its own install. None of that is gated or versioned.</p>
+
+<p>Neither approach is simply better. In Prime Agent the model cannot break its own loop, because the loop is compiled Rust it cannot touch. The price is a ceiling: no amount of learning changes how its prompt is built or which tools exist. cmh removes that ceiling and pays for it with the gate machinery of chapter 2. The rest of this book asks whether that trade pays off, and how the choice of language changes it.</p>
+
+<h2>Key takeaways</h2>
+<ul>
+<li>Prime Agent is the eval baseline: the "vs prime" column and the 80% pass bar in every results table are measured against it.</li>
+<li>It gives the model one tool, <code>python_repl</code>, a persistent Python REPL. Shell, edits, subagents, MCP and harness edits are all Python functions called inside it.</li>
+<li>RLM is the runtime: context lives in variables, and subagents are <code>await rlm.spawn(...)</code> calls that form a tree of persistent sessions.</li>
+<li>The Continual Harness is versioned JSON state, local by default. The agent edits it directly or through <code>refine</code>, a second LLM call that proposes schema-checked edits. Auto-refine runs only after compaction, and only on local state.</li>
+<li>Our evals run it in print mode with a private agent dir that is kept for a whole suite, so global state can carry between episodes.</li>
+<li>Its baseline numbers are strong but noisy: transfer was 94% twice and 67% once on deepseek-v4.1-flash and 50% on glm-5.3-flash, and it is roughly two to four times as fast per episode as the cmh flavors.</li>
+<li>The core difference: Prime Agent learns data inside a fixed program, with no test gate. cmh lets the agent rewrite live code, including its own prompt assembly, behind a validate → trial → soak → keep/revert gate.</li>
+</ul>
+</main>
+<footer class="nav"><a href="02-shared-design.html">← The shared design: SPEC.md</a><a href="index.html">Contents</a><a href="04-clojure.html">Clojure: eval into namespaces →</a></footer>
+</body></html>
