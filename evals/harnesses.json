@@ -105,5 +105,20 @@
       "ANTHROPIC_BASE_URL": "{base_url}",
       "ANTHROPIC_API_KEY": "via-eval-proxy"
     }
+  },
+  "roc": {
+    "cmd": [
+      "{repo}/roc/bin/cmh",
+      "--state",
+      "{state}",
+      "--model",
+      "{model}",
+      "run",
+      "{prompt}"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "{base_url}",
+      "ANTHROPIC_API_KEY": "via-eval-proxy"
+    }
   }
 }
